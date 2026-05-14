@@ -1,0 +1,212 @@
+use std::fs;
+use std::path::Path;
+
+use symphony::config::{HooksConfig, WorkspaceConfig};
+use symphony::error::SymphonyError;
+use symphony::workspace::{WorkspaceManager, sanitize_workspace_key};
+use tempfile::TempDir;
+
+fn hooks_with_timeout(timeout_ms: u64) -> HooksConfig {
+    HooksConfig {
+        timeout_ms,
+        ..HooksConfig::default()
+    }
+}
+
+fn manager(root: &Path, hooks: HooksConfig) -> WorkspaceManager {
+    WorkspaceManager::new(
+        &WorkspaceConfig {
+            root: root.to_path_buf(),
+        },
+        hooks,
+    )
+    .expect("workspace manager should build")
+}
+
+fn assert_hook_error(error: SymphonyError, hook: &'static str, message_contains: &str) {
+    match error {
+        SymphonyError::Hook {
+            hook: actual,
+            message,
+        } => {
+            assert_eq!(actual, hook);
+            assert!(
+                message.contains(message_contains),
+                "expected hook error message to contain {message_contains:?}, got {message:?}"
+            );
+        }
+        other => panic!("expected hook error, got {other:?}"),
+    }
+}
+
+#[test]
+fn sanitizes_workspace_keys_to_safe_path_segments() {
+    assert_eq!(sanitize_workspace_key("issue/123"), "issue_123");
+    assert_eq!(sanitize_workspace_key("A b$c"), "A_b_c");
+    assert_eq!(sanitize_workspace_key(""), "_");
+    assert_eq!(sanitize_workspace_key("."), "_");
+    assert_eq!(sanitize_workspace_key(".."), "_");
+
+    let temp = TempDir::new().expect("tempdir");
+    let manager = manager(temp.path(), hooks_with_timeout(1_000));
+    let (key, path) = manager
+        .workspace_path_for_identifier("..")
+        .expect("sanitized dot-dot identifier should stay contained");
+
+    assert_eq!(key, "_");
+    assert_eq!(path, manager.root().join("_"));
+}
+
+#[tokio::test]
+async fn creates_new_workspace_then_reuses_existing_directory() {
+    let temp = TempDir::new().expect("tempdir");
+    let manager = manager(temp.path(), hooks_with_timeout(1_000));
+
+    let first = manager
+        .create_for_identifier("issue/123")
+        .await
+        .expect("first create should succeed");
+    assert_eq!(first.workspace_key, "issue_123");
+    assert!(first.created_now);
+    assert!(first.path.is_dir());
+
+    let second = manager
+        .create_for_identifier("issue/123")
+        .await
+        .expect("second create should reuse");
+    assert_eq!(second.path, first.path);
+    assert!(!second.created_now);
+}
+
+#[tokio::test]
+async fn existing_non_directory_workspace_path_fails_without_replacing_it() {
+    let temp = TempDir::new().expect("tempdir");
+    let manager = manager(temp.path(), hooks_with_timeout(1_000));
+    let (_, path) = manager
+        .workspace_path_for_identifier("issue-1")
+        .expect("path should be contained");
+    fs::create_dir_all(temp.path()).expect("root create");
+    fs::write(&path, "do not replace").expect("write sentinel file");
+
+    let error = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect_err("non-directory should fail safely");
+    assert!(matches!(error, SymphonyError::Workspace(_)));
+    assert_eq!(
+        fs::read_to_string(&path).expect("sentinel file remains"),
+        "do not replace"
+    );
+}
+
+#[tokio::test]
+async fn after_create_runs_only_for_new_workspace_with_workspace_cwd() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.after_create = Some("pwd > pwd.txt; printf x >> ../after_create_count".to_string());
+    let manager = manager(temp.path(), hooks);
+
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("first create should run after_create");
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("pwd.txt"))
+            .expect("hook should write cwd marker")
+            .trim_end(),
+        workspace.path.to_string_lossy()
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("after_create_count")).expect("count marker"),
+        "x"
+    );
+
+    let reused = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("reuse should succeed");
+    assert!(!reused.created_now);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("after_create_count")).expect("count marker"),
+        "x"
+    );
+}
+
+#[tokio::test]
+async fn before_run_failure_is_fatal() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.before_run = Some("exit 7".to_string());
+    let manager = manager(temp.path(), hooks);
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("create should succeed");
+
+    let error = manager
+        .before_run(&workspace.path)
+        .await
+        .expect_err("before_run failure should be fatal");
+    assert_hook_error(error, "before_run", "exit_status=");
+}
+
+#[tokio::test]
+async fn after_run_failure_is_ignored_after_hook_runs() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.after_run = Some("printf ran > after_run_marker; exit 9".to_string());
+    let manager = manager(temp.path(), hooks);
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("create should succeed");
+
+    manager.after_run_best_effort(&workspace.path).await;
+
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("after_run_marker"))
+            .expect("marker should be written"),
+        "ran"
+    );
+}
+
+#[tokio::test]
+async fn before_remove_runs_before_directory_is_removed() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.before_remove = Some("test -d . && printf ran > ../before_remove_marker".to_string());
+    let manager = manager(temp.path(), hooks);
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("create should succeed");
+
+    manager
+        .remove_for_identifier("issue-1")
+        .await
+        .expect("remove should succeed");
+
+    assert!(!workspace.path.exists());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("before_remove_marker")).expect("remove marker"),
+        "ran"
+    );
+}
+
+#[tokio::test]
+async fn fatal_hook_timeout_returns_error() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(10);
+    hooks.before_run = Some("sleep 1".to_string());
+    let manager = manager(temp.path(), hooks);
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("create should succeed");
+
+    let error = manager
+        .before_run(&workspace.path)
+        .await
+        .expect_err("timeout should be fatal");
+    assert_hook_error(error, "before_run", "timeout after 10 ms");
+}
