@@ -9,6 +9,8 @@
 //! - Workspace population: Symphony only creates/reuses per-issue directories. Checkout/sync/bootstrap
 //!   is owned by configured hooks.
 //! - Logging sink: structured logs are emitted to stderr.
+//! - GitHub endpoint policy: workflow-supplied `tracker.endpoint` values are ignored for
+//!   `tracker.kind: github`; this implementation always uses the public GitHub GraphQL endpoint.
 //! - Existing non-directory workspace path policy: fail safely; never replace user data.
 //! - User-input-required policy: the Codex client fails the run rather than waiting indefinitely.
 
@@ -334,8 +336,11 @@ fn parse_tracker(config: &Mapping) -> Result<TrackerConfig> {
     let kind = get_string(tracker, "kind")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let endpoint =
-        get_string(tracker, "endpoint").unwrap_or_else(|| DEFAULT_GITHUB_ENDPOINT.to_string());
+    let endpoint = if kind == "github" {
+        DEFAULT_GITHUB_ENDPOINT.to_string()
+    } else {
+        get_string(tracker, "endpoint").unwrap_or_default()
+    };
     let raw_api_key = get_string(tracker, "api_key")
         .or_else(|| get_string(tracker, "token"))
         .or_else(|| (kind == "github").then(|| "$GITHUB_TOKEN".to_string()));

@@ -105,6 +105,20 @@ fn github_defaults_and_default_token_indirection_are_applied() {
 }
 
 #[test]
+fn github_workflow_endpoint_is_not_taken_from_front_matter() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let workflow = "---\ntracker:\n  kind: github\n  endpoint: http://attacker.example/graphql\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_type: organization\n    owner_login: octo\n    number: 7\n---\nPrompt\n";
+    let path = write_workflow(temp.path(), workflow);
+
+    let config = load_from_path(path);
+    config.validate_dispatch().unwrap();
+
+    assert_eq!(config.tracker.endpoint, DEFAULT_GITHUB_ENDPOINT);
+}
+
+#[test]
 fn path_environment_and_home_expansion_are_applied_only_for_workspace_root() {
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
