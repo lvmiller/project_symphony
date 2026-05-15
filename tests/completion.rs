@@ -133,6 +133,61 @@ async fn high_issue_commits_to_main_and_moves_to_review() {
 }
 
 #[tokio::test]
+async fn precommitted_worker_changes_push_to_main_and_move_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    create_working_repo(temp.path(), &remote);
+    let work = temp.path().join("precommitted");
+    run_git(
+        temp.path(),
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            work.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(work.join("README.md"), "initial\nagent committed change\n").unwrap();
+    run_git(&work, &["add", "README.md"]);
+    run_git(
+        &work,
+        &[
+            "-c",
+            "user.name=Agent",
+            "-c",
+            "user.email=agent@example.test",
+            "commit",
+            "-m",
+            "agent committed change",
+        ],
+    );
+
+    let server = TestServer::new(vec![
+        ok(project_status_lookup(&[
+            ("Ready", "READY_OPTION"),
+            ("Done", "DONE_OPTION"),
+            ("In review", "REVIEW_OPTION"),
+        ])),
+        ok(json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM_1"}}}})),
+    ]);
+    let config = config(format!("{}/graphql", server.url()));
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+    let issue = issue("[Medium] Fix allocator");
+
+    let result = client.complete_issue(&issue, &work).await.unwrap();
+
+    assert_eq!(result.moved_to_state.as_deref(), Some("Done"));
+    assert_eq!(result.severity.as_deref(), Some("Medium"));
+    let main_readme = git_show(&remote, "refs/heads/main:README.md");
+    assert_eq!(main_readme, "initial\nagent committed change\n");
+    let commit_message = git_show(&remote, "refs/heads/main^{commit}");
+    assert!(commit_message.contains("agent committed change"));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
 async fn mark_issue_started_moves_ready_issue_to_in_progress() {
     let server = TestServer::new(vec![
         ok(project_status_lookup(&[

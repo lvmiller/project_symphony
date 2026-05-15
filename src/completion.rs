@@ -154,12 +154,17 @@ impl GitHubCompletionClient {
         workspace: &Path,
     ) -> Result<CompletionResult> {
         let severity = Severity::from_issue(issue)?;
-        if !git_has_changes(workspace).await? {
+        let has_workspace_changes = git_has_changes(workspace).await?;
+        let has_unpushed_commits = git_has_unpushed_commits(workspace).await?;
+        if !has_workspace_changes && !has_unpushed_commits {
             info!(issue_id = %issue.id, issue_identifier = %issue.identifier, "completion_skipped_no_changes");
             return Ok(CompletionResult::skipped("no workspace changes"));
         }
+
         ensure_on_base_branch(workspace, &self.direct_commit.base_branch).await?;
-        git_commit_all(workspace, issue, &self.direct_commit).await?;
+        if has_workspace_changes {
+            git_commit_all(workspace, issue, &self.direct_commit).await?;
+        }
         let commit_sha = git_commit_sha(workspace).await?;
         git_push_base_branch(workspace, &self.direct_commit.base_branch, &self.token).await?;
         let target_state = severity.target_state(&self.direct_commit).to_string();
@@ -327,6 +332,14 @@ struct GraphqlError {
 async fn git_has_changes(workspace: &Path) -> Result<bool> {
     let output = git_output(workspace, &["status", "--porcelain=v1"], None).await?;
     Ok(!output.trim().is_empty())
+}
+
+async fn git_has_unpushed_commits(workspace: &Path) -> Result<bool> {
+    let output = git_output(workspace, &["status", "--porcelain=v1", "--branch"], None).await?;
+    Ok(output
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains("[ahead ")))
 }
 
 async fn ensure_on_base_branch(workspace: &Path, base_branch: &str) -> Result<()> {
