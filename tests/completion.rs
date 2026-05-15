@@ -133,6 +133,43 @@ async fn high_issue_commits_to_main_and_moves_to_review() {
 }
 
 #[tokio::test]
+async fn mark_issue_started_moves_ready_issue_to_in_progress() {
+    let server = TestServer::new(vec![
+        ok(project_status_lookup(&[
+            ("Ready", "READY_OPTION"),
+            ("In progress", "PROGRESS_OPTION"),
+            ("Done", "DONE_OPTION"),
+        ])),
+        ok(json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM_1"}}}})),
+    ]);
+    let config = config(format!("{}/graphql", server.url()));
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+    let issue = issue("[Medium] Fix allocator");
+
+    let moved = client.mark_issue_started(&issue).await.unwrap();
+
+    assert_eq!(moved.as_deref(), Some("In progress"));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let mutation_body: Value = serde_json::from_str(request_body(&requests[1])).unwrap();
+    assert_eq!(mutation_body["variables"]["optionId"], "PROGRESS_OPTION");
+}
+
+#[tokio::test]
+async fn mark_issue_started_skips_already_started_issue() {
+    let server = TestServer::new(Vec::new());
+    let config = config(format!("{}/graphql", server.url()));
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+    let mut issue = issue("[Medium] Fix allocator");
+    issue.state = "In progress".to_string();
+
+    let moved = client.mark_issue_started(&issue).await.unwrap();
+
+    assert!(moved.is_none());
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
 async fn missing_title_severity_does_not_commit_or_move_status() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote.git");
@@ -231,6 +268,7 @@ fn config(endpoint: String) -> EffectiveConfig {
                 base_branch: "main".to_string(),
                 high_review_state: "In review".to_string(),
                 auto_approved_state: "Done".to_string(),
+                started_state: Some("In progress".to_string()),
                 commit_author_name: "Symphony".to_string(),
                 commit_author_email: "symphony@users.noreply.github.com".to_string(),
             },

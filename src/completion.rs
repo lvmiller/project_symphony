@@ -179,6 +179,24 @@ impl GitHubCompletionClient {
         })
     }
 
+    pub async fn mark_issue_started(&self, issue: &Issue) -> Result<Option<String>> {
+        let Some(started_state) = self.direct_commit.started_state.as_deref() else {
+            return Ok(None);
+        };
+        if issue.state.eq_ignore_ascii_case(started_state) {
+            return Ok(None);
+        }
+        self.move_issue_to_state(issue, started_state).await?;
+        info!(
+            issue_id = %issue.id,
+            issue_identifier = %issue.identifier,
+            from_state = %issue.state,
+            state = %started_state,
+            "issue_marked_started"
+        );
+        Ok(Some(started_state.to_string()))
+    }
+
     async fn move_issue_to_state(&self, issue: &Issue, target_state: &str) -> Result<()> {
         let data = self
             .graphql(

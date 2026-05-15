@@ -54,6 +54,7 @@ completion:
   direct_commit:
     enabled: true
     base_branch: main
+    started_state: In progress
     high_review_state: In review
     auto_approved_state: Done
     commit_author_name: Symphony

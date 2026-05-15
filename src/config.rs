@@ -247,6 +247,7 @@ pub struct DirectCommitCompletionConfig {
     pub base_branch: String,
     pub high_review_state: String,
     pub auto_approved_state: String,
+    pub started_state: Option<String>,
     pub commit_author_name: String,
     pub commit_author_email: String,
 }
@@ -258,6 +259,7 @@ impl Default for DirectCommitCompletionConfig {
             base_branch: "main".to_string(),
             high_review_state: "In review".to_string(),
             auto_approved_state: "Done".to_string(),
+            started_state: None,
             commit_author_name: "Symphony".to_string(),
             commit_author_email: "symphony@users.noreply.github.com".to_string(),
         }
@@ -540,6 +542,9 @@ fn parse_codex(config: &Mapping) -> Result<CodexConfig> {
 fn parse_completion(config: &Mapping) -> Result<CompletionConfig> {
     let completion = get_map(config, "completion");
     let direct_commit = get_nested_map(completion, "direct_commit");
+    let started_state = get_string(direct_commit, "started_state")
+        .or_else(|| get_string(completion, "started_state"))
+        .map(|state| state.trim().to_string());
     let mut direct_commit_config = DirectCommitCompletionConfig {
         enabled: get_bool(direct_commit, "enabled").unwrap_or(false),
         base_branch: get_string(direct_commit, "base_branch").unwrap_or_else(|| "main".to_string()),
@@ -549,6 +554,7 @@ fn parse_completion(config: &Mapping) -> Result<CompletionConfig> {
         auto_approved_state: get_string(direct_commit, "auto_approved_state")
             .or_else(|| get_string(completion, "auto_approved_state"))
             .unwrap_or_else(|| "Done".to_string()),
+        started_state,
         commit_author_name: get_string(direct_commit, "commit_author_name")
             .unwrap_or_else(|| "Symphony".to_string()),
         commit_author_email: get_string(direct_commit, "commit_author_email")
@@ -580,6 +586,16 @@ fn parse_completion(config: &Mapping) -> Result<CompletionConfig> {
             return Err(SymphonyError::config(
                 "invalid_completion_auto_approved_state",
                 "completion.direct_commit.auto_approved_state must be non-empty",
+            ));
+        }
+        if direct_commit_config
+            .started_state
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(SymphonyError::config(
+                "invalid_completion_started_state",
+                "completion.direct_commit.started_state must be non-empty when configured",
             ));
         }
         if direct_commit_config.commit_author_name.is_empty() {

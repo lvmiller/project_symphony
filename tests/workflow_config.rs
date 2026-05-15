@@ -101,6 +101,7 @@ fn github_defaults_and_default_token_indirection_are_applied() {
         "In review"
     );
     assert_eq!(config.completion.direct_commit.auto_approved_state, "Done");
+    assert_eq!(config.completion.direct_commit.started_state, None);
 }
 
 #[test]
@@ -187,7 +188,7 @@ fn completion_direct_commit_config_is_parsed_and_validated() {
     let temp = tempfile::tempdir().unwrap();
     let valid = write_workflow(
         temp.path(),
-        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\ncompletion:\n  direct_commit:\n    enabled: true\n    base_branch: trunk\n    high_review_state: In review\n    auto_approved_state: Done\n    commit_author_name: Bot\n    commit_author_email: bot@example.test\n---\nPrompt\n",
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\ncompletion:\n  direct_commit:\n    enabled: true\n    base_branch: trunk\n    started_state: In progress\n    high_review_state: In review\n    auto_approved_state: Done\n    commit_author_name: Bot\n    commit_author_email: bot@example.test\n---\nPrompt\n",
     );
     let config = load_from_path(valid);
     assert!(config.completion.direct_commit.enabled);
@@ -197,6 +198,10 @@ fn completion_direct_commit_config_is_parsed_and_validated() {
         "In review"
     );
     assert_eq!(config.completion.direct_commit.auto_approved_state, "Done");
+    assert_eq!(
+        config.completion.direct_commit.started_state.as_deref(),
+        Some("In progress")
+    );
     assert_eq!(config.completion.direct_commit.commit_author_name, "Bot");
     assert_eq!(
         config.completion.direct_commit.commit_author_email,

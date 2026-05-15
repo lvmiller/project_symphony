@@ -61,9 +61,13 @@ impl SymphonyAgentRunner {
             Ok(workspace) => workspace,
             Err(error) => return WorkerExitReason::Failed(error.to_string()),
         };
+        let mut working_issue = issue.clone();
+        if let Err(error) = self.mark_started_if_configured(&mut working_issue).await {
+            return WorkerExitReason::Failed(error.to_string());
+        }
 
         let mut reason = match self
-            .run_in_workspace(issue, attempt, on_event, &workspace.path)
+            .run_in_workspace(&working_issue, attempt, on_event, &workspace.path)
             .await
         {
             Ok(reason) => reason,
@@ -72,11 +76,23 @@ impl SymphonyAgentRunner {
 
         self.workspace.after_run_best_effort(&workspace.path).await;
         if reason.is_normal()
-            && let Err(error) = self.complete_if_configured(issue, &workspace.path).await
+            && let Err(error) = self
+                .complete_if_configured(&working_issue, &workspace.path)
+                .await
         {
             reason = WorkerExitReason::Failed(error.to_string());
         }
         reason
+    }
+
+    async fn mark_started_if_configured(&self, issue: &mut Issue) -> Result<()> {
+        let Some(completion) = GitHubCompletionClient::new(&self.config)? else {
+            return Ok(());
+        };
+        if let Some(started_state) = completion.mark_issue_started(issue).await? {
+            issue.state = started_state;
+        }
+        Ok(())
     }
 
     async fn complete_if_configured(
