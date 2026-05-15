@@ -130,6 +130,34 @@ async fn pages_project_items_filters_statuses_and_normalizes_issues() {
 }
 
 #[tokio::test]
+async fn candidate_fetch_skips_project_items_from_other_repositories() {
+    let in_repo = project_item("I_in_repo", 1, "Todo", &["Bug"], None, None);
+    let mut out_of_repo = project_item("I_out_of_repo", 2, "Todo", &["Bug"], None, None);
+    let repository = out_of_repo
+        .get_mut("content")
+        .unwrap()
+        .get_mut("repository")
+        .unwrap();
+    *repository = json!({
+        "nameWithOwner": "other-org/other-repo",
+        "name": "other-repo",
+        "owner": {"login": "other-org"}
+    });
+    let server = TestServer::new(vec![ok(project_page(
+        false,
+        None,
+        vec![in_repo, out_of_repo],
+    ))]);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    let issues = client.fetch_candidate_issues().await.unwrap();
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].id, "I_in_repo");
+    assert_eq!(issues[0].identifier, "octo-org/octo-repo#1");
+}
+
+#[tokio::test]
 async fn fetches_issue_states_by_node_ids_from_project_items() {
     let refreshed = json!({
         "data": {

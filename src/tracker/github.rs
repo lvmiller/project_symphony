@@ -737,9 +737,24 @@ fn normalize_project_item(github: &GithubConfig, item: ProjectItem) -> Result<Op
     }
     let content: IssueNode = serde_json::from_value(content_value)
         .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+    if !issue_matches_configured_repository(github, &content) {
+        return Ok(None);
+    }
     let state = field_value_by_name(&item.field_values.nodes, &github.status_field_name)
         .ok_or_else(|| tracker_error("github_malformed", "missing project Status value"))?;
     normalize_issue(github, content, &item.field_values.nodes, state).map(Some)
+}
+
+fn issue_matches_configured_repository(github: &GithubConfig, content: &IssueNode) -> bool {
+    content
+        .repository
+        .owner
+        .login
+        .eq_ignore_ascii_case(&github.repository_owner)
+        && content
+            .repository
+            .name
+            .eq_ignore_ascii_case(&github.repository_name)
 }
 
 fn normalize_issue(
