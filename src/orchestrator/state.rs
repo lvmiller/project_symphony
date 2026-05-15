@@ -346,3 +346,39 @@ impl OrchestratorState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issue(id: &str, identifier: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            identifier: identifier.to_string(),
+            title: format!("Issue {identifier}"),
+            description: None,
+            priority: None,
+            state: "In Progress".to_string(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn releases_claimed_workspace_key_after_retry_entry_was_removed() {
+        let mut state = OrchestratorState::default();
+        let retrying = issue("id-1", "S/001");
+        let retry = state.schedule_retry_now(&retrying, 1, Some("transient failure".to_string()));
+        state.retry_attempts.remove(&retrying.id);
+
+        state.release(&retrying.id);
+        assert!(state.claimed_workspace_keys.contains(&retry.workspace_key));
+
+        state.release_workspace_key_if_unowned(&retry.workspace_key);
+        assert!(!state.claimed_workspace_keys.contains(&retry.workspace_key));
+    }
+}

@@ -220,6 +220,7 @@ async fn dispatch_due_retries(
             .cloned()
         else {
             state.release(&issue_id);
+            state.release_workspace_key_if_unowned(&retry.workspace_key);
             continue;
         };
         state.claimed.remove(&issue_id);
