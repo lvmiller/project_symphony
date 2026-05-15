@@ -188,6 +188,97 @@ async fn precommitted_worker_changes_push_to_main_and_move_status() {
 }
 
 #[tokio::test]
+async fn precommitted_worker_changes_rebase_when_remote_main_advanced() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    create_working_repo(temp.path(), &remote);
+    let work = temp.path().join("worker");
+    let other = temp.path().join("other");
+    run_git(
+        temp.path(),
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            work.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        temp.path(),
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(other.join("REMOTE.md"), "remote change\n").unwrap();
+    run_git(&other, &["add", "REMOTE.md"]);
+    run_git(
+        &other,
+        &[
+            "-c",
+            "user.name=Remote",
+            "-c",
+            "user.email=remote@example.test",
+            "commit",
+            "-m",
+            "remote main advanced",
+        ],
+    );
+    run_git(&other, &["push", "origin", "main"]);
+    std::fs::write(work.join("WORKER.md"), "worker change\n").unwrap();
+    run_git(&work, &["add", "WORKER.md"]);
+    run_git(
+        &work,
+        &[
+            "-c",
+            "user.name=Agent",
+            "-c",
+            "user.email=agent@example.test",
+            "commit",
+            "-m",
+            "agent committed change",
+        ],
+    );
+
+    let server = TestServer::new(vec![
+        ok(project_status_lookup(&[
+            ("Ready", "READY_OPTION"),
+            ("Done", "DONE_OPTION"),
+            ("In review", "REVIEW_OPTION"),
+        ])),
+        ok(json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM_1"}}}})),
+    ]);
+    let config = config(format!("{}/graphql", server.url()));
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+    let issue = issue("[Medium] Fix allocator");
+
+    let result = client.complete_issue(&issue, &work).await.unwrap();
+
+    assert_eq!(result.moved_to_state.as_deref(), Some("Done"));
+    assert_eq!(result.severity.as_deref(), Some("Medium"));
+    assert_eq!(
+        git_show(&remote, "refs/heads/main:REMOTE.md"),
+        "remote change\n"
+    );
+    assert_eq!(
+        git_show(&remote, "refs/heads/main:WORKER.md"),
+        "worker change\n"
+    );
+    let commit_message = git_show(&remote, "refs/heads/main^{commit}");
+    assert!(commit_message.contains("agent committed change"));
+    let parent_message = git_show(&remote, "refs/heads/main^1^{commit}");
+    assert!(parent_message.contains("remote main advanced"));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
 async fn mark_issue_started_moves_ready_issue_to_in_progress() {
     let server = TestServer::new(vec![
         ok(project_status_lookup(&[

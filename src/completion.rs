@@ -155,16 +155,28 @@ impl GitHubCompletionClient {
     ) -> Result<CompletionResult> {
         let severity = Severity::from_issue(issue)?;
         let has_workspace_changes = git_has_changes(workspace).await?;
-        let has_unpushed_commits = git_has_unpushed_commits(workspace).await?;
-        if !has_workspace_changes && !has_unpushed_commits {
+        let has_pending_local_commits = if has_workspace_changes {
+            true
+        } else {
+            git_status_has_unpushed_commits(workspace).await?
+        };
+        if !has_pending_local_commits {
             info!(issue_id = %issue.id, issue_identifier = %issue.identifier, "completion_skipped_no_changes");
             return Ok(CompletionResult::skipped("no workspace changes"));
         }
-
         ensure_on_base_branch(workspace, &self.direct_commit.base_branch).await?;
         if has_workspace_changes {
             git_commit_all(workspace, issue, &self.direct_commit).await?;
         }
+        git_fetch_base_branch(workspace, &self.direct_commit.base_branch, &self.token).await?;
+        let has_unpushed_commits =
+            git_has_unpushed_commits(workspace, &self.direct_commit.base_branch).await?;
+        if !has_unpushed_commits {
+            info!(issue_id = %issue.id, issue_identifier = %issue.identifier, "completion_skipped_no_changes");
+            return Ok(CompletionResult::skipped("no workspace changes"));
+        }
+        git_rebase_onto_base_branch(workspace, &self.direct_commit.base_branch).await?;
+
         let commit_sha = git_commit_sha(workspace).await?;
         git_push_base_branch(workspace, &self.direct_commit.base_branch, &self.token).await?;
         let target_state = severity.target_state(&self.direct_commit).to_string();
@@ -334,12 +346,44 @@ async fn git_has_changes(workspace: &Path) -> Result<bool> {
     Ok(!output.trim().is_empty())
 }
 
-async fn git_has_unpushed_commits(workspace: &Path) -> Result<bool> {
+async fn git_status_has_unpushed_commits(workspace: &Path) -> Result<bool> {
     let output = git_output(workspace, &["status", "--porcelain=v1", "--branch"], None).await?;
     Ok(output
         .lines()
         .next()
         .is_some_and(|line| line.contains("[ahead ")))
+}
+
+async fn git_fetch_base_branch(workspace: &Path, base_branch: &str, token: &str) -> Result<()> {
+    let auth_header = github_git_authorization_header(token);
+    git_output(
+        workspace,
+        &["fetch", "origin", base_branch],
+        Some(auth_header.as_str()),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn git_has_unpushed_commits(workspace: &Path, base_branch: &str) -> Result<bool> {
+    let revision_range = format!("origin/{base_branch}..HEAD");
+    let output = git_output(workspace, &["rev-list", "--count", &revision_range], None).await?;
+    let count = output
+        .trim()
+        .parse::<u64>()
+        .map_err(|err| completion_error("git_output", err.to_string()))?;
+    Ok(count > 0)
+}
+
+async fn git_rebase_onto_base_branch(workspace: &Path, base_branch: &str) -> Result<()> {
+    let upstream = format!("origin/{base_branch}");
+    match git_output(workspace, &["rebase", &upstream], None).await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = git_output(workspace, &["rebase", "--abort"], None).await;
+            Err(error)
+        }
+    }
 }
 
 async fn ensure_on_base_branch(workspace: &Path, base_branch: &str) -> Result<()> {
