@@ -243,6 +243,25 @@ fn retry_claims_block_workspace_key_until_released() {
 }
 
 #[test]
+fn scheduled_retry_claims_block_workspace_key_until_released() {
+    let config = config(2, []);
+    let mut state = OrchestratorState::default();
+    let retrying = issue("id-1", "S/001", "In Progress");
+    let colliding = issue("id-2", "S?001", "In Progress");
+
+    let retry = state.schedule_retry_now(&retrying, 1, Some("transient failure".to_string()));
+
+    assert_eq!(retry.workspace_key, "S_001");
+    assert_eq!(
+        dispatch_ineligible_reason(&colliding, &state, &config),
+        Some(DispatchIneligibleReason::AlreadyRunningOrClaimed)
+    );
+
+    state.release(&retrying.id);
+    assert!(is_dispatch_eligible(&colliding, &state, &config));
+}
+
+#[test]
 fn worker_exit_schedules_normal_continuation_retry_and_keeps_retry_claim() {
     let config = config(1, []);
     let mut state = OrchestratorState::default();
