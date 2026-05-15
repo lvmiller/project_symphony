@@ -39,6 +39,16 @@ fn assert_hook_error(error: SymphonyError, hook: &'static str, message_contains:
     }
 }
 
+fn assert_workspace_error(error: SymphonyError, message_contains: &str) {
+    match error {
+        SymphonyError::Workspace(message) => assert!(
+            message.contains(message_contains),
+            "expected workspace error message to contain {message_contains:?}, got {message:?}"
+        ),
+        other => panic!("expected workspace error, got {other:?}"),
+    }
+}
+
 #[test]
 fn sanitizes_workspace_keys_to_safe_path_segments() {
     assert_eq!(sanitize_workspace_key("issue/123"), "issue_123");
@@ -55,6 +65,34 @@ fn sanitizes_workspace_keys_to_safe_path_segments() {
 
     assert_eq!(key, "_");
     assert_eq!(path, manager.root().join("_"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_symlink_workspace_path_is_rejected_on_create() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().expect("tempdir");
+    let outside = TempDir::new().expect("outside tempdir");
+    let manager = manager(temp.path(), hooks_with_timeout(1_000));
+    let (_, path) = manager
+        .workspace_path_for_identifier("issue-1")
+        .expect("path should be contained");
+    fs::create_dir_all(temp.path()).expect("root create");
+    symlink(outside.path(), &path).expect("workspace symlink create");
+
+    let error = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect_err("symlink workspace should fail safely");
+
+    assert_workspace_error(error, "symlink");
+    assert!(
+        fs::symlink_metadata(&path)
+            .expect("symlink remains")
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[tokio::test]
@@ -132,6 +170,31 @@ async fn after_create_runs_only_for_new_workspace_with_workspace_cwd() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn before_run_rejects_symlink_workspace_before_hook_runs() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().expect("tempdir");
+    let outside = TempDir::new().expect("outside tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.before_run = Some("printf ran > marker".to_string());
+    let manager = manager(temp.path(), hooks);
+    let (_, path) = manager
+        .workspace_path_for_identifier("issue-1")
+        .expect("path should be contained");
+    fs::create_dir_all(temp.path()).expect("root create");
+    symlink(outside.path(), &path).expect("workspace symlink create");
+
+    let error = manager
+        .before_run(&path)
+        .await
+        .expect_err("symlink workspace should fail before hook");
+
+    assert_workspace_error(error, "symlink");
+    assert!(!outside.path().join("marker").exists());
+}
+
 #[tokio::test]
 async fn before_run_failure_is_fatal() {
     let temp = TempDir::new().expect("tempdir");
@@ -167,6 +230,38 @@ async fn after_run_failure_is_ignored_after_hook_runs() {
         fs::read_to_string(workspace.path.join("after_run_marker"))
             .expect("marker should be written"),
         "ran"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remove_rejects_symlink_workspace_before_hook_or_delete() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().expect("tempdir");
+    let outside = TempDir::new().expect("outside tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.before_remove = Some("printf ran > marker".to_string());
+    let manager = manager(temp.path(), hooks);
+    let (_, path) = manager
+        .workspace_path_for_identifier("issue-1")
+        .expect("path should be contained");
+    fs::create_dir_all(temp.path()).expect("root create");
+    symlink(outside.path(), &path).expect("workspace symlink create");
+
+    let error = manager
+        .remove_for_identifier("issue-1")
+        .await
+        .expect_err("symlink workspace cleanup should fail before hook");
+
+    assert_workspace_error(error, "symlink");
+    assert!(outside.path().exists());
+    assert!(!outside.path().join("marker").exists());
+    assert!(
+        fs::symlink_metadata(&path)
+            .expect("symlink remains")
+            .file_type()
+            .is_symlink()
     );
 }
 
