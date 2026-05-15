@@ -69,7 +69,7 @@ pub fn dispatch_ineligible_reason(
     if !config.is_active_state(&issue.state) {
         return Some(DispatchIneligibleReason::InactiveState);
     }
-    if state.running.contains_key(&issue.id) || state.claimed.contains(&issue.id) {
+    if state.is_issue_or_workspace_claimed(issue) {
         return Some(DispatchIneligibleReason::AlreadyRunningOrClaimed);
     }
     if available_global_slots(state, config) == 0 {

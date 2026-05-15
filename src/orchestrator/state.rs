@@ -12,11 +12,13 @@ use crate::orchestrator::retry::{
     continuation_retry_due_at_ms, failure_retry_delay_ms, failure_retry_due_at_ms,
 };
 use crate::time::{ms_from_now, utc_elapsed_ms};
+use crate::workspace::sanitize_workspace_key;
 
 #[derive(Clone, Debug)]
 pub struct RunningEntry {
     pub issue: Issue,
     pub identifier: String,
+    pub workspace_key: String,
     pub started_at: DateTime<Utc>,
     pub retry_attempt: Option<u32>,
     pub live_session: Option<LiveSession>,
@@ -36,6 +38,7 @@ pub enum ReconcileDecision {
 pub struct OrchestratorState {
     pub running: BTreeMap<String, RunningEntry>,
     pub claimed: BTreeSet<String>,
+    pub claimed_workspace_keys: BTreeSet<String>,
     pub retry_attempts: BTreeMap<String, RetryEntry>,
     pub completed: BTreeSet<String>,
     pub codex_totals: TokenTotals,
@@ -47,13 +50,16 @@ impl OrchestratorState {
     pub fn claim_running(&mut self, issue: Issue, attempt: Option<u32>, started_at: DateTime<Utc>) {
         let issue_id = issue.id.clone();
         let identifier = issue.identifier.clone();
+        let workspace_key = sanitize_workspace_key(&identifier);
         self.claimed.insert(issue_id.clone());
+        self.claimed_workspace_keys.insert(workspace_key.clone());
         self.retry_attempts.remove(&issue_id);
         self.running.insert(
             issue_id,
             RunningEntry {
                 issue,
                 identifier,
+                workspace_key,
                 started_at,
                 retry_attempt: attempt,
                 live_session: None,
@@ -70,6 +76,13 @@ impl OrchestratorState {
                 .or_insert(0) += 1;
         }
         counts
+    }
+
+    pub fn is_issue_or_workspace_claimed(&self, issue: &Issue) -> bool {
+        self.claimed.contains(&issue.id)
+            || self
+                .claimed_workspace_keys
+                .contains(&sanitize_workspace_key(&issue.identifier))
     }
 
     pub fn apply_codex_event(&mut self, event: CodexEvent) {
@@ -144,11 +157,14 @@ impl OrchestratorState {
             let retry = RetryEntry {
                 issue_id: issue_id.to_string(),
                 identifier: entry.identifier,
+                workspace_key: entry.workspace_key,
                 attempt: 1,
                 due_at_ms: continuation_retry_due_at_ms(now_ms),
                 error: None,
             };
             self.claimed.insert(issue_id.to_string());
+            self.claimed_workspace_keys
+                .insert(retry.workspace_key.clone());
             self.retry_attempts
                 .insert(issue_id.to_string(), retry.clone());
             Some(retry)
@@ -157,6 +173,7 @@ impl OrchestratorState {
             let retry = RetryEntry {
                 issue_id: issue_id.to_string(),
                 identifier: entry.identifier,
+                workspace_key: entry.workspace_key,
                 attempt: next_attempt,
                 due_at_ms: failure_retry_due_at_ms(
                     next_attempt,
@@ -166,6 +183,8 @@ impl OrchestratorState {
                 error: reason.error_message(),
             };
             self.claimed.insert(issue_id.to_string());
+            self.claimed_workspace_keys
+                .insert(retry.workspace_key.clone());
             self.retry_attempts
                 .insert(issue_id.to_string(), retry.clone());
             Some(retry)
@@ -173,8 +192,12 @@ impl OrchestratorState {
     }
 
     pub fn release(&mut self, issue_id: &str) {
-        self.running.remove(issue_id);
-        self.retry_attempts.remove(issue_id);
+        if let Some(entry) = self.running.remove(issue_id) {
+            self.claimed_workspace_keys.remove(&entry.workspace_key);
+        }
+        if let Some(retry) = self.retry_attempts.remove(issue_id) {
+            self.claimed_workspace_keys.remove(&retry.workspace_key);
+        }
         self.claimed.remove(issue_id);
     }
 
@@ -274,11 +297,14 @@ impl OrchestratorState {
         let retry = RetryEntry {
             issue_id: issue.id.clone(),
             identifier: issue.identifier.clone(),
+            workspace_key: sanitize_workspace_key(&issue.identifier),
             attempt,
             due_at_ms: ms_from_now(failure_retry_delay_ms(attempt, u64::MAX)),
             error: error.into(),
         };
         self.claimed.insert(issue.id.clone());
+        self.claimed_workspace_keys
+            .insert(retry.workspace_key.clone());
         self.retry_attempts.insert(issue.id.clone(), retry.clone());
         retry
     }

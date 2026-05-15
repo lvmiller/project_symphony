@@ -120,6 +120,7 @@ impl LiveSession {
 pub struct RetryEntry {
     pub issue_id: String,
     pub identifier: String,
+    pub workspace_key: String,
     pub attempt: u32,
     pub due_at_ms: u64,
     pub error: Option<String>,

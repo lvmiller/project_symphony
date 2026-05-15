@@ -197,6 +197,52 @@ fn concurrency_uses_global_and_per_state_slots_and_release_frees_claims() {
 }
 
 #[test]
+fn dispatch_rejects_different_issue_ids_with_same_workspace_key() {
+    let config = config(2, []);
+    let mut state = OrchestratorState::default();
+    let running = issue("id-1", "S/001", "Todo");
+    let colliding = issue("id-2", "S?001", "Todo");
+
+    state.claim_running(running.clone(), None, ts(0));
+
+    assert_eq!(
+        dispatch_ineligible_reason(&colliding, &state, &config),
+        Some(DispatchIneligibleReason::AlreadyRunningOrClaimed)
+    );
+
+    state.release(&running.id);
+    assert!(is_dispatch_eligible(&colliding, &state, &config));
+}
+
+#[test]
+fn retry_claims_block_workspace_key_until_released() {
+    let config = config(2, []);
+    let mut state = OrchestratorState::default();
+    let running = issue("id-1", "S/001", "In Progress");
+    let colliding = issue("id-2", "S?001", "In Progress");
+    state.claim_running(running.clone(), None, ts(0));
+
+    let retry = state
+        .worker_exit(
+            &running.id,
+            WorkerExitReason::Normal,
+            &config,
+            50,
+            ts(1_000),
+        )
+        .unwrap();
+
+    assert_eq!(retry.workspace_key, "S_001");
+    assert_eq!(
+        dispatch_ineligible_reason(&colliding, &state, &config),
+        Some(DispatchIneligibleReason::AlreadyRunningOrClaimed)
+    );
+
+    state.release(&running.id);
+    assert!(is_dispatch_eligible(&colliding, &state, &config));
+}
+
+#[test]
 fn worker_exit_schedules_normal_continuation_retry_and_keeps_retry_claim() {
     let config = config(1, []);
     let mut state = OrchestratorState::default();

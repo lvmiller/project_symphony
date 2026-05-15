@@ -223,6 +223,7 @@ async fn dispatch_due_retries(
             continue;
         };
         state.claimed.remove(&issue_id);
+        state.claimed_workspace_keys.remove(&retry.workspace_key);
         if is_dispatch_eligible(&issue, state, &config) {
             dispatch_issue(
                 state,
@@ -243,6 +244,9 @@ async fn dispatch_due_retries(
                 config.agent.max_retry_backoff_ms,
             ));
             state.claimed.insert(issue_id.clone());
+            state
+                .claimed_workspace_keys
+                .insert(retry.workspace_key.clone());
             state.retry_attempts.insert(issue_id, retry);
         }
     }
