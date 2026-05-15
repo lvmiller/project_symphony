@@ -192,13 +192,17 @@ impl OrchestratorState {
     }
 
     pub fn release(&mut self, issue_id: &str) {
+        let mut workspace_keys = Vec::new();
         if let Some(entry) = self.running.remove(issue_id) {
-            self.claimed_workspace_keys.remove(&entry.workspace_key);
+            workspace_keys.push(entry.workspace_key);
         }
         if let Some(retry) = self.retry_attempts.remove(issue_id) {
-            self.claimed_workspace_keys.remove(&retry.workspace_key);
+            workspace_keys.push(retry.workspace_key);
         }
         self.claimed.remove(issue_id);
+        for workspace_key in workspace_keys {
+            self.release_workspace_key_if_unowned(&workspace_key);
+        }
     }
 
     pub fn reconcile_running_issue(
@@ -307,5 +311,19 @@ impl OrchestratorState {
             .insert(retry.workspace_key.clone());
         self.retry_attempts.insert(issue.id.clone(), retry.clone());
         retry
+    }
+
+    pub(crate) fn release_workspace_key_if_unowned(&mut self, workspace_key: &str) {
+        let owned_by_running = self
+            .running
+            .values()
+            .any(|entry| entry.workspace_key == workspace_key);
+        let owned_by_retry = self
+            .retry_attempts
+            .values()
+            .any(|retry| retry.workspace_key == workspace_key);
+        if !owned_by_running && !owned_by_retry {
+            self.claimed_workspace_keys.remove(workspace_key);
+        }
     }
 }

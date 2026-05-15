@@ -215,6 +215,27 @@ fn dispatch_rejects_different_issue_ids_with_same_workspace_key() {
 }
 
 #[test]
+fn releasing_one_owner_does_not_free_workspace_key_still_owned_by_another_entry() {
+    let config = config(3, []);
+    let mut state = OrchestratorState::default();
+    let first = issue("id-1", "S/001", "Todo");
+    let second = issue("id-2", "S?001", "Todo");
+    let third = issue("id-3", "S 001", "Todo");
+
+    state.claim_running(first.clone(), None, ts(0));
+    state.claim_running(second.clone(), None, ts(0));
+
+    state.release(&first.id);
+    assert_eq!(
+        dispatch_ineligible_reason(&third, &state, &config),
+        Some(DispatchIneligibleReason::AlreadyRunningOrClaimed)
+    );
+
+    state.release(&second.id);
+    assert!(is_dispatch_eligible(&third, &state, &config));
+}
+
+#[test]
 fn retry_claims_block_workspace_key_until_released() {
     let config = config(2, []);
     let mut state = OrchestratorState::default();

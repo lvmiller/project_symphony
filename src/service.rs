@@ -223,7 +223,7 @@ async fn dispatch_due_retries(
             continue;
         };
         state.claimed.remove(&issue_id);
-        state.claimed_workspace_keys.remove(&retry.workspace_key);
+        state.release_workspace_key_if_unowned(&retry.workspace_key);
         if is_dispatch_eligible(&issue, state, &config) {
             dispatch_issue(
                 state,
