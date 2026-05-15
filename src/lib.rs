@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod completion;
 pub mod config;
 pub mod domain;
 pub mod error;

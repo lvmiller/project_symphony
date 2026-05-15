@@ -7,8 +7,8 @@ use chrono::Utc;
 use symphony::agent::codex::{CodexClient, TurnOutcome};
 use symphony::agent::runner::{AgentRunner, SymphonyAgentRunner};
 use symphony::config::{
-    AgentConfig, CodexConfig, EffectiveConfig, GithubConfig, GithubProjectOwnerType, HooksConfig,
-    PollingConfig, TrackerConfig, WorkspaceConfig,
+    AgentConfig, CodexConfig, CompletionConfig, EffectiveConfig, GithubConfig,
+    GithubProjectOwnerType, HooksConfig, PollingConfig, TrackerConfig, WorkspaceConfig,
 };
 use symphony::domain::{CodexEvent, Issue, WorkerExitReason};
 use symphony::error::{Result, SymphonyError};
@@ -243,6 +243,7 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
             read_timeout_ms: 1_000,
             stall_timeout_ms: 1_000,
         },
+        completion: CompletionConfig::default(),
     }
 }
 

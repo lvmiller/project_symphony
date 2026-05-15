@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 use symphony::config::{
-    AgentConfig, CodexConfig, EffectiveConfig, GithubConfig, GithubProjectOwnerType, HooksConfig,
-    PollingConfig, TrackerConfig, WorkspaceConfig,
+    AgentConfig, CodexConfig, CompletionConfig, EffectiveConfig, GithubConfig,
+    GithubProjectOwnerType, HooksConfig, PollingConfig, TrackerConfig, WorkspaceConfig,
 };
 use symphony::domain::{BlockerRef, CodexEvent, Issue, TokenTotals, WorkerExitReason};
 use symphony::orchestrator::retry::{
@@ -74,6 +74,7 @@ fn config(
             read_timeout_ms: 10_000,
             stall_timeout_ms: 0,
         },
+        completion: CompletionConfig::default(),
     }
 }
 

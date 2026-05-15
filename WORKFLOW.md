@@ -1,0 +1,80 @@
+---
+tracker:
+  kind: github
+  api_key: $GITHUB_TOKEN
+  repository:
+    owner: lvmiller
+    name: project_symphony
+  project:
+    owner_type: user
+    owner_login: lvmiller
+    # From https://github.com/users/lvmiller/projects/2
+    number: 2
+    status_field: Status
+    priority_field: Priority
+  active_states:
+    - Ready
+    - In progress
+  terminal_states:
+    - Done
+  priority_labels:
+    P0: 100
+    P1: 75
+    P2: 50
+
+polling:
+  interval_ms: 60000
+
+workspace:
+  root: ./.symphony-workspaces
+
+hooks:
+  timeout_ms: 120000
+  after_create: |
+    git clone --depth 1 https://github.com/lvmiller/project_symphony.git .
+
+agent:
+  max_concurrent_agents: 1
+  max_turns: 1
+  max_retry_backoff_ms: 300000
+  max_concurrent_agents_by_state:
+    In progress: 1
+
+codex:
+  command: codex app-server
+  approval_policy: never
+  thread_sandbox: danger-full-access
+  turn_sandbox_policy:
+    type: dangerFullAccess
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 5000
+  stall_timeout_ms: 300000
+
+completion:
+  direct_commit:
+    enabled: true
+    base_branch: main
+    high_review_state: In review
+    auto_approved_state: Done
+    commit_author_name: Symphony
+    commit_author_email: symphony@users.noreply.github.com
+---
+You are working in an isolated Symphony workspace for GitHub issue {{ issue.identifier }}.
+
+Repository: lvmiller/project_symphony
+Issue URL: {{ issue.url }}
+Issue title: {{ issue.title }}
+Issue state: {{ issue.state }}
+Attempt: {{ attempt }}
+
+Issue description:
+{{ issue.description }}
+
+Instructions:
+- Treat SPEC.md and AGENTS.md as authoritative for this repository.
+- Implement only the requested issue; do not broaden scope.
+- Preserve workspace safety: do not write outside the current workspace.
+- Run focused verification for the behavior you change.
+- The issue title starts with `[Low]`, `[Medium]`, or `[High]`; treat that prefix as the severity for review policy.
+- Do not create branches, open pull requests, push, or mutate GitHub tracker state from this run; Symphony will commit verified changes to main and move the project item according to severity.
+- Stop after one complete implementation-and-verification pass and report what changed, what was verified, and any remaining blocker.

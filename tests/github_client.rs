@@ -33,6 +33,39 @@ async fn sends_auth_query_and_project_variables() {
     assert_eq!(body["variables"]["projectOwnerLogin"], "octo-org");
     assert_eq!(body["variables"]["projectNumber"], 7);
     assert!(body["variables"]["after"].is_null());
+    assert_eq!(body["variables"]["isOrganization"].as_bool(), Some(true));
+    assert_eq!(body["variables"]["isUser"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn user_owned_projects_query_only_user_owner() {
+    let server = TestServer::new(vec![ok(project_page_for_owner(
+        GithubProjectOwnerType::User,
+        false,
+        None,
+        Vec::new(),
+    ))]);
+    let client = client_for_owner_type(
+        server.url(),
+        vec!["Todo"],
+        BTreeMap::new(),
+        GithubProjectOwnerType::User,
+    );
+
+    let issues = client.fetch_candidate_issues().await.unwrap();
+
+    assert!(issues.is_empty());
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_str(request_body(&requests[0])).unwrap();
+    let query = body["query"].as_str().unwrap();
+    assert!(
+        query.contains("organization(login: $projectOwnerLogin) @include(if: $isOrganization)")
+    );
+    assert!(query.contains("user(login: $projectOwnerLogin) @include(if: $isUser)"));
+    assert_eq!(body["variables"]["projectOwnerLogin"], "octo-user");
+    assert_eq!(body["variables"]["isOrganization"].as_bool(), Some(false));
+    assert_eq!(body["variables"]["isUser"].as_bool(), Some(true));
 }
 
 #[tokio::test]
@@ -185,6 +218,24 @@ fn client(
     active_states: Vec<&str>,
     priority_labels: BTreeMap<String, i64>,
 ) -> GitHubTrackerClient {
+    client_for_owner_type(
+        endpoint,
+        active_states,
+        priority_labels,
+        GithubProjectOwnerType::Organization,
+    )
+}
+
+fn client_for_owner_type(
+    endpoint: String,
+    active_states: Vec<&str>,
+    priority_labels: BTreeMap<String, i64>,
+    project_owner_type: GithubProjectOwnerType,
+) -> GitHubTrackerClient {
+    let project_owner_login = match project_owner_type {
+        GithubProjectOwnerType::Organization => "octo-org",
+        GithubProjectOwnerType::User => "octo-user",
+    };
     let tracker = TrackerConfig {
         kind: "github".to_string(),
         endpoint,
@@ -194,8 +245,8 @@ fn client(
         github: Some(GithubConfig {
             repository_owner: "octo-org".to_string(),
             repository_name: "octo-repo".to_string(),
-            project_owner_type: GithubProjectOwnerType::Organization,
-            project_owner_login: "octo-org".to_string(),
+            project_owner_type,
+            project_owner_login: project_owner_login.to_string(),
             project_number: 7,
             status_field_name: "Status".to_string(),
             priority_field_name: Some("Priority".to_string()),
@@ -208,19 +259,42 @@ fn client(
 }
 
 fn project_page(has_next_page: bool, end_cursor: Option<&str>, nodes: Vec<Value>) -> Value {
-    json!({
-        "data": {
-            "organization": {
-                "projectV2": {
-                    "items": {
-                        "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
-                        "nodes": nodes
-                    }
-                }
-            },
-            "user": null
+    project_page_for_owner(
+        GithubProjectOwnerType::Organization,
+        has_next_page,
+        end_cursor,
+        nodes,
+    )
+}
+
+fn project_page_for_owner(
+    owner_type: GithubProjectOwnerType,
+    has_next_page: bool,
+    end_cursor: Option<&str>,
+    nodes: Vec<Value>,
+) -> Value {
+    let owner = json!({
+        "projectV2": {
+            "items": {
+                "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+                "nodes": nodes
+            }
         }
-    })
+    });
+    match owner_type {
+        GithubProjectOwnerType::Organization => json!({
+            "data": {
+                "organization": owner,
+                "user": null
+            }
+        }),
+        GithubProjectOwnerType::User => json!({
+            "data": {
+                "organization": null,
+                "user": owner
+            }
+        }),
+    }
 }
 
 fn project_item(

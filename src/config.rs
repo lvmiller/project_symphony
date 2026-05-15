@@ -39,6 +39,7 @@ pub struct EffectiveConfig {
     pub hooks: HooksConfig,
     pub agent: AgentConfig,
     pub codex: CodexConfig,
+    pub completion: CompletionConfig,
 }
 
 impl EffectiveConfig {
@@ -54,6 +55,7 @@ impl EffectiveConfig {
         let hooks = parse_hooks(&workflow.config)?;
         let agent = parse_agent(&workflow.config)?;
         let codex = parse_codex(&workflow.config)?;
+        let completion = parse_completion(&workflow.config)?;
         Ok(Self {
             workflow_path: workflow.path,
             workflow_dir,
@@ -64,6 +66,7 @@ impl EffectiveConfig {
             hooks,
             agent,
             codex,
+            completion,
         })
     }
 
@@ -231,6 +234,34 @@ pub struct CodexConfig {
     pub turn_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub stall_timeout_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionConfig {
+    pub direct_commit: DirectCommitCompletionConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectCommitCompletionConfig {
+    pub enabled: bool,
+    pub base_branch: String,
+    pub high_review_state: String,
+    pub auto_approved_state: String,
+    pub commit_author_name: String,
+    pub commit_author_email: String,
+}
+
+impl Default for DirectCommitCompletionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_branch: "main".to_string(),
+            high_review_state: "In review".to_string(),
+            auto_approved_state: "Done".to_string(),
+            commit_author_name: "Symphony".to_string(),
+            commit_author_email: "symphony@users.noreply.github.com".to_string(),
+        }
+    }
 }
 
 pub struct ConfigReloader {
@@ -506,6 +537,69 @@ fn parse_codex(config: &Mapping) -> Result<CodexConfig> {
     })
 }
 
+fn parse_completion(config: &Mapping) -> Result<CompletionConfig> {
+    let completion = get_map(config, "completion");
+    let direct_commit = get_nested_map(completion, "direct_commit");
+    let mut direct_commit_config = DirectCommitCompletionConfig {
+        enabled: get_bool(direct_commit, "enabled").unwrap_or(false),
+        base_branch: get_string(direct_commit, "base_branch").unwrap_or_else(|| "main".to_string()),
+        high_review_state: get_string(direct_commit, "high_review_state")
+            .or_else(|| get_string(completion, "high_review_state"))
+            .unwrap_or_else(|| "In review".to_string()),
+        auto_approved_state: get_string(direct_commit, "auto_approved_state")
+            .or_else(|| get_string(completion, "auto_approved_state"))
+            .unwrap_or_else(|| "Done".to_string()),
+        commit_author_name: get_string(direct_commit, "commit_author_name")
+            .unwrap_or_else(|| "Symphony".to_string()),
+        commit_author_email: get_string(direct_commit, "commit_author_email")
+            .unwrap_or_else(|| "symphony@users.noreply.github.com".to_string()),
+    };
+    direct_commit_config.base_branch = direct_commit_config.base_branch.trim().to_string();
+    direct_commit_config.high_review_state =
+        direct_commit_config.high_review_state.trim().to_string();
+    direct_commit_config.auto_approved_state =
+        direct_commit_config.auto_approved_state.trim().to_string();
+    direct_commit_config.commit_author_name =
+        direct_commit_config.commit_author_name.trim().to_string();
+    direct_commit_config.commit_author_email =
+        direct_commit_config.commit_author_email.trim().to_string();
+    if direct_commit_config.enabled {
+        if direct_commit_config.base_branch.is_empty() {
+            return Err(SymphonyError::config(
+                "invalid_completion_base_branch",
+                "completion.direct_commit.base_branch must be non-empty",
+            ));
+        }
+        if direct_commit_config.high_review_state.is_empty() {
+            return Err(SymphonyError::config(
+                "invalid_completion_high_review_state",
+                "completion.direct_commit.high_review_state must be non-empty",
+            ));
+        }
+        if direct_commit_config.auto_approved_state.is_empty() {
+            return Err(SymphonyError::config(
+                "invalid_completion_auto_approved_state",
+                "completion.direct_commit.auto_approved_state must be non-empty",
+            ));
+        }
+        if direct_commit_config.commit_author_name.is_empty() {
+            return Err(SymphonyError::config(
+                "invalid_completion_commit_author_name",
+                "completion.direct_commit.commit_author_name must be non-empty",
+            ));
+        }
+        if direct_commit_config.commit_author_email.is_empty() {
+            return Err(SymphonyError::config(
+                "invalid_completion_commit_author_email",
+                "completion.direct_commit.commit_author_email must be non-empty",
+            ));
+        }
+    }
+    Ok(CompletionConfig {
+        direct_commit: direct_commit_config,
+    })
+}
+
 pub fn normalize_state(state: &str) -> String {
     state.to_ascii_lowercase()
 }
@@ -604,6 +698,14 @@ fn get_i64(mapping: Option<&Mapping>, name: &str) -> Option<i64> {
     get_value(mapping, name).and_then(|value| match value {
         Value::Number(n) => n.as_i64(),
         Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+fn get_bool(mapping: Option<&Mapping>, name: &str) -> Option<bool> {
+    get_value(mapping, name).and_then(|value| match value {
+        Value::Bool(value) => Some(*value),
+        Value::String(value) => value.parse::<bool>().ok(),
         _ => None,
     })
 }

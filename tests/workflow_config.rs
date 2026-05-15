@@ -94,6 +94,13 @@ fn github_defaults_and_default_token_indirection_are_applied() {
     assert_eq!(config.codex.read_timeout_ms, 5_000);
     assert_eq!(config.codex.stall_timeout_ms, 300_000);
     assert!(config.workspace.root.ends_with("symphony_workspaces"));
+    assert!(!config.completion.direct_commit.enabled);
+    assert_eq!(config.completion.direct_commit.base_branch, "main");
+    assert_eq!(
+        config.completion.direct_commit.high_review_state,
+        "In review"
+    );
+    assert_eq!(config.completion.direct_commit.auto_approved_state, "Done");
 }
 
 #[test]
@@ -171,4 +178,40 @@ fn per_state_concurrency_keys_are_normalized_and_invalid_values_ignored() {
         config.agent.max_concurrent_agents_by_state["in progress"],
         3
     );
+}
+
+#[test]
+fn completion_direct_commit_config_is_parsed_and_validated() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let valid = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\ncompletion:\n  direct_commit:\n    enabled: true\n    base_branch: trunk\n    high_review_state: In review\n    auto_approved_state: Done\n    commit_author_name: Bot\n    commit_author_email: bot@example.test\n---\nPrompt\n",
+    );
+    let config = load_from_path(valid);
+    assert!(config.completion.direct_commit.enabled);
+    assert_eq!(config.completion.direct_commit.base_branch, "trunk");
+    assert_eq!(
+        config.completion.direct_commit.high_review_state,
+        "In review"
+    );
+    assert_eq!(config.completion.direct_commit.auto_approved_state, "Done");
+    assert_eq!(config.completion.direct_commit.commit_author_name, "Bot");
+    assert_eq!(
+        config.completion.direct_commit.commit_author_email,
+        "bot@example.test"
+    );
+
+    let invalid = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\ncompletion:\n  direct_commit:\n    enabled: true\n    high_review_state: \"  \"\n---\nPrompt\n",
+    );
+    let error = EffectiveConfig::load(Some(invalid)).unwrap_err();
+    match error {
+        SymphonyError::ConfigValidation { code, .. } => {
+            assert_eq!(code, "invalid_completion_high_review_state");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }

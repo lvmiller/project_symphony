@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use crate::agent::codex::CodexClient;
+use crate::completion::GitHubCompletionClient;
 use crate::config::EffectiveConfig;
 use crate::domain::{CodexEvent, Issue, WorkerExitReason};
 use crate::error::Result;
@@ -61,7 +62,7 @@ impl SymphonyAgentRunner {
             Err(error) => return WorkerExitReason::Failed(error.to_string()),
         };
 
-        let reason = match self
+        let mut reason = match self
             .run_in_workspace(issue, attempt, on_event, &workspace.path)
             .await
         {
@@ -70,7 +71,49 @@ impl SymphonyAgentRunner {
         };
 
         self.workspace.after_run_best_effort(&workspace.path).await;
+        if reason.is_normal()
+            && let Err(error) = self.complete_if_configured(issue, &workspace.path).await
+        {
+            reason = WorkerExitReason::Failed(error.to_string());
+        }
         reason
+    }
+
+    async fn complete_if_configured(
+        &self,
+        issue: &Issue,
+        workspace_path: &std::path::Path,
+    ) -> Result<()> {
+        let Some(completion) = GitHubCompletionClient::new(&self.config)? else {
+            return Ok(());
+        };
+        let refreshed = self
+            .tracker
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
+            .await?;
+        let Some(current) = refreshed.iter().find(|current| current.id == issue.id) else {
+            return Err(crate::error::SymphonyError::tracker(
+                "completion_missing_issue",
+                "issue was not returned by tracker state refresh",
+            ));
+        };
+        if !self.config.is_active_state(&current.state) {
+            info!(
+                issue_id = %issue.id,
+                issue_identifier = %issue.identifier,
+                state = %current.state,
+                "completion_skipped_inactive_issue"
+            );
+            return Ok(());
+        }
+        let result = completion.complete_issue(current, workspace_path).await?;
+        if let Some(reason) = result.skipped_reason {
+            return Err(crate::error::SymphonyError::tracker(
+                "completion_skipped",
+                reason,
+            ));
+        }
+        Ok(())
     }
 
     async fn run_in_workspace(

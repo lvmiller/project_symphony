@@ -18,9 +18,11 @@ query SymphonyProjectItems(
   $projectOwnerLogin: String!
   $projectNumber: Int!
   $after: String
+  $isOrganization: Boolean!
+  $isUser: Boolean!
 ) {
   repository(owner: $repositoryOwner, name: $repositoryName) { id }
-  organization(login: $projectOwnerLogin) {
+  organization(login: $projectOwnerLogin) @include(if: $isOrganization) {
     projectV2(number: $projectNumber) {
       items(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
@@ -46,7 +48,7 @@ query SymphonyProjectItems(
       }
     }
   }
-  user(login: $projectOwnerLogin) {
+  user(login: $projectOwnerLogin) @include(if: $isUser) {
     projectV2(number: $projectNumber) {
       items(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
@@ -193,6 +195,8 @@ impl GitHubTrackerClient {
             "projectOwnerLogin": self.github.project_owner_login,
             "projectNumber": self.github.project_number,
             "after": after,
+            "isOrganization": matches!(self.github.project_owner_type, GithubProjectOwnerType::Organization),
+            "isUser": matches!(self.github.project_owner_type, GithubProjectOwnerType::User),
         })
     }
 
