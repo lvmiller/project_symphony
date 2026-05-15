@@ -10,7 +10,7 @@ Keep implementation boundaries aligned with `SPEC.md`:
 
 1. `Workflow Loader` reads `WORKFLOW.md`, parses optional YAML front matter, and returns `{ config, prompt_template }`.
 2. `Config Layer` applies defaults, resolves explicit `$VAR` indirection, validates typed values, and supports dynamic reload with last-known-good fallback.
-3. `Issue Tracker Client` fetches Linear-compatible candidate issues, terminal issues, and current states; it normalizes payloads into the stable issue model.
+3. `Issue Tracker Client` fetches GitHub Project v2 candidate issues, terminal issues, and current states; it normalizes payloads into the stable issue model.
 4. `Orchestrator` is the single owner of scheduling state (`running`, `claimed`, `retry_attempts`) and performs poll, reconcile, dispatch, retry, and release transitions.
 5. `Workspace Manager` maps sanitized issue identifiers to `<workspace.root>/<workspace_key>`, runs hooks, and enforces workspace-root containment.
 6. `Agent Runner` creates/reuses the workspace, renders the prompt, launches `codex app-server`, streams events, and reports outcomes back to the orchestrator.
@@ -58,14 +58,15 @@ Runtime command execution patterns from the spec:
 
 ## Important Files
 
-- `SPEC.md`: primary reference for domain model, workflow schema, state machine, Linear contract, Codex integration, observability, failure handling, and safety rules.
+- `SPEC.md`: primary reference for domain model, workflow schema, state machine, GitHub Projects v2 contract, Codex integration, observability, failure handling, and safety rules.
 - `WORKFLOW.md` (expected, absent): repository-owned runtime policy file with YAML front matter plus Markdown prompt template.
 - Future implementation should document any implementation-defined choices required by the spec, especially approval/sandbox policy, workspace population, logging sinks, and status surfaces.
 
 ## Runtime/Tooling Preferences
 
 - Runtime is intentionally language-agnostic, but the host must support local filesystem workspaces, shell hooks, issue-tracker access, and a Codex app-server-compatible executable.
-- Current tracker target is Linear (`tracker.kind: linear`) with default endpoint `https://api.linear.app/graphql`; canonical env var is `LINEAR_API_KEY` when referenced from config.
+- Current tracker target is GitHub Projects v2 (`tracker.kind: github`) with default endpoint `https://api.github.com/graphql`; canonical env var is `GITHUB_TOKEN` when referenced from config.
+- Required GitHub tracker config includes `repository.owner`, `repository.name`, `project.owner_login`, and `project.number`; `project.owner_type` defaults to `organization`, and the Project v2 Status field is the canonical issue state.
 - Default workspace root is `<system-temp>/symphony_workspaces`; relative `workspace.root` values resolve relative to `WORKFLOW.md`.
 - Codex protocol schemas and message shapes must come from the targeted Codex app-server version, not from hand-maintained assumptions in this repo.
 - Approval, sandbox, operator-confirmation, workspace population, log sinks, and optional HTTP/status surfaces are implementation-defined and must be documented when implemented.
@@ -77,9 +78,9 @@ There is no current test framework, test command, CI config, or coverage policy.
 When implementation begins, add focused tests around spec-critical behavior before declaring features done:
 
 - `WORKFLOW.md` parsing, non-map front matter errors, strict template rendering, and dynamic reload last-known-good behavior.
-- Config defaults, `$VAR` resolution, required Linear fields, and invalid-value handling.
+- Config defaults, `$VAR` resolution, required GitHub repository/project fields, and invalid-value handling.
 - Workspace key sanitization, root containment, hook timeout/failure semantics, and non-destructive reuse.
 - Orchestrator candidate eligibility, concurrency limits, retry backoff, reconciliation, terminal cleanup, and restart recovery assumptions.
-- Linear pagination, payload normalization, error category mapping, and malformed response handling.
+- GitHub Project v2 pagination, payload normalization, error category mapping, and malformed response handling.
 - Codex runner launch cwd validation, timeout/stall handling, event/token accounting, unsupported tool calls, and user-input-required policy.
 - Logging assertions for required context fields and secret redaction.
