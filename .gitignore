@@ -1,5 +1,6 @@
 /target/
 /.symphony-workspaces/
+/WORKFLOW.md
 .DS_Store
 *.log
 *.tmp

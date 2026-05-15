@@ -3,13 +3,13 @@ tracker:
   kind: github
   api_key: $GITHUB_TOKEN
   repository:
-    owner: lvmiller
-    name: project_symphony
+    owner: your-org-or-user
+    name: your-repo
   project:
-    owner_type: user
-    owner_login: lvmiller
-    # From https://github.com/users/lvmiller/projects/2
-    number: 2
+    owner_type: user # user or organization
+    owner_login: your-org-or-user
+    # From https://github.com/users/<owner>/projects/<number> or /orgs/<owner>/projects/<number>
+    number: 1
     status_field: Status
     priority_field: Priority
   active_states:
@@ -31,7 +31,7 @@ workspace:
 hooks:
   timeout_ms: 120000
   after_create: |
-    git clone --depth 1 https://github.com/lvmiller/project_symphony.git .
+    git clone --depth 1 https://github.com/your-org-or-user/your-repo.git .
 
 agent:
   max_concurrent_agents: 1
@@ -62,7 +62,7 @@ completion:
 ---
 You are working in an isolated Symphony workspace for GitHub issue {{ issue.identifier }}.
 
-Repository: lvmiller/project_symphony
+Repository: your-org-or-user/your-repo
 Issue URL: {{ issue.url }}
 Issue title: {{ issue.title }}
 Issue state: {{ issue.state }}
@@ -72,7 +72,7 @@ Issue description:
 {{ issue.description }}
 
 Instructions:
-- Treat SPEC.md and AGENTS.md as authoritative for this repository.
+- Treat repository guidance and specifications as authoritative.
 - Implement only the requested issue; do not broaden scope.
 - Preserve workspace safety: do not write outside the current workspace.
 - Run focused verification for the behavior you change.

@@ -47,6 +47,12 @@ cargo run -- path/to/WORKFLOW.md
 
 If no path is provided, Symphony uses `./WORKFLOW.md`.
 
+For local setup, copy the committed example and customize repository/project values:
+
+```sh
+cp WORKFLOW.example.md WORKFLOW.md
+```
+
 The binary validates startup config before entering the service loop. It exits nonzero on startup failures and logs structured `key=value` events to stderr.
 
 ## Minimal `WORKFLOW.md`
@@ -124,11 +130,12 @@ AGENTS.md         Repository guidance
 
 ## GitHub upload notes
 
-Commit source, tests, `Cargo.toml`, `Cargo.lock`, `SPEC.md`, `AGENTS.md`, `.gitignore`, and this README.
+Commit source, tests, `Cargo.toml`, `Cargo.lock`, `SPEC.md`, `AGENTS.md`, `.gitignore`, `WORKFLOW.example.md`, and this README.
 
 Do not upload generated or local-only artifacts:
 
 - `target/`, including generated Codex schemas under `target/codex-schema/`
 - `.env` or `.env.*`
+- `WORKFLOW.md` local runtime policy; commit `WORKFLOW.example.md` instead
 - logs/temp files
 - OS/editor metadata such as `.DS_Store`, `.idea/`, `.vscode/`
