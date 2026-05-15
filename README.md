@@ -21,7 +21,7 @@ Optional `SPEC.md` extensions are intentionally not included: HTTP status server
 
 - Rust toolchain with Cargo.
 - `codex` CLI with app-server support.
-- GitHub token with access to the configured repository and Project v2.
+- GitHub token with access to the configured repository and Project v2; when `completion.direct_commit.enabled` is true, the token must be able to push repository contents and update the Project v2 status field.
 
 The GitHub token is usually provided through `GITHUB_TOKEN` and referenced from `WORKFLOW.md` as `$GITHUB_TOKEN`.
 

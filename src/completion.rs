@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -377,20 +378,28 @@ async fn git_commit_sha(workspace: &Path) -> Result<String> {
 
 async fn git_push_base_branch(workspace: &Path, base_branch: &str, token: &str) -> Result<()> {
     let refspec = format!("HEAD:refs/heads/{base_branch}");
+    let auth_header = github_git_authorization_header(token);
     git_output(
         workspace,
         &["push", "origin", &refspec],
-        Some(("AUTHORIZATION: bearer ", token)),
+        Some(auth_header.as_str()),
     )
     .await
     .map(|_| ())
 }
 
-async fn git_output(
-    workspace: &Path,
-    args: &[&str],
-    auth_header: Option<(&str, &str)>,
-) -> Result<String> {
+fn github_git_authorization_header(token: &str) -> String {
+    let mut credentials = String::with_capacity("x-access-token:".len() + token.len());
+    credentials.push_str("x-access-token:");
+    credentials.push_str(token);
+
+    let encoded = BASE64_STANDARD.encode(credentials);
+    let mut header = String::with_capacity("AUTHORIZATION: basic ".len() + encoded.len());
+    header.push_str("AUTHORIZATION: basic ");
+    header.push_str(&encoded);
+    header
+}
+async fn git_output(workspace: &Path, args: &[&str], auth_header: Option<&str>) -> Result<String> {
     let mut command = Command::new("git");
     command
         .args(args)
@@ -399,11 +408,11 @@ async fn git_output(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0");
-    if let Some((prefix, token)) = auth_header {
+    if let Some(header) = auth_header {
         command
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-            .env("GIT_CONFIG_VALUE_0", format!("{prefix}{token}"));
+            .env("GIT_CONFIG_VALUE_0", header);
     }
     let output = command
         .output()
@@ -565,4 +574,17 @@ fn issue_number(issue: &Issue) -> Option<i64> {
 
 fn completion_error(kind: &'static str, message: impl Into<String>) -> SymphonyError {
     SymphonyError::tracker(kind, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::github_git_authorization_header;
+
+    #[test]
+    fn github_git_authorization_header_uses_x_access_token_basic_auth() {
+        assert_eq!(
+            github_git_authorization_header("token-123"),
+            "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46dG9rZW4tMTIz"
+        );
+    }
 }

@@ -7,8 +7,9 @@ use chrono::Utc;
 use symphony::agent::codex::{CodexClient, TurnOutcome};
 use symphony::agent::runner::{AgentRunner, SymphonyAgentRunner};
 use symphony::config::{
-    AgentConfig, CodexConfig, CompletionConfig, EffectiveConfig, GithubConfig,
-    GithubProjectOwnerType, HooksConfig, PollingConfig, TrackerConfig, WorkspaceConfig,
+    AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
+    GithubConfig, GithubProjectOwnerType, HooksConfig, PollingConfig, TrackerConfig,
+    WorkspaceConfig,
 };
 use symphony::domain::{CodexEvent, Issue, WorkerExitReason};
 use symphony::error::{Result, SymphonyError};
@@ -73,6 +74,45 @@ async fn runner_runs_lifecycle_hooks_and_stops_on_terminal_state() {
     assert_eq!(outcome.reason, WorkerExitReason::Normal);
     assert_eq!(codex.prompts().len(), 1);
     assert_eq!(std::fs::read_to_string(events).unwrap(), "beforeafter");
+}
+
+#[tokio::test]
+async fn runner_treats_direct_completion_without_changes_as_normal_skip() {
+    let temp = TempDir::new().unwrap();
+    let mut issue = issue("ISS-4", "active");
+    issue.title = "[Medium] Fix allocator".to_string();
+
+    let mut config = config(temp.path(), 1, "{{ issue.identifier }}");
+    config.hooks = HooksConfig {
+        after_create: Some("git init".to_string()),
+        timeout_ms: 60_000,
+        ..HooksConfig::default()
+    };
+    config.completion = CompletionConfig {
+        direct_commit: DirectCommitCompletionConfig {
+            enabled: true,
+            base_branch: "main".to_string(),
+            high_review_state: "In review".to_string(),
+            auto_approved_state: "Done".to_string(),
+            started_state: None,
+            commit_author_name: "Symphony".to_string(),
+            commit_author_email: "symphony@users.noreply.github.com".to_string(),
+        },
+    };
+    let workspace = WorkspaceManager::new(&config.workspace, config.hooks.clone()).unwrap();
+    let codex = Arc::new(FakeCodex::default());
+    let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
+    let runner = SymphonyAgentRunner::new(config, workspace, tracker.clone(), codex.clone());
+
+    let outcome = runner.run(issue, None, Box::new(|_| {})).await.unwrap();
+
+    assert_eq!(outcome.issue_id, "ISS-4");
+    assert_eq!(outcome.reason, WorkerExitReason::Normal);
+    assert_eq!(codex.prompts().len(), 1);
+    assert_eq!(
+        tracker.requested_ids(),
+        vec![vec!["ISS-4".to_string()], vec!["ISS-4".to_string()]]
+    );
 }
 
 #[tokio::test]

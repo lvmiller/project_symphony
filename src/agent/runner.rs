@@ -122,13 +122,7 @@ impl SymphonyAgentRunner {
             );
             return Ok(());
         }
-        let result = completion.complete_issue(current, workspace_path).await?;
-        if let Some(reason) = result.skipped_reason {
-            return Err(crate::error::SymphonyError::tracker(
-                "completion_skipped",
-                reason,
-            ));
-        }
+        completion.complete_issue(current, workspace_path).await?;
         Ok(())
     }
 

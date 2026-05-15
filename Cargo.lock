@@ -1600,6 +1600,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "liquid",
