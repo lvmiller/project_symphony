@@ -53,9 +53,16 @@ impl OrchestratorState {
         let workspace_key = sanitize_workspace_key(&identifier);
         self.claimed.insert(issue_id.clone());
         self.claimed_workspace_keys.insert(workspace_key.clone());
-        self.retry_attempts.remove(&issue_id);
+        let displaced_retry_workspace_key = self
+            .retry_attempts
+            .remove(&issue_id)
+            .map(|retry| retry.workspace_key);
+        let displaced_running_workspace_key = self
+            .running
+            .get(&issue_id)
+            .map(|entry| entry.workspace_key.clone());
         self.running.insert(
-            issue_id,
+            issue_id.clone(),
             RunningEntry {
                 issue,
                 identifier,
@@ -66,6 +73,12 @@ impl OrchestratorState {
                 cancel_requested: false,
             },
         );
+        for workspace_key in displaced_retry_workspace_key
+            .into_iter()
+            .chain(displaced_running_workspace_key)
+        {
+            self.release_workspace_key_if_unowned(&workspace_key);
+        }
     }
 
     pub fn running_state_counts(&self) -> StateCounts {
@@ -309,7 +322,13 @@ impl OrchestratorState {
         self.claimed.insert(issue.id.clone());
         self.claimed_workspace_keys
             .insert(retry.workspace_key.clone());
-        self.retry_attempts.insert(issue.id.clone(), retry.clone());
+        let displaced_retry_workspace_key = self
+            .retry_attempts
+            .insert(issue.id.clone(), retry.clone())
+            .map(|retry| retry.workspace_key);
+        if let Some(workspace_key) = displaced_retry_workspace_key {
+            self.release_workspace_key_if_unowned(&workspace_key);
+        }
         retry
     }
 

@@ -283,6 +283,44 @@ fn scheduled_retry_claims_block_workspace_key_until_released() {
 }
 
 #[test]
+fn replacing_running_entry_releases_displaced_workspace_key_for_same_issue_id() {
+    let config = config(2, []);
+    let mut state = OrchestratorState::default();
+    let original = issue("id-1", "S/001", "In Progress");
+    let renamed = issue("id-1", "S-002", "In Progress");
+    let old_key_collision = issue("id-2", "S?001", "In Progress");
+    let new_key_collision = issue("id-3", "S-002", "In Progress");
+
+    state.claim_running(original.clone(), None, ts(0));
+    state.claim_running(renamed, None, ts(1_000));
+
+    assert!(is_dispatch_eligible(&old_key_collision, &state, &config));
+    assert_eq!(
+        dispatch_ineligible_reason(&new_key_collision, &state, &config),
+        Some(DispatchIneligibleReason::AlreadyRunningOrClaimed)
+    );
+}
+
+#[test]
+fn replacing_retry_entry_releases_displaced_workspace_key_for_same_issue_id() {
+    let config = config(2, []);
+    let mut state = OrchestratorState::default();
+    let original = issue("id-1", "S/001", "In Progress");
+    let renamed = issue("id-1", "S-002", "In Progress");
+    let old_key_collision = issue("id-2", "S?001", "In Progress");
+    let new_key_collision = issue("id-3", "S-002", "In Progress");
+
+    state.schedule_retry_now(&original, 1, Some("first failure".to_string()));
+    state.schedule_retry_now(&renamed, 2, Some("second failure".to_string()));
+
+    assert!(is_dispatch_eligible(&old_key_collision, &state, &config));
+    assert_eq!(
+        dispatch_ineligible_reason(&new_key_collision, &state, &config),
+        Some(DispatchIneligibleReason::AlreadyRunningOrClaimed)
+    );
+}
+
+#[test]
 fn worker_exit_schedules_normal_continuation_retry_and_keeps_retry_claim() {
     let config = config(1, []);
     let mut state = OrchestratorState::default();
