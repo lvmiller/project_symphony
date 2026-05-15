@@ -175,7 +175,13 @@ impl GitHubCompletionClient {
             info!(issue_id = %issue.id, issue_identifier = %issue.identifier, "completion_skipped_no_changes");
             return Ok(CompletionResult::skipped("no workspace changes"));
         }
-        git_rebase_onto_base_branch(workspace, &self.direct_commit.base_branch).await?;
+        git_rebase_onto_base_branch(
+            workspace,
+            &self.direct_commit.base_branch,
+            issue,
+            &self.direct_commit,
+        )
+        .await?;
 
         let commit_sha = git_commit_sha(workspace).await?;
         git_push_base_branch(workspace, &self.direct_commit.base_branch, &self.token).await?;
@@ -375,15 +381,82 @@ async fn git_has_unpushed_commits(workspace: &Path, base_branch: &str) -> Result
     Ok(count > 0)
 }
 
-async fn git_rebase_onto_base_branch(workspace: &Path, base_branch: &str) -> Result<()> {
+async fn git_rebase_onto_base_branch(
+    workspace: &Path,
+    base_branch: &str,
+    issue: &Issue,
+    config: &DirectCommitCompletionConfig,
+) -> Result<()> {
     let upstream = format!("origin/{base_branch}");
-    match git_output(workspace, &["rebase", &upstream], None).await {
+    let error = match git_rebase(workspace, &upstream).await {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    if !is_dirty_rebase_error(&error) {
+        let _ = git_output(workspace, &["rebase", "--abort"], None).await;
+        return Err(error);
+    }
+
+    let stashed_changes = if git_has_changes(workspace).await? {
+        git_stash_push_rebase_retry(workspace).await?;
+        true
+    } else {
+        false
+    };
+    let _ = git_output(workspace, &["rebase", "--abort"], None).await;
+    if stashed_changes {
+        git_stash_pop(workspace).await?;
+    }
+    if git_has_changes(workspace).await? {
+        git_commit_all(workspace, issue, config).await?;
+    }
+    git_rebase_or_abort(workspace, &upstream).await
+}
+
+async fn git_rebase(workspace: &Path, upstream: &str) -> Result<()> {
+    git_output(workspace, &["rebase", upstream], None)
+        .await
+        .map(|_| ())
+}
+
+async fn git_rebase_or_abort(workspace: &Path, upstream: &str) -> Result<()> {
+    match git_rebase(workspace, upstream).await {
         Ok(_) => Ok(()),
         Err(error) => {
             let _ = git_output(workspace, &["rebase", "--abort"], None).await;
             Err(error)
         }
     }
+}
+async fn git_stash_push_rebase_retry(workspace: &Path) -> Result<()> {
+    git_output(
+        workspace,
+        &[
+            "stash",
+            "push",
+            "--include-untracked",
+            "-m",
+            "symphony-rebase-retry",
+        ],
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn git_stash_pop(workspace: &Path) -> Result<()> {
+    git_output(workspace, &["stash", "pop"], None)
+        .await
+        .map(|_| ())
+}
+
+fn is_dirty_rebase_error(error: &SymphonyError) -> bool {
+    let SymphonyError::Tracker { message, .. } = error else {
+        return false;
+    };
+    message.contains("Your local changes")
+        || message.contains("Please commit your changes or stash")
+        || message.contains("cannot rebase: You have unstaged changes")
 }
 
 async fn ensure_on_base_branch(workspace: &Path, base_branch: &str) -> Result<()> {

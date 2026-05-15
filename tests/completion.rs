@@ -279,6 +279,123 @@ async fn precommitted_worker_changes_rebase_when_remote_main_advanced() {
 }
 
 #[tokio::test]
+async fn dirty_rebase_retry_commits_late_workspace_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    let seed = create_working_repo(temp.path(), &remote);
+    std::fs::create_dir_all(seed.join("src")).unwrap();
+    std::fs::write(seed.join("src/service.rs"), "base\n").unwrap();
+    run_git(&seed, &["add", "src/service.rs"]);
+    run_git(
+        &seed,
+        &[
+            "-c",
+            "user.name=Seed",
+            "-c",
+            "user.email=seed@example.test",
+            "commit",
+            "-m",
+            "add service",
+        ],
+    );
+    run_git(&seed, &["push", "origin", "main"]);
+    let work = temp.path().join("worker");
+    let other = temp.path().join("other");
+    run_git(
+        temp.path(),
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            work.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        temp.path(),
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(other.join("REMOTE.md"), "remote change\n").unwrap();
+    run_git(&other, &["add", "REMOTE.md"]);
+    run_git(
+        &other,
+        &[
+            "-c",
+            "user.name=Remote",
+            "-c",
+            "user.email=remote@example.test",
+            "commit",
+            "-m",
+            "remote main advanced",
+        ],
+    );
+    run_git(&other, &["push", "origin", "main"]);
+    std::fs::write(work.join("WORKER.md"), "worker change\n").unwrap();
+    run_git(&work, &["add", "WORKER.md"]);
+    run_git(
+        &work,
+        &[
+            "-c",
+            "user.name=Agent",
+            "-c",
+            "user.email=agent@example.test",
+            "commit",
+            "-m",
+            "agent committed change",
+        ],
+    );
+    let pre_rebase_hook = work.join(".git/hooks/pre-rebase");
+    let hook_marker = temp.path().join("pre-rebase-ran");
+    std::fs::write(
+        &pre_rebase_hook,
+        format!(
+            "#!/bin/sh\nif [ ! -f {} ]; then printf 'late change\\n' >> src/service.rs; touch {}; fi\n",
+            shell_quote(&hook_marker),
+            shell_quote(&hook_marker)
+        ),
+    )
+    .unwrap();
+    make_executable(&pre_rebase_hook);
+
+    let server = TestServer::new(vec![
+        ok(project_status_lookup(&[
+            ("Ready", "READY_OPTION"),
+            ("Done", "DONE_OPTION"),
+            ("In review", "REVIEW_OPTION"),
+        ])),
+        ok(json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM_1"}}}})),
+    ]);
+    let config = config(format!("{}/graphql", server.url()));
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+    let issue = issue("[Medium] Fix allocator");
+
+    let result = client.complete_issue(&issue, &work).await.unwrap();
+
+    assert_eq!(result.moved_to_state.as_deref(), Some("Done"));
+    assert_eq!(
+        git_show(&remote, "refs/heads/main:REMOTE.md"),
+        "remote change\n"
+    );
+    assert_eq!(
+        git_show(&remote, "refs/heads/main:WORKER.md"),
+        "worker change\n"
+    );
+    assert_eq!(
+        git_show(&remote, "refs/heads/main:src/service.rs"),
+        "base\nlate change\n"
+    );
+    let commit_message = git_show(&remote, "refs/heads/main^{commit}");
+    assert!(commit_message.contains("lvmiller/project_symphony#1"));
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
 async fn mark_issue_started_moves_ready_issue_to_in_progress() {
     let server = TestServer::new(vec![
         ok(project_status_lookup(&[
@@ -505,6 +622,22 @@ fn git_show(git_dir: &Path, spec: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 fn ok(body: Value) -> HttpResponse {
