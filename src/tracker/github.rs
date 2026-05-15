@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{EffectiveConfig, GithubConfig, GithubProjectOwnerType, TrackerConfig};
@@ -33,10 +33,11 @@ query SymphonyProjectItems(
             ... on Issue {
               id number title body url createdAt updatedAt
               repository { nameWithOwner name owner { login } }
-              labels(first: 100) { nodes { name } }
+              labels(first: 100) { pageInfo { hasNextPage endCursor } nodes { name } }
             }
           }
           fieldValues(first: 50) {
+            pageInfo { hasNextPage endCursor }
             nodes {
               __typename
               ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
@@ -59,10 +60,11 @@ query SymphonyProjectItems(
             ... on Issue {
               id number title body url createdAt updatedAt
               repository { nameWithOwner name owner { login } }
-              labels(first: 100) { nodes { name } }
+              labels(first: 100) { pageInfo { hasNextPage endCursor } nodes { name } }
             }
           }
           fieldValues(first: 50) {
+            pageInfo { hasNextPage endCursor }
             nodes {
               __typename
               ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
@@ -84,11 +86,71 @@ query SymphonyIssueStates($ids: [ID!]!) {
     ... on Issue {
       id number title body url createdAt updatedAt
       repository { nameWithOwner name owner { login } }
-      labels(first: 100) { nodes { name } }
+      labels(first: 100) { pageInfo { hasNextPage endCursor } nodes { name } }
       projectItems(first: 100) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           fieldValues(first: 50) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              __typename
+              ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
+              ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2FieldCommon { name } } }
+              ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2FieldCommon { name } } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+const ISSUE_LABELS_QUERY: &str = r#"
+query SymphonyIssueLabels($id: ID!, $after: String) {
+  node(id: $id) {
+    __typename
+    ... on Issue {
+      labels(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { name }
+      }
+    }
+  }
+}
+"#;
+
+const PROJECT_ITEM_FIELD_VALUES_QUERY: &str = r#"
+query SymphonyProjectItemFieldValues($id: ID!, $after: String) {
+  node(id: $id) {
+    __typename
+    ... on ProjectV2Item {
+      fieldValues(first: 50, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          __typename
+          ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
+          ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2FieldCommon { name } } }
+          ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2FieldCommon { name } } }
+        }
+      }
+    }
+  }
+}
+"#;
+
+const ISSUE_PROJECT_ITEMS_QUERY: &str = r#"
+query SymphonyIssueProjectItems($id: ID!, $after: String) {
+  node(id: $id) {
+    __typename
+    ... on Issue {
+      projectItems(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          fieldValues(first: 50) {
+            pageInfo { hasNextPage endCursor }
             nodes {
               __typename
               ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
@@ -159,6 +221,7 @@ impl GitHubTrackerClient {
                 .await?;
             let connection = self.project_items_connection(&data)?;
             for item in connection.nodes {
+                let item = self.complete_project_item(item).await?;
                 if let Some(issue) = normalize_project_item(&self.github, item)?
                     && wanted.contains(&normalize_state_name(&issue.state))
                 {
@@ -255,6 +318,266 @@ impl GitHubTrackerClient {
             .data
             .ok_or_else(|| tracker_error("github_malformed", "missing GraphQL data"))
     }
+
+    async fn complete_project_item(&self, mut item: ProjectItem) -> Result<ProjectItem> {
+        if item.field_values.page_info.has_next_page {
+            let id = item.id.clone();
+            self.append_project_item_field_values(&id, &mut item.field_values)
+                .await?;
+        }
+        if let Some(content) = item.content.as_mut()
+            && content.get("__typename").and_then(Value::as_str) == Some("Issue")
+        {
+            self.append_issue_labels(content).await?;
+        }
+        Ok(item)
+    }
+
+    async fn append_issue_labels(&self, issue: &mut Value) -> Result<()> {
+        let issue_id = issue
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| tracker_error("github_malformed", "missing issue id"))?
+            .to_string();
+        let labels = issue
+            .get_mut("labels")
+            .ok_or_else(|| tracker_error("github_malformed", "missing issue labels"))?;
+        let Some(mut connection) = labels.as_object_mut() else {
+            return Err(tracker_error("github_malformed", "malformed issue labels"));
+        };
+        let mut page_info: PageInfo = serde_json::from_value(
+            connection
+                .get("pageInfo")
+                .cloned()
+                .unwrap_or_else(default_page_info_value),
+        )
+        .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+        let mut after = page_info.end_cursor.clone();
+        for _ in 0..1_000 {
+            if !page_info.has_next_page {
+                return Ok(());
+            }
+            let cursor = after.ok_or_else(|| {
+                tracker_error(
+                    "github_pagination",
+                    "GitHub returned hasNextPage=true without endCursor",
+                )
+            })?;
+            let next = self.fetch_issue_labels(&issue_id, Some(&cursor)).await?;
+            let nodes: Vec<Value> = next
+                .nodes
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+            extend_connection_nodes(&mut connection, &nodes)?;
+            if next.page_info.end_cursor.as_deref() == Some(cursor.as_str())
+                && next.page_info.has_next_page
+            {
+                return Err(tracker_error(
+                    "github_pagination",
+                    "GitHub returned the same pagination cursor twice",
+                ));
+            }
+            after = next.page_info.end_cursor.clone();
+            page_info = next.page_info;
+        }
+        Err(tracker_error(
+            "github_pagination",
+            "GitHub issue label pagination exceeded safety limit",
+        ))
+    }
+
+    async fn fetch_issue_labels(
+        &self,
+        issue_id: &str,
+        after: Option<&str>,
+    ) -> Result<LabelConnection> {
+        let data = self
+            .graphql(
+                ISSUE_LABELS_QUERY,
+                json!({ "id": issue_id, "after": after }),
+            )
+            .await?;
+        let labels = data
+            .get("node")
+            .and_then(|node| node.get("labels"))
+            .ok_or_else(|| tracker_error("github_malformed", "missing issue labels"))?;
+        serde_json::from_value(labels.clone())
+            .map_err(|err| tracker_error("github_malformed", err.to_string()))
+    }
+
+    async fn fetch_project_item_field_values(
+        &self,
+        item_id: &str,
+        after: Option<&str>,
+    ) -> Result<FieldValueConnection> {
+        let data = self
+            .graphql(
+                PROJECT_ITEM_FIELD_VALUES_QUERY,
+                json!({ "id": item_id, "after": after }),
+            )
+            .await?;
+        let field_values = data
+            .get("node")
+            .and_then(|node| node.get("fieldValues"))
+            .ok_or_else(|| tracker_error("github_malformed", "missing project item fieldValues"))?;
+        serde_json::from_value(field_values.clone())
+            .map_err(|err| tracker_error("github_malformed", err.to_string()))
+    }
+
+    async fn fetch_issue_project_items(
+        &self,
+        issue_id: &str,
+        after: Option<&str>,
+    ) -> Result<ProjectItemsConnection> {
+        let data = self
+            .graphql(
+                ISSUE_PROJECT_ITEMS_QUERY,
+                json!({ "id": issue_id, "after": after }),
+            )
+            .await?;
+        let project_items = data
+            .get("node")
+            .and_then(|node| node.get("projectItems"))
+            .ok_or_else(|| tracker_error("github_malformed", "missing issue projectItems"))?;
+        serde_json::from_value(project_items.clone())
+            .map_err(|err| tracker_error("github_malformed", err.to_string()))
+    }
+
+    async fn complete_issue_state_node(&self, issue: &mut Value) -> Result<()> {
+        self.append_issue_labels(issue).await?;
+        self.append_issue_project_items(issue).await?;
+        self.append_issue_project_item_field_values(issue).await
+    }
+
+    async fn append_issue_project_items(&self, issue: &mut Value) -> Result<()> {
+        let issue_id = issue
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| tracker_error("github_malformed", "missing issue id"))?
+            .to_string();
+        let project_items = issue
+            .get_mut("projectItems")
+            .ok_or_else(|| tracker_error("github_malformed", "missing issue projectItems"))?;
+        let Some(mut connection) = project_items.as_object_mut() else {
+            return Err(tracker_error(
+                "github_malformed",
+                "malformed issue projectItems",
+            ));
+        };
+        let mut page_info: PageInfo = serde_json::from_value(
+            connection
+                .get("pageInfo")
+                .cloned()
+                .unwrap_or_else(default_page_info_value),
+        )
+        .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+        let mut after = page_info.end_cursor.clone();
+        for _ in 0..1_000 {
+            if !page_info.has_next_page {
+                return Ok(());
+            }
+            let cursor = after.ok_or_else(|| {
+                tracker_error(
+                    "github_pagination",
+                    "GitHub returned hasNextPage=true without endCursor",
+                )
+            })?;
+            let next = self
+                .fetch_issue_project_items(&issue_id, Some(&cursor))
+                .await?;
+            let nodes: Vec<Value> = next
+                .nodes
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+            extend_connection_nodes(&mut connection, &nodes)?;
+            if next.page_info.end_cursor.as_deref() == Some(cursor.as_str())
+                && next.page_info.has_next_page
+            {
+                return Err(tracker_error(
+                    "github_pagination",
+                    "GitHub returned the same pagination cursor twice",
+                ));
+            }
+            after = next.page_info.end_cursor.clone();
+            page_info = next.page_info;
+        }
+        Err(tracker_error(
+            "github_pagination",
+            "GitHub issue project item pagination exceeded safety limit",
+        ))
+    }
+
+    async fn append_issue_project_item_field_values(&self, issue: &mut Value) -> Result<()> {
+        let Some(project_items) = issue
+            .get_mut("projectItems")
+            .and_then(|project_items| project_items.get_mut("nodes"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Ok(());
+        };
+        for project_item in project_items {
+            let item_id = project_item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| tracker_error("github_malformed", "missing project item id"))?
+                .to_string();
+            let field_values = project_item.get_mut("fieldValues").ok_or_else(|| {
+                tracker_error("github_malformed", "missing project item fieldValues")
+            })?;
+            let mut connection: FieldValueConnection = serde_json::from_value(field_values.clone())
+                .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+            if connection.page_info.has_next_page {
+                self.append_project_item_field_values(&item_id, &mut connection)
+                    .await?;
+                *field_values = serde_json::to_value(connection)
+                    .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn append_project_item_field_values(
+        &self,
+        item_id: &str,
+        connection: &mut FieldValueConnection,
+    ) -> Result<()> {
+        let mut page_info = std::mem::take(&mut connection.page_info);
+        let mut after = page_info.end_cursor.clone();
+        for _ in 0..1_000 {
+            if !page_info.has_next_page {
+                connection.page_info = page_info;
+                return Ok(());
+            }
+            let cursor = after.ok_or_else(|| {
+                tracker_error(
+                    "github_pagination",
+                    "GitHub returned hasNextPage=true without endCursor",
+                )
+            })?;
+            let next = self
+                .fetch_project_item_field_values(item_id, Some(&cursor))
+                .await?;
+            connection.nodes.extend(next.nodes);
+            if next.page_info.end_cursor.as_deref() == Some(cursor.as_str())
+                && next.page_info.has_next_page
+            {
+                return Err(tracker_error(
+                    "github_pagination",
+                    "GitHub returned the same pagination cursor twice",
+                ));
+            }
+            after = next.page_info.end_cursor.clone();
+            page_info = next.page_info;
+        }
+        Err(tracker_error(
+            "github_pagination",
+            "GitHub project item fieldValues pagination exceeded safety limit",
+        ))
+    }
 }
 
 #[async_trait]
@@ -287,6 +610,8 @@ impl TrackerClient for GitHubTrackerClient {
             if node.get("__typename").and_then(Value::as_str) != Some("Issue") {
                 continue;
             }
+            let mut node = node.clone();
+            self.complete_issue_state_node(&mut node).await?;
             let issue_node: IssueNode = serde_json::from_value(node.clone())
                 .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
             let mut values = Vec::new();
@@ -324,29 +649,43 @@ struct GraphqlError {
     message: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectItemsConnection {
     page_info: PageInfo,
     nodes: Vec<ProjectItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PageInfo {
     has_next_page: bool,
     end_cursor: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+impl Default for PageInfo {
+    fn default() -> Self {
+        Self {
+            has_next_page: false,
+            end_cursor: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectItem {
+    id: String,
+    #[serde(default)]
     content: Option<Value>,
     field_values: FieldValueConnection,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct FieldValueConnection {
+    #[serde(default)]
+    page_info: PageInfo,
     nodes: Vec<Value>,
 }
 
@@ -377,12 +716,14 @@ struct RepositoryOwnerNode {
     login: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct LabelConnection {
+    #[serde(default)]
+    page_info: PageInfo,
     nodes: Vec<LabelNode>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct LabelNode {
     name: String,
 }
@@ -529,6 +870,22 @@ fn normalized_set(states: &[String]) -> BTreeSet<String> {
 
 fn normalize_state_name(state: &str) -> String {
     state.trim().to_ascii_lowercase()
+}
+
+fn extend_connection_nodes(
+    connection: &mut serde_json::Map<String, Value>,
+    nodes: &[Value],
+) -> Result<()> {
+    let values = connection
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| tracker_error("github_malformed", "missing connection nodes"))?;
+    values.extend(nodes.iter().cloned());
+    Ok(())
+}
+
+fn default_page_info_value() -> Value {
+    json!({"hasNextPage": false, "endCursor": null})
 }
 
 fn tracker_error(kind: &'static str, message: impl Into<String>) -> SymphonyError {

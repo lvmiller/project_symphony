@@ -160,6 +160,161 @@ async fn fetches_issue_states_by_node_ids_from_project_items() {
 }
 
 #[tokio::test]
+async fn candidate_fetch_pages_nested_labels_and_field_values_before_normalizing() {
+    let mut content = issue_node("I_nested", 12, &["Bug"]);
+    content.as_object_mut().unwrap().insert(
+        "labels".to_string(),
+        json!({
+            "pageInfo": {"hasNextPage": true, "endCursor": "label-cursor-1"},
+            "nodes": [{"name": "Bug"}]
+        }),
+    );
+    let item = json!({
+        "id": "ITEM_nested",
+        "content": content,
+        "fieldValues": {
+            "pageInfo": {"hasNextPage": true, "endCursor": "field-cursor-1"},
+            "nodes": [text_field("Other", "ignored")]
+        }
+    });
+    let server = TestServer::new(vec![
+        ok(project_page(false, None, vec![item])),
+        ok(field_values_page(
+            false,
+            None,
+            vec![single_select("Status", "Todo"), text_field("Priority", "8")],
+        )),
+        ok(labels_page(
+            false,
+            None,
+            vec!["P1", "blocked-by:octo-org/octo-repo#8"],
+        )),
+    ]);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    let issues = client.fetch_candidate_issues().await.unwrap();
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].id, "I_nested");
+    assert_eq!(issues[0].state, "Todo");
+    assert_eq!(issues[0].priority, Some(8));
+    assert_eq!(
+        issues[0].labels,
+        vec!["bug", "p1", "blocked-by:octo-org/octo-repo#8"]
+    );
+    assert_eq!(
+        issues[0].blocked_by[0].identifier.as_deref(),
+        Some("octo-org/octo-repo#8")
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    let field_body: Value = serde_json::from_str(request_body(&requests[1])).unwrap();
+    assert!(
+        field_body["query"]
+            .as_str()
+            .unwrap()
+            .contains("SymphonyProjectItemFieldValues")
+    );
+    assert_eq!(field_body["variables"]["id"], "ITEM_nested");
+    assert_eq!(field_body["variables"]["after"], "field-cursor-1");
+    let labels_body: Value = serde_json::from_str(request_body(&requests[2])).unwrap();
+    assert!(
+        labels_body["query"]
+            .as_str()
+            .unwrap()
+            .contains("SymphonyIssueLabels")
+    );
+    assert_eq!(labels_body["variables"]["id"], "I_nested");
+    assert_eq!(labels_body["variables"]["after"], "label-cursor-1");
+}
+
+#[tokio::test]
+async fn state_refresh_pages_issue_project_items_and_nested_field_values() {
+    let mut issue = issue_node("I_refresh", 44, &["Bug"]);
+    issue.as_object_mut().unwrap().insert(
+        "labels".to_string(),
+        json!({
+            "pageInfo": {"hasNextPage": true, "endCursor": "label-cursor-1"},
+            "nodes": [{"name": "Bug"}]
+        }),
+    );
+    issue.as_object_mut().unwrap().insert(
+        "projectItems".to_string(),
+        json!({
+            "pageInfo": {"hasNextPage": true, "endCursor": "project-item-cursor-1"},
+            "nodes": [{
+                "id": "ITEM_first",
+                "fieldValues": {
+                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": []
+                }
+            }]
+        }),
+    );
+    let refreshed = json!({"data": {"nodes": [issue]}});
+    let server = TestServer::new(vec![
+        ok(refreshed),
+        ok(labels_page(
+            false,
+            None,
+            vec!["blocked-by:octo-org/octo-repo#1"],
+        )),
+        ok(project_items_page(
+            false,
+            None,
+            vec![json!({
+                "id": "ITEM_second",
+                "fieldValues": {
+                    "pageInfo": {"hasNextPage": true, "endCursor": "field-cursor-1"},
+                    "nodes": []
+                }
+            })],
+        )),
+        ok(field_values_page(
+            false,
+            None,
+            vec![
+                single_select("Status", "Review"),
+                text_field("Priority", "3"),
+            ],
+        )),
+    ]);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    let issues = client
+        .fetch_issue_states_by_ids(&["I_refresh".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].state, "Review");
+    assert_eq!(issues[0].priority, Some(3));
+    assert_eq!(
+        issues[0].blocked_by[0].identifier.as_deref(),
+        Some("octo-org/octo-repo#1")
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    let project_items_body: Value = serde_json::from_str(request_body(&requests[2])).unwrap();
+    assert!(
+        project_items_body["query"]
+            .as_str()
+            .unwrap()
+            .contains("SymphonyIssueProjectItems")
+    );
+    assert_eq!(project_items_body["variables"]["id"], "I_refresh");
+    assert_eq!(
+        project_items_body["variables"]["after"],
+        "project-item-cursor-1"
+    );
+    let field_body: Value = serde_json::from_str(request_body(&requests[3])).unwrap();
+    assert_eq!(field_body["variables"]["id"], "ITEM_second");
+    assert_eq!(field_body["variables"]["after"], "field-cursor-1");
+}
+
+#[tokio::test]
 async fn empty_state_and_id_inputs_do_not_call_api() {
     let server = TestServer::new(Vec::new());
     let client = client(server.url(), vec!["Todo"], BTreeMap::new());
@@ -313,6 +468,7 @@ fn project_item(
         fields.push(text_field("Blocked By", blocker));
     }
     json!({
+        "id": format!("ITEM_{id}"),
         "content": issue_node(id, number, labels),
         "fieldValues": {"nodes": fields}
     })
@@ -322,7 +478,7 @@ fn issue_node_with_project_item(id: &str, number: i64, status: &str) -> Value {
     let mut node = issue_node(id, number, &["Bug"]);
     node.as_object_mut().unwrap().insert(
         "projectItems".to_string(),
-        json!({"nodes": [{"fieldValues": {"nodes": [single_select("Status", status)]}}]}),
+        json!({"nodes": [{"id": format!("ITEM_{id}"), "fieldValues": {"nodes": [single_select("Status", status)]}}]}),
     );
     node
 }
@@ -343,6 +499,48 @@ fn issue_node(id: &str, number: i64, labels: &[&str]) -> Value {
             "owner": {"login": "octo-org"}
         },
         "labels": {"nodes": labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()}
+    })
+}
+
+fn labels_page(has_next_page: bool, end_cursor: Option<&str>, labels: Vec<&str>) -> Value {
+    json!({
+        "data": {
+            "node": {
+                "__typename": "Issue",
+                "labels": {
+                    "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+                    "nodes": labels.into_iter().map(|name| json!({"name": name})).collect::<Vec<_>>()
+                }
+            }
+        }
+    })
+}
+
+fn field_values_page(has_next_page: bool, end_cursor: Option<&str>, nodes: Vec<Value>) -> Value {
+    json!({
+        "data": {
+            "node": {
+                "__typename": "ProjectV2Item",
+                "fieldValues": {
+                    "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+                    "nodes": nodes
+                }
+            }
+        }
+    })
+}
+
+fn project_items_page(has_next_page: bool, end_cursor: Option<&str>, nodes: Vec<Value>) -> Value {
+    json!({
+        "data": {
+            "node": {
+                "__typename": "Issue",
+                "projectItems": {
+                    "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+                    "nodes": nodes
+                }
+            }
+        }
     })
 }
 
