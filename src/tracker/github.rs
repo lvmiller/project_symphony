@@ -342,7 +342,7 @@ impl GitHubTrackerClient {
         let labels = issue
             .get_mut("labels")
             .ok_or_else(|| tracker_error("github_malformed", "missing issue labels"))?;
-        let Some(mut connection) = labels.as_object_mut() else {
+        let Some(connection) = labels.as_object_mut() else {
             return Err(tracker_error("github_malformed", "malformed issue labels"));
         };
         let mut page_info: PageInfo = serde_json::from_value(
@@ -370,7 +370,7 @@ impl GitHubTrackerClient {
                 .map(serde_json::to_value)
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
-            extend_connection_nodes(&mut connection, &nodes)?;
+            extend_connection_nodes(connection, &nodes)?;
             if next.page_info.end_cursor.as_deref() == Some(cursor.as_str())
                 && next.page_info.has_next_page
             {
@@ -460,7 +460,7 @@ impl GitHubTrackerClient {
         let project_items = issue
             .get_mut("projectItems")
             .ok_or_else(|| tracker_error("github_malformed", "missing issue projectItems"))?;
-        let Some(mut connection) = project_items.as_object_mut() else {
+        let Some(connection) = project_items.as_object_mut() else {
             return Err(tracker_error(
                 "github_malformed",
                 "malformed issue projectItems",
@@ -493,7 +493,7 @@ impl GitHubTrackerClient {
                 .map(serde_json::to_value)
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
-            extend_connection_nodes(&mut connection, &nodes)?;
+            extend_connection_nodes(connection, &nodes)?;
             if next.page_info.end_cursor.as_deref() == Some(cursor.as_str())
                 && next.page_info.has_next_page
             {
@@ -656,20 +656,11 @@ struct ProjectItemsConnection {
     nodes: Vec<ProjectItem>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PageInfo {
     has_next_page: bool,
     end_cursor: Option<String>,
-}
-
-impl Default for PageInfo {
-    fn default() -> Self {
-        Self {
-            has_next_page: false,
-            end_cursor: None,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

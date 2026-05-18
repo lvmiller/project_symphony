@@ -10,6 +10,7 @@ pub mod logging;
 pub mod orchestrator;
 pub mod prompt;
 pub mod service;
+pub mod shutdown;
 pub mod time;
 pub mod tracker;
 pub mod workflow;

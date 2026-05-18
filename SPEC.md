@@ -143,6 +143,32 @@ Symphony is easiest to port when kept in these layers:
 - Coding-agent executable that supports the targeted Codex app-server mode.
 - Host environment authentication for the issue tracker and coding agent.
 
+### 3.4 Containerized Deployment Profile
+
+A Docker/OCI container is a conforming host environment for the local execution mode. In this
+profile:
+
+- `Host environment` means the container filesystem, process environment, user, network namespace,
+  mounted volumes, and installed tools.
+- The image/container MUST provide the Symphony executable, a shell compatible with the configured
+  subprocess/hook invocation, a compatible Codex app-server executable, CA certificates, and any
+  workflow hook tools required by `WORKFLOW.md` (for example Git).
+- `WORKFLOW.md` MAY be baked into the image, mounted read-only, or supplied as an explicit workflow
+  path. Secrets MUST be supplied at runtime through environment variables or secret mounts; they
+  MUST NOT be baked into reusable images.
+- `workspace.root` MUST resolve to a writable path inside the container. For preserved workspaces
+  across container replacement, it SHOULD be backed by a mounted volume. Relative workspace roots
+  still resolve relative to the selected `WORKFLOW.md` path inside the container.
+- Workspace hooks and `codex.command` execute inside the container, not on the Docker host. Any host
+  paths needed by hooks or the agent MUST be mounted into the container and referenced by their
+  container paths.
+- The container MUST run Symphony as the foreground service process, either directly or under an
+  init/reaper, and treat SIGINT and SIGTERM as normal shutdown requests. Docker/OCI deployments
+  SHOULD use an init/reaper process or equivalent when workflow tools may spawn extra child
+  processes.
+- Container isolation is an additional deployment boundary; it does not weaken workspace containment,
+  secret handling, hook timeout, approval, or sandbox requirements elsewhere in this specification.
+
 ## 4. Core Domain Model
 
 ### 4.1 Entities
@@ -897,6 +923,7 @@ Execution contract:
   `cwd`.
 - On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
   conforming default.
+- In containerized deployments, this shell context is the container environment, not the Docker host.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 
@@ -957,6 +984,8 @@ Notes:
 - The default command is `codex app-server`.
 - Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
   using fields supported by the targeted Codex app-server version.
+- In containerized deployments, `codex.command` is resolved inside the container environment and any
+  referenced filesystem paths are container paths.
 
 RECOMMENDED additional process settings:
 
@@ -2073,6 +2102,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - CLI surfaces startup failure cleanly
 - CLI exits with success when application starts and shuts down normally
 - CLI exits nonzero when startup fails or the host process exits abnormally
+- CLI treats SIGINT and SIGTERM as normal shutdown requests.
 
 ### 17.8 Real Integration Profile (RECOMMENDED)
 
@@ -2115,6 +2145,7 @@ Use the same validation profiles as Section 17:
 - Workspace cleanup for terminal issues (startup sweep + active transition)
 - Structured logs with `issue_id`, `issue_identifier`, and `session_id`
 - Operator-visible observability (structured logs; OPTIONAL snapshot/status surface)
+- Host lifecycle handles SIGINT/SIGTERM normal shutdown, including container stop semantics.
 
 ### 18.2 RECOMMENDED Extensions (Not REQUIRED for Conformance)
 

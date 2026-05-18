@@ -1,0 +1,11 @@
+.git
+/target
+/.symphony-workspaces
+/WORKFLOW.md
+.env
+.env.*
+*.log
+*.tmp
+.DS_Store
+/.idea
+/.vscode

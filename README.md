@@ -21,6 +21,7 @@ Optional `SPEC.md` extensions are intentionally not included: HTTP status server
 
 - Rust toolchain with Cargo.
 - `codex` CLI with app-server support.
+- Docker or another OCI runtime if building/running the container image.
 - GitHub token with access to the configured repository and Project v2; when `completion.direct_commit.enabled` is true, the token must be able to push repository contents and update the Project v2 status field.
 
 The GitHub token is usually provided through `GITHUB_TOKEN` and referenced from `WORKFLOW.md` as `$GITHUB_TOKEN`.
@@ -31,6 +32,12 @@ The GitHub token is usually provided through `GITHUB_TOKEN` and referenced from 
 cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
+```
+
+Container image:
+
+```sh
+docker build -t symphony:local .
 ```
 
 If the filesystem has Cargo incremental-lock issues, use:
@@ -54,6 +61,36 @@ cp WORKFLOW.example.md WORKFLOW.md
 ```
 
 The binary validates startup config before entering the service loop. It exits nonzero on startup failures and logs structured `key=value` events to stderr.
+
+## Run in Docker
+
+Use container paths in `WORKFLOW.md`. The committed example's `workspace.root: ./.symphony-workspaces`
+works with the mount below because the container workdir is `/app`.
+Pass any additional Codex authentication variables or mounted credential files required by the
+installed `codex` CLI. The image includes `tini` as PID 1 for signal forwarding and child reaping.
+
+```sh
+mkdir -p .symphony-workspaces
+docker run --rm \
+  -e GITHUB_TOKEN \
+  -e OPENAI_API_KEY \
+  -v "$PWD/WORKFLOW.md:/app/WORKFLOW.md:ro" \
+  -v "$PWD/.symphony-workspaces:/app/.symphony-workspaces" \
+  symphony:local
+```
+
+For configuration-only validation:
+
+```sh
+docker run --rm \
+  -e GITHUB_TOKEN \
+  -v "$PWD/WORKFLOW.md:/app/WORKFLOW.md:ro" \
+  -v "$PWD/.symphony-workspaces:/app/.symphony-workspaces" \
+  symphony:local --check
+```
+
+If a workflow uses `workspace.root: $SYMPHONY_WORKSPACE_ROOT`, the image sets that variable to
+`/app/.symphony-workspaces` by default.
 
 ## Minimal `WORKFLOW.md`
 
@@ -106,6 +143,8 @@ Implementation-defined choices are part of the runtime contract:
 - Existing non-directory workspace path: fail safely; never replace user data.
 - Codex default posture: high-trust defaults are used unless overridden in `WORKFLOW.md` with schema-valid Codex values.
 - User input required by Codex: treated as a run failure so the worker does not stall indefinitely.
+- Container runtime: the image uses `tini` for PID 1 signal forwarding/reaping, handles
+  SIGINT/SIGTERM, and executes hooks plus `codex.command` inside the container namespace.
 - Logging: structured logs are emitted to stderr; secrets must not be logged.
 
 ## Repository layout
@@ -126,11 +165,13 @@ src/
 tests/            Conformance-focused integration tests
 SPEC.md           Normative service specification
 AGENTS.md         Repository guidance
+Dockerfile        Container image build for Symphony + Codex CLI
+.dockerignore     Container build context exclusions
 ```
 
 ## GitHub upload notes
 
-Commit source, tests, `Cargo.toml`, `Cargo.lock`, `SPEC.md`, `AGENTS.md`, `.gitignore`, `WORKFLOW.example.md`, and this README.
+Commit source, tests, `Cargo.toml`, `Cargo.lock`, `SPEC.md`, `AGENTS.md`, `.gitignore`, `.dockerignore`, `Dockerfile`, `WORKFLOW.example.md`, and this README.
 
 Do not upload generated or local-only artifacts:
 

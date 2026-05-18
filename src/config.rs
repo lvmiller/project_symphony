@@ -13,6 +13,8 @@
 //!   `tracker.kind: github`; this implementation always uses the public GitHub GraphQL endpoint.
 //! - Existing non-directory workspace path policy: fail safely; never replace user data.
 //! - User-input-required policy: the Codex client fails the run rather than waiting indefinitely.
+//! - Container runtime: the published image uses an init/reaper, executes hooks and Codex inside the
+//!   container namespace, and expects workflow/workspace paths to be container paths.
 
 use std::collections::BTreeMap;
 use std::env;

@@ -4,6 +4,7 @@ use clap::Parser;
 use symphony::config::ConfigReloader;
 use symphony::logging::init_logging;
 use symphony::service::run_service_until_shutdown;
+use symphony::shutdown::shutdown_signal;
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -40,11 +41,5 @@ async fn main() {
             eprintln!("startup_failed error=\"{error}\"");
             std::process::exit(1);
         }
-    }
-}
-
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("signal_error error=\"{error}\"");
     }
 }
