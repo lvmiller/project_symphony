@@ -9,7 +9,7 @@ use crate::completion::GitHubCompletionClient;
 use crate::config::EffectiveConfig;
 use crate::domain::{CodexEvent, Issue, WorkerExitReason};
 use crate::error::Result;
-use crate::prompt::{continuation_prompt, render_prompt};
+use crate::prompt::{PromptSourceContext, continuation_prompt, render_prompt_with_source};
 use crate::tracker::TrackerClient;
 use crate::workspace::WorkspaceManager;
 
@@ -57,7 +57,11 @@ impl SymphonyAgentRunner {
         attempt: Option<u32>,
         on_event: &mut (dyn FnMut(CodexEvent) + Send),
     ) -> WorkerExitReason {
-        let workspace = match self.workspace.create_for_issue(issue).await {
+        let workspace = match self
+            .workspace
+            .create_for_source_issue(&self.config.source.id, issue)
+            .await
+        {
             Ok(workspace) => workspace,
             Err(error) => return WorkerExitReason::Failed(error.to_string()),
         };
@@ -74,13 +78,34 @@ impl SymphonyAgentRunner {
             Err(error) => WorkerExitReason::Failed(error.to_string()),
         };
 
-        self.workspace.after_run_best_effort(&workspace.path).await;
-        if reason.is_normal()
-            && let Err(error) = self
+        self.workspace
+            .after_run_best_effort_for_source(&self.config.source.id, &workspace.path)
+            .await;
+        if reason.is_normal() {
+            match self
                 .complete_if_configured(&working_issue, &workspace.path)
                 .await
-        {
-            reason = WorkerExitReason::Failed(error.to_string());
+            {
+                Ok(true) => {
+                    if let Err(error) = self
+                        .workspace
+                        .remove_for_source_issue(&self.config.source.id, &working_issue)
+                        .await
+                    {
+                        warn!(
+                            source_id = %self.config.source.id,
+                            issue_id = %working_issue.id,
+                            issue_identifier = %working_issue.identifier,
+                            error = %error,
+                            "workspace_cleanup_after_commit_failed"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    reason = WorkerExitReason::Failed(error.to_string());
+                }
+            }
         }
         reason
     }
@@ -99,9 +124,9 @@ impl SymphonyAgentRunner {
         &self,
         issue: &Issue,
         workspace_path: &std::path::Path,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(completion) = GitHubCompletionClient::new(&self.config)? else {
-            return Ok(());
+            return Ok(false);
         };
         let refreshed = self
             .tracker
@@ -120,10 +145,15 @@ impl SymphonyAgentRunner {
                 state = %current.state,
                 "completion_skipped_inactive_issue"
             );
-            return Ok(());
+            return Ok(false);
         }
-        completion.complete_issue(current, workspace_path).await?;
-        Ok(())
+        let result = completion.complete_issue(current, workspace_path).await?;
+        Ok(result.commit_sha.is_some()
+            && self
+                .config
+                .workspace
+                .cleanup
+                .removes_after_committed_success())
     }
 
     async fn run_in_workspace(
@@ -134,14 +164,23 @@ impl SymphonyAgentRunner {
         workspace_path: &std::path::Path,
     ) -> Result<WorkerExitReason> {
         info!(
+            source_id = %self.config.source.id,
             issue_id = %issue.id,
             issue_identifier = %issue.identifier,
             workspace = %workspace_path.display(),
             "worker_starting"
         );
-        self.workspace.before_run(workspace_path).await?;
+        self.workspace
+            .before_run_for_source(&self.config.source.id, workspace_path)
+            .await?;
 
-        let first_prompt = render_prompt(self.config.prompt_template_or_default(), issue, attempt)?;
+        let source = PromptSourceContext::from_config(&self.config);
+        let first_prompt = render_prompt_with_source(
+            self.config.prompt_template_or_default(),
+            issue,
+            attempt,
+            &source,
+        )?;
         let max_turns = self.config.agent.max_turns;
 
         for turn_index in 0..max_turns {
@@ -153,6 +192,7 @@ impl SymphonyAgentRunner {
             };
 
             info!(
+                source_id = %self.config.source.id,
                 issue_id = %issue.id,
                 turn = turn_number,
                 max_turns,
@@ -162,6 +202,7 @@ impl SymphonyAgentRunner {
                 .run_turn(workspace_path, prompt.as_ref(), on_event)
                 .await?;
             info!(
+                source_id = %self.config.source.id,
                 issue_id = %issue.id,
                 turn = turn_number,
                 max_turns,

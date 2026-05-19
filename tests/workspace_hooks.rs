@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use symphony::config::{HooksConfig, WorkspaceConfig};
+use symphony::config::{HooksConfig, WorkspaceCleanupConfig, WorkspaceConfig};
 use symphony::error::SymphonyError;
-use symphony::workspace::{WorkspaceManager, sanitize_workspace_key};
+use symphony::workspace::{WorkspaceManager, sanitize_workspace_key, source_workspace_key};
 use tempfile::TempDir;
 
 fn hooks_with_timeout(timeout_ms: u64) -> HooksConfig {
@@ -17,6 +17,7 @@ fn manager(root: &Path, hooks: HooksConfig) -> WorkspaceManager {
     WorkspaceManager::new(
         &WorkspaceConfig {
             root: root.to_path_buf(),
+            cleanup: WorkspaceCleanupConfig::default(),
         },
         hooks,
     )
@@ -114,6 +115,36 @@ async fn creates_new_workspace_then_reuses_existing_directory() {
         .expect("second create should reuse");
     assert_eq!(second.path, first.path);
     assert!(!second.created_now);
+}
+
+#[tokio::test]
+async fn source_workspaces_are_namespaced_and_hooks_receive_source_id() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.after_create = Some("printf \"$SYMPHONY_SOURCE_ID\" > source_id".to_string());
+    let manager = manager(temp.path(), hooks);
+
+    let workspace = manager
+        .create_for_source_identifier("api/service", "issue/123")
+        .await
+        .expect("source workspace should be created");
+
+    assert_eq!(workspace.workspace_key, "api_service/issue_123");
+    assert_eq!(
+        source_workspace_key("api/service", "issue/123"),
+        workspace.workspace_key
+    );
+    assert_eq!(
+        workspace.path,
+        fs::canonicalize(temp.path())
+            .unwrap()
+            .join("api_service")
+            .join("issue_123")
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("source_id")).expect("source id marker"),
+        "api/service"
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,10 @@
+services:
+  symphony:
+    build: .
+    image: symphony:local
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?set GITHUB_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
+    volumes:
+      - ./WORKFLOW.md:/app/WORKFLOW.md:ro
+      - ./.symphony-workspaces:/app/.symphony-workspaces

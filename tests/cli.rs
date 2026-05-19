@@ -74,6 +74,31 @@ fn cli_uses_explicit_workflow_path_for_check_success() {
         .stderr(predicate::str::contains("startup completed"));
 }
 
+#[test]
+fn cli_accepts_multiple_workflow_paths_for_check_success() {
+    let temp = TempDir::new().unwrap();
+    let first = temp.path().join("api.md");
+    let second = temp.path().join("worker.md");
+    std::fs::write(&first, valid_source_workflow("api")).unwrap();
+    std::fs::write(&second, valid_source_workflow("worker")).unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("GITHUB_TOKEN", "test-token")
+        .arg(&first)
+        .arg(&second)
+        .arg("--check")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            predicate::str::contains("startup completed")
+                .and(predicate::str::contains("api:"))
+                .and(predicate::str::contains("worker:")),
+        );
+}
+
 fn valid_workflow() -> &'static str {
     r#"---
 tracker:
@@ -91,4 +116,26 @@ agent:
 ---
 Handle {{ issue.identifier }}
 "#
+}
+
+fn valid_source_workflow(source_id: &str) -> String {
+    format!(
+        r#"---
+source:
+  id: {source_id}
+tracker:
+  kind: github
+  repository:
+    owner: acme
+    name: symphony
+  project:
+    owner_type: organization
+    owner_login: acme
+    number: 1
+agent:
+  max_turns: 1
+---
+Handle {{{{ issue.identifier }}}}
+"#
+    )
 }

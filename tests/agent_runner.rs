@@ -1,14 +1,19 @@
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-
 use async_trait::async_trait;
 use chrono::Utc;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::Path;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use symphony::agent::codex::{CodexClient, TurnOutcome};
 use symphony::agent::runner::{AgentRunner, SymphonyAgentRunner};
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
-    GithubConfig, GithubProjectOwnerType, HooksConfig, PollingConfig, TrackerConfig,
+    GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig,
+    SourceConfig, TrackerConfig, WorkspaceCleanupAfterSuccess, WorkspaceCleanupConfig,
     WorkspaceConfig,
 };
 use symphony::domain::{CodexEvent, Issue, WorkerExitReason};
@@ -100,6 +105,9 @@ async fn runner_treats_direct_completion_without_changes_as_normal_skip() {
         },
     };
     let workspace = WorkspaceManager::new(&config.workspace, config.hooks.clone()).unwrap();
+    let (_, workspace_path) = workspace
+        .workspace_path_for_identifier(&issue.identifier)
+        .unwrap();
     let codex = Arc::new(FakeCodex::default());
     let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
     let runner = SymphonyAgentRunner::new(config, workspace, tracker.clone(), codex.clone());
@@ -113,6 +121,116 @@ async fn runner_treats_direct_completion_without_changes_as_normal_skip() {
         tracker.requested_ids(),
         vec![vec!["ISS-4".to_string()], vec!["ISS-4".to_string()]]
     );
+    assert!(workspace_path.exists());
+}
+
+#[tokio::test]
+async fn runner_removes_workspace_after_successful_direct_commit_completion() {
+    let temp = TempDir::new().unwrap();
+    let server = TestServer::new(vec![
+        ok(project_status_lookup(
+            GithubProjectOwnerType::Organization,
+            "owner",
+            1,
+            &[("Done", "DONE_OPTION"), ("In review", "REVIEW_OPTION")],
+        )),
+        ok(json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM_1"}}}})),
+    ]);
+    let mut issue = issue("ISS-5", "active");
+    issue.title = "[Medium] Fix allocator".to_string();
+
+    let mut config = config(temp.path(), 1, "{{ issue.identifier }}");
+    config.tracker.endpoint = format!("{}/graphql", server.url());
+    config.completion = CompletionConfig {
+        direct_commit: DirectCommitCompletionConfig {
+            enabled: true,
+            base_branch: "main".to_string(),
+            high_review_state: "In review".to_string(),
+            auto_approved_state: "Done".to_string(),
+            started_state: None,
+            commit_author_name: "Symphony".to_string(),
+            commit_author_email: "symphony@users.noreply.github.com".to_string(),
+        },
+    };
+    let workspace = WorkspaceManager::new(&config.workspace, config.hooks.clone()).unwrap();
+    let prepared = workspace
+        .create_for_identifier(&issue.identifier)
+        .await
+        .unwrap();
+    let remote = temp.path().join("remote.git");
+    init_workspace_repo(&prepared.path, &remote, "initial\n");
+    let codex = Arc::new(FakeCodex::writing("README.md", "initial\nchanged\n"));
+    let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
+    let runner = SymphonyAgentRunner::new(config, workspace, tracker, codex);
+
+    let outcome = runner
+        .run(issue.clone(), None, Box::new(|_| {}))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.issue_id, "ISS-5");
+    assert_eq!(outcome.reason, WorkerExitReason::Normal);
+    assert!(!prepared.path.exists());
+    assert_eq!(
+        git_show(&remote, "refs/heads/main:README.md"),
+        "initial\nchanged\n"
+    );
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn runner_keeps_workspace_after_committed_completion_when_cleanup_policy_is_never() {
+    let temp = TempDir::new().unwrap();
+    let server = TestServer::new(vec![
+        ok(project_status_lookup(
+            GithubProjectOwnerType::Organization,
+            "owner",
+            1,
+            &[("Done", "DONE_OPTION"), ("In review", "REVIEW_OPTION")],
+        )),
+        ok(json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM_1"}}}})),
+    ]);
+    let mut issue = issue("ISS-6", "active");
+    issue.title = "[Medium] Fix allocator".to_string();
+
+    let mut config = config(temp.path(), 1, "{{ issue.identifier }}");
+    config.tracker.endpoint = format!("{}/graphql", server.url());
+    config.workspace.cleanup.after_success = WorkspaceCleanupAfterSuccess::Never;
+    config.completion = CompletionConfig {
+        direct_commit: DirectCommitCompletionConfig {
+            enabled: true,
+            base_branch: "main".to_string(),
+            high_review_state: "In review".to_string(),
+            auto_approved_state: "Done".to_string(),
+            started_state: None,
+            commit_author_name: "Symphony".to_string(),
+            commit_author_email: "symphony@users.noreply.github.com".to_string(),
+        },
+    };
+    let workspace = WorkspaceManager::new(&config.workspace, config.hooks.clone()).unwrap();
+    let prepared = workspace
+        .create_for_identifier(&issue.identifier)
+        .await
+        .unwrap();
+    let remote = temp.path().join("remote-never.git");
+    init_workspace_repo(&prepared.path, &remote, "initial\n");
+    let codex = Arc::new(FakeCodex::writing("README.md", "initial\nchanged\n"));
+    let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
+    let runner = SymphonyAgentRunner::new(config, workspace, tracker, codex);
+
+    let outcome = runner
+        .run(issue.clone(), None, Box::new(|_| {}))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.issue_id, "ISS-6");
+    assert_eq!(outcome.reason, WorkerExitReason::Normal);
+    assert!(prepared.path.exists());
+    assert_eq!(
+        git_show(&remote, "refs/heads/main:README.md"),
+        "initial\nchanged\n"
+    );
+    assert_eq!(server.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -146,6 +264,7 @@ async fn runner_converts_codex_failure_to_worker_outcome_and_runs_after_run() {
 struct FakeCodex {
     prompts: Mutex<Vec<String>>,
     failure: Option<&'static str>,
+    write_file: Option<(String, String)>,
 }
 
 impl FakeCodex {
@@ -153,6 +272,15 @@ impl FakeCodex {
         Self {
             prompts: Mutex::new(Vec::new()),
             failure: Some(message),
+            write_file: None,
+        }
+    }
+
+    fn writing(path: impl Into<String>, contents: impl Into<String>) -> Self {
+        Self {
+            prompts: Mutex::new(Vec::new()),
+            failure: None,
+            write_file: Some((path.into(), contents.into())),
         }
     }
 
@@ -165,13 +293,20 @@ impl FakeCodex {
 impl CodexClient for FakeCodex {
     async fn run_turn(
         &self,
-        _workspace: &Path,
+        workspace: &Path,
         prompt: &str,
         _on_event: &mut (dyn FnMut(CodexEvent) + Send),
     ) -> Result<TurnOutcome> {
         self.prompts.lock().unwrap().push(prompt.to_string());
         if let Some(message) = self.failure {
             return Err(SymphonyError::codex("fake", message));
+        }
+        if let Some((path, contents)) = &self.write_file {
+            let file_path = workspace.join(path);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(file_path, contents).unwrap();
         }
         Ok(TurnOutcome {
             thread_id: "thread".to_string(),
@@ -242,6 +377,9 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
         workflow_path: root.join("WORKFLOW.md"),
         workflow_dir: root.to_path_buf(),
         prompt_template: prompt_template.to_string(),
+        source: SourceConfig {
+            id: "default".to_string(),
+        },
         tracker: TrackerConfig {
             kind: "github".to_string(),
             endpoint: "https://api.github.com/graphql".to_string(),
@@ -251,6 +389,10 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
             github: Some(GithubConfig {
                 repository_owner: "owner".to_string(),
                 repository_name: "repo".to_string(),
+                repositories: vec![GithubRepositoryConfig {
+                    owner: "owner".to_string(),
+                    name: "repo".to_string(),
+                }],
                 project_owner_type: GithubProjectOwnerType::Organization,
                 project_owner_login: "owner".to_string(),
                 project_number: 1,
@@ -266,6 +408,7 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
         },
         workspace: WorkspaceConfig {
             root: root.join("workspaces"),
+            cleanup: WorkspaceCleanupConfig::default(),
         },
         hooks: HooksConfig::default(),
         agent: AgentConfig {
@@ -289,4 +432,209 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn init_workspace_repo(workspace: &Path, remote: &Path, initial_readme: &str) {
+    run_git(
+        workspace.parent().unwrap(),
+        &["init", "--bare", remote.to_str().unwrap()],
+    );
+    run_git(workspace, &["init"]);
+    std::fs::write(workspace.join("README.md"), initial_readme).unwrap();
+    run_git(workspace, &["add", "README.md"]);
+    run_git(
+        workspace,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+    run_git(workspace, &["branch", "-M", "main"]);
+    run_git(
+        workspace,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    run_git(workspace, &["push", "origin", "main"]);
+}
+
+fn run_git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout={}\nstderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_show(git_dir: &Path, spec: &str) -> String {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["show", "--format=%B", spec])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git show {:?} failed\nstdout={}\nstderr={}",
+        spec,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn project_status_lookup(
+    owner_type: GithubProjectOwnerType,
+    owner_login: &str,
+    project_number: i64,
+    options: &[(&str, &str)],
+) -> Value {
+    let options: Vec<Value> = options
+        .iter()
+        .map(|(name, id)| json!({"id": id, "name": name}))
+        .collect();
+    let owner_data = json!({
+        "projectV2": {
+            "id": "PROJECT_1",
+            "fields": {
+                "nodes": [{
+                    "id": "STATUS_FIELD",
+                    "name": "Status",
+                    "options": options
+                }]
+            }
+        }
+    });
+    let project_owner = match owner_type {
+        GithubProjectOwnerType::Organization => {
+            json!({"__typename": "Organization", "login": owner_login})
+        }
+        GithubProjectOwnerType::User => json!({"__typename": "User", "login": owner_login}),
+    };
+    json!({
+        "data": {
+            "organization": matches!(owner_type, GithubProjectOwnerType::Organization).then_some(owner_data.clone()),
+            "user": matches!(owner_type, GithubProjectOwnerType::User).then_some(owner_data),
+            "node": {
+                "projectItems": {
+                    "nodes": [{
+                        "id": "ITEM_1",
+                        "project": {
+                            "id": "PROJECT_1",
+                            "number": project_number,
+                            "owner": project_owner
+                        }
+                    }]
+                }
+            }
+        }
+    })
+}
+
+fn ok(body: Value) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        body: body.to_string(),
+    }
+}
+
+struct HttpResponse {
+    status: u16,
+    body: String,
+}
+
+struct TestServer {
+    url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl TestServer {
+    fn new(responses: Vec<HttpResponse>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                request_log.lock().unwrap().push(request);
+                write_http_response(&mut stream, response);
+            }
+        });
+        Self { url, requests }
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).unwrap();
+        assert_ne!(read, 0);
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = find_subslice(&buffer, b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                })
+                .unwrap_or("0")
+                .parse::<usize>()
+                .unwrap();
+            let needed = header_end + 4 + content_length;
+            while buffer.len() < needed {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0);
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            buffer.truncate(needed);
+            return String::from_utf8(buffer).unwrap();
+        }
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn write_http_response(stream: &mut std::net::TcpStream, response: HttpResponse) {
+    let reason = if response.status == 200 {
+        "OK"
+    } else {
+        "Error"
+    };
+    let reply = format!(
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response.status,
+        reason,
+        response.body.len(),
+        response.body
+    );
+    stream.write_all(reply.as_bytes()).unwrap();
 }

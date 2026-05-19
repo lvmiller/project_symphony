@@ -37,6 +37,15 @@ impl HookKind {
 }
 
 pub async fn run_hook(kind: HookKind, hooks: &HooksConfig, workspace: &Path) -> Result<()> {
+    run_hook_with_source(kind, hooks, workspace, None).await
+}
+
+pub async fn run_hook_with_source(
+    kind: HookKind,
+    hooks: &HooksConfig,
+    workspace: &Path,
+    source_id: Option<&str>,
+) -> Result<()> {
     let Some(script) = kind.script(hooks) else {
         return Ok(());
     };
@@ -48,6 +57,11 @@ pub async fn run_hook(kind: HookKind, hooks: &HooksConfig, workspace: &Path) -> 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .envs(
+            source_id
+                .into_iter()
+                .map(|source_id| ("SYMPHONY_SOURCE_ID", source_id)),
+        )
         .spawn()
         .map_err(|err| SymphonyError::Hook {
             hook: kind.name(),
@@ -82,7 +96,16 @@ pub async fn run_hook(kind: HookKind, hooks: &HooksConfig, workspace: &Path) -> 
 }
 
 pub async fn run_hook_best_effort(kind: HookKind, hooks: &HooksConfig, workspace: &Path) {
-    if let Err(error) = run_hook(kind, hooks, workspace).await {
+    run_hook_best_effort_with_source(kind, hooks, workspace, None).await;
+}
+
+pub async fn run_hook_best_effort_with_source(
+    kind: HookKind,
+    hooks: &HooksConfig,
+    workspace: &Path,
+    source_id: Option<&str>,
+) {
+    if let Err(error) = run_hook_with_source(kind, hooks, workspace, source_id).await {
         warn!(hook = kind.name(), error = %error, "hook failed ignored");
     }
 }

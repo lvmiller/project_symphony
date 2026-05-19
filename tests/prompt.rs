@@ -1,6 +1,7 @@
+use symphony::config::GithubRepositoryConfig;
 use symphony::domain::{BlockerRef, Issue};
 use symphony::error::SymphonyError;
-use symphony::prompt::render_prompt;
+use symphony::prompt::{PromptSourceContext, render_prompt, render_prompt_with_source};
 
 fn issue() -> Issue {
     Issue {
@@ -36,6 +37,32 @@ fn renders_issue_fields_attempt_and_nested_collections() {
         rendered,
         "OCTO-1 Fix renderer attempt=4 labels=bug;backend; blockers=OCTO-0:Done;"
     );
+}
+
+#[test]
+fn renders_source_context_when_available() {
+    let source = PromptSourceContext {
+        id: "api".to_string(),
+        workflow_path: "/repo/api/WORKFLOW.md".to_string(),
+        repository_owner: Some("octo".to_string()),
+        repository_name: Some("api".to_string()),
+        repositories: vec![GithubRepositoryConfig {
+            owner: "octo".to_string(),
+            name: "api".to_string(),
+        }],
+        project_owner_login: Some("octo".to_string()),
+        project_number: Some(7),
+    };
+
+    let rendered = render_prompt_with_source(
+        "{{ source.id }} {{ source.repository_name }} {{ source.project_number }}",
+        &issue(),
+        None,
+        &source,
+    )
+    .unwrap();
+
+    assert_eq!(rendered, "api api 7");
 }
 
 #[test]

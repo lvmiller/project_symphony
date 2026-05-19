@@ -27,6 +27,8 @@ polling:
 
 workspace:
   root: ./.symphony-workspaces
+  cleanup:
+    after_success: committed
 
 hooks:
   timeout_ms: 120000

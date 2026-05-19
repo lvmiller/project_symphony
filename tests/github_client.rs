@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::{Value, json};
-use symphony::config::{GithubConfig, GithubProjectOwnerType, TrackerConfig};
+use symphony::config::{
+    GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, TrackerConfig,
+};
 use symphony::error::SymphonyError;
 use symphony::tracker::TrackerClient;
 use symphony::tracker::github::GitHubTrackerClient;
@@ -155,6 +157,56 @@ async fn candidate_fetch_skips_project_items_from_other_repositories() {
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].id, "I_in_repo");
     assert_eq!(issues[0].identifier, "octo-org/octo-repo#1");
+}
+
+#[tokio::test]
+async fn candidate_fetch_accepts_multiple_configured_repositories() {
+    let in_primary = project_item("I_primary", 1, "Todo", &["Bug"], None, None);
+    let mut in_secondary = project_item("I_secondary", 2, "Todo", &["Bug"], None, None);
+    *in_secondary
+        .get_mut("content")
+        .unwrap()
+        .get_mut("repository")
+        .unwrap() = json!({
+        "nameWithOwner": "other-org/other-repo",
+        "name": "other-repo",
+        "owner": {"login": "other-org"}
+    });
+    let mut filtered = project_item("I_filtered", 3, "Todo", &["Bug"], None, None);
+    *filtered
+        .get_mut("content")
+        .unwrap()
+        .get_mut("repository")
+        .unwrap() = json!({
+        "nameWithOwner": "unlisted/unlisted",
+        "name": "unlisted",
+        "owner": {"login": "unlisted"}
+    });
+    let server = TestServer::new(vec![ok(project_page(
+        false,
+        None,
+        vec![in_primary, in_secondary, filtered],
+    ))]);
+    let client = client_with_repositories(
+        server.url(),
+        vec!["Todo"],
+        vec![
+            GithubRepositoryConfig {
+                owner: "octo-org".to_string(),
+                name: "octo-repo".to_string(),
+            },
+            GithubRepositoryConfig {
+                owner: "other-org".to_string(),
+                name: "other-repo".to_string(),
+            },
+        ],
+    );
+
+    let issues = client.fetch_candidate_issues().await.unwrap();
+
+    assert_eq!(issues.len(), 2);
+    assert_eq!(issues[0].identifier, "octo-org/octo-repo#1");
+    assert_eq!(issues[1].identifier, "other-org/other-repo#2");
 }
 
 #[tokio::test]
@@ -409,6 +461,35 @@ fn client(
     )
 }
 
+fn client_with_repositories(
+    endpoint: String,
+    active_states: Vec<&str>,
+    repositories: Vec<GithubRepositoryConfig>,
+) -> GitHubTrackerClient {
+    let primary = repositories.first().unwrap();
+    let tracker = TrackerConfig {
+        kind: "github".to_string(),
+        endpoint,
+        api_key: Some("test-token".to_string()),
+        active_states: active_states.into_iter().map(str::to_string).collect(),
+        terminal_states: vec!["Done".to_string()],
+        github: Some(GithubConfig {
+            repository_owner: primary.owner.clone(),
+            repository_name: primary.name.clone(),
+            repositories,
+            project_owner_type: GithubProjectOwnerType::Organization,
+            project_owner_login: "octo-org".to_string(),
+            project_number: 7,
+            status_field_name: "Status".to_string(),
+            priority_field_name: Some("Priority".to_string()),
+            blocker_field_name: Some("Blocked By".to_string()),
+            blocker_label_prefix: Some("blocked-by".to_string()),
+            priority_labels: BTreeMap::new(),
+        }),
+    };
+    GitHubTrackerClient::from_tracker_config(&tracker).unwrap()
+}
+
 fn client_for_owner_type(
     endpoint: String,
     active_states: Vec<&str>,
@@ -428,6 +509,10 @@ fn client_for_owner_type(
         github: Some(GithubConfig {
             repository_owner: "octo-org".to_string(),
             repository_name: "octo-repo".to_string(),
+            repositories: vec![GithubRepositoryConfig {
+                owner: "octo-org".to_string(),
+                name: "octo-repo".to_string(),
+            }],
             project_owner_type,
             project_owner_login: project_owner_login.to_string(),
             project_number: 7,

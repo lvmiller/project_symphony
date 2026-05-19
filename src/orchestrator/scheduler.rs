@@ -55,7 +55,25 @@ pub fn is_dispatch_eligible(
     dispatch_ineligible_reason(issue, state, config).is_none()
 }
 
+pub fn is_dispatch_eligible_for_source(
+    source_id: &str,
+    issue: &Issue,
+    state: &OrchestratorState,
+    config: &EffectiveConfig,
+) -> bool {
+    dispatch_ineligible_reason_for_source(source_id, issue, state, config).is_none()
+}
+
 pub fn dispatch_ineligible_reason(
+    issue: &Issue,
+    state: &OrchestratorState,
+    config: &EffectiveConfig,
+) -> Option<DispatchIneligibleReason> {
+    dispatch_ineligible_reason_for_source(&config.source.id, issue, state, config)
+}
+
+pub fn dispatch_ineligible_reason_for_source(
+    source_id: &str,
     issue: &Issue,
     state: &OrchestratorState,
     config: &EffectiveConfig,
@@ -69,7 +87,7 @@ pub fn dispatch_ineligible_reason(
     if !config.is_active_state(&issue.state) {
         return Some(DispatchIneligibleReason::InactiveState);
     }
-    if state.is_issue_or_workspace_claimed(issue) {
+    if state.is_issue_or_workspace_claimed_for_source(source_id, issue) {
         return Some(DispatchIneligibleReason::AlreadyRunningOrClaimed);
     }
     if available_global_slots(state, config) == 0 {

@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
-use crate::config::{HooksConfig, WorkspaceConfig, normalize_absolute_path};
+use crate::config::{DEFAULT_SOURCE_ID, HooksConfig, WorkspaceConfig, normalize_absolute_path};
 use crate::domain::{Issue, Workspace};
 use crate::error::{Result, SymphonyError};
-use crate::hooks::{HookKind, run_hook, run_hook_best_effort};
+use crate::hooks::{HookKind, run_hook_best_effort_with_source, run_hook_with_source};
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceManager {
@@ -26,7 +26,15 @@ impl WorkspaceManager {
     }
 
     pub fn workspace_path_for_identifier(&self, identifier: &str) -> Result<(String, PathBuf)> {
-        let key = sanitize_workspace_key(identifier);
+        self.workspace_path_for_source_identifier(DEFAULT_SOURCE_ID, identifier)
+    }
+
+    pub fn workspace_path_for_source_identifier(
+        &self,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<(String, PathBuf)> {
+        let key = source_workspace_key(source_id, identifier);
         let path = normalize_absolute_path(&self.root.join(&key))?;
         ensure_contained(&self.root, &path)?;
         Ok((key, path))
@@ -36,12 +44,39 @@ impl WorkspaceManager {
         self.create_for_identifier(&issue.identifier).await
     }
 
+    pub async fn create_for_source_issue(
+        &self,
+        source_id: &str,
+        issue: &Issue,
+    ) -> Result<Workspace> {
+        self.create_for_source_identifier(source_id, &issue.identifier)
+            .await
+    }
+
     pub async fn create_for_identifier(&self, identifier: &str) -> Result<Workspace> {
+        self.create_for_source_identifier(DEFAULT_SOURCE_ID, identifier)
+            .await
+    }
+
+    pub async fn create_for_source_identifier(
+        &self,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<Workspace> {
         fs::create_dir_all(&self.root)
             .map_err(|err| SymphonyError::io(Some(self.root.clone()), err))?;
         let canonical_root = canonicalize_dir(&self.root)?;
-        let workspace_key = sanitize_workspace_key(identifier);
-        let path = normalize_absolute_path(&canonical_root.join(&workspace_key))?;
+        let source_key = sanitize_workspace_key(source_id);
+        let workspace_key = source_workspace_key(source_id, identifier);
+        let workspace_parent = if source_id == DEFAULT_SOURCE_ID {
+            canonical_root.clone()
+        } else {
+            let source_path = normalize_absolute_path(&canonical_root.join(&source_key))?;
+            ensure_contained(&canonical_root, &source_path)?;
+            ensure_existing_directory(&canonical_root, &source_path, "workspace source path")?
+        };
+        let issue_key = sanitize_workspace_key(identifier);
+        let path = normalize_absolute_path(&workspace_parent.join(&issue_key))?;
         ensure_contained(&canonical_root, &path)?;
         let (created_now, verified_path) = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
@@ -71,7 +106,13 @@ impl WorkspaceManager {
             created_now,
         };
         if created_now
-            && let Err(error) = run_hook(HookKind::AfterCreate, &self.hooks, &verified_path).await
+            && let Err(error) = run_hook_with_source(
+                HookKind::AfterCreate,
+                &self.hooks,
+                &verified_path,
+                Some(source_id),
+            )
+            .await
         {
             let _ = fs::remove_dir_all(&verified_path);
             return Err(error);
@@ -80,12 +121,28 @@ impl WorkspaceManager {
     }
 
     pub async fn before_run(&self, workspace: &Path) -> Result<()> {
+        self.before_run_for_source(DEFAULT_SOURCE_ID, workspace)
+            .await
+    }
+
+    pub async fn before_run_for_source(&self, source_id: &str, workspace: &Path) -> Result<()> {
         let canonical_root = canonicalize_dir(&self.root)?;
         let workspace = verify_workspace_dir(&canonical_root, workspace)?;
-        run_hook(HookKind::BeforeRun, &self.hooks, &workspace).await
+        run_hook_with_source(
+            HookKind::BeforeRun,
+            &self.hooks,
+            &workspace,
+            Some(source_id),
+        )
+        .await
     }
 
     pub async fn after_run_best_effort(&self, workspace: &Path) {
+        self.after_run_best_effort_for_source(DEFAULT_SOURCE_ID, workspace)
+            .await;
+    }
+
+    pub async fn after_run_best_effort_for_source(&self, source_id: &str, workspace: &Path) {
         let canonical_root = match canonicalize_dir(&self.root) {
             Ok(root) => root,
             Err(error) => {
@@ -100,16 +157,36 @@ impl WorkspaceManager {
                 return;
             }
         };
-        run_hook_best_effort(HookKind::AfterRun, &self.hooks, &workspace).await;
+        run_hook_best_effort_with_source(
+            HookKind::AfterRun,
+            &self.hooks,
+            &workspace,
+            Some(source_id),
+        )
+        .await;
     }
 
     pub async fn remove_for_issue(&self, issue: &Issue) -> Result<()> {
         self.remove_for_identifier(&issue.identifier).await
     }
 
+    pub async fn remove_for_source_issue(&self, source_id: &str, issue: &Issue) -> Result<()> {
+        self.remove_for_source_identifier(source_id, &issue.identifier)
+            .await
+    }
+
     pub async fn remove_for_identifier(&self, identifier: &str) -> Result<()> {
+        self.remove_for_source_identifier(DEFAULT_SOURCE_ID, identifier)
+            .await
+    }
+
+    pub async fn remove_for_source_identifier(
+        &self,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<()> {
         let canonical_root = canonicalize_dir(&self.root)?;
-        let workspace_key = sanitize_workspace_key(identifier);
+        let workspace_key = source_workspace_key(source_id, identifier);
         let path = normalize_absolute_path(&canonical_root.join(&workspace_key))?;
         ensure_contained(&canonical_root, &path)?;
         let workspace = match fs::symlink_metadata(&path) {
@@ -132,7 +209,13 @@ impl WorkspaceManager {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(SymphonyError::io(Some(path.clone()), err)),
         };
-        run_hook_best_effort(HookKind::BeforeRemove, &self.hooks, &workspace).await;
+        run_hook_best_effort_with_source(
+            HookKind::BeforeRemove,
+            &self.hooks,
+            &workspace,
+            Some(source_id),
+        )
+        .await;
         fs::remove_dir_all(&workspace)
             .map_err(|err| SymphonyError::io(Some(workspace.clone()), err))?;
         info!(workspace = %workspace.display(), "workspace removed");
@@ -159,6 +242,15 @@ pub fn sanitize_workspace_key(identifier: &str) -> String {
     }
 }
 
+pub fn source_workspace_key(source_id: &str, identifier: &str) -> String {
+    let issue_key = sanitize_workspace_key(identifier);
+    if source_id == DEFAULT_SOURCE_ID {
+        issue_key
+    } else {
+        format!("{}/{}", sanitize_workspace_key(source_id), issue_key)
+    }
+}
+
 pub fn ensure_contained(root: &Path, workspace_path: &Path) -> Result<()> {
     let root = normalize_absolute_path(root)?;
     let workspace_path = normalize_absolute_path(workspace_path)?;
@@ -179,6 +271,30 @@ fn canonicalize_if_exists(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(path.to_path_buf())
     }
+}
+
+fn ensure_existing_directory(canonical_root: &Path, path: &Path, label: &str) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_workspace_error(
+                    &format!("{label} is a symlink"),
+                    path,
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(SymphonyError::Workspace(format!(
+                    "{label} exists and is not a directory path={}",
+                    path.display()
+                )));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|err| SymphonyError::io(Some(path.to_path_buf()), err))?;
+        }
+        Err(err) => return Err(SymphonyError::io(Some(path.to_path_buf()), err)),
+    }
+    verify_workspace_dir(canonical_root, path)
 }
 
 fn canonicalize_dir(path: &Path) -> Result<PathBuf> {

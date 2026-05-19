@@ -6,8 +6,9 @@
 //! - Approval/sandbox posture: default Codex policy is high-trust (`approvalPolicy = "never"`,
 //!   thread sandbox `danger-full-access`, turn sandbox policy `{type: "dangerFullAccess"}`). Workflows
 //!   may override these pass-through values with schema-valid Codex values.
-//! - Workspace population: Symphony only creates/reuses per-issue directories. Checkout/sync/bootstrap
-//!   is owned by configured hooks.
+//! - Workspace population: Symphony creates/reuses per-issue directories and removes them after a
+//!   successful direct-commit completion unless `workspace.cleanup.after_success: never` is set.
+//!   Checkout/sync/bootstrap is owned by configured hooks.
 //! - Logging sink: structured logs are emitted to stderr.
 //! - GitHub endpoint policy: workflow-supplied `tracker.endpoint` values are ignored for
 //!   `tracker.kind: github`; this implementation always uses the public GitHub GraphQL endpoint.
@@ -32,11 +33,19 @@ use crate::workflow::{load_workflow, select_workflow_path};
 pub const DEFAULT_GITHUB_ENDPOINT: &str = "https://api.github.com/graphql";
 pub const DEFAULT_PROMPT: &str = "You are working on an issue from GitHub.";
 
+pub const DEFAULT_SOURCE_ID: &str = "default";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceConfig {
+    pub id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectiveConfig {
     pub workflow_path: PathBuf,
     pub workflow_dir: PathBuf,
     pub prompt_template: String,
+    pub source: SourceConfig,
     pub tracker: TrackerConfig,
     pub polling: PollingConfig,
     pub workspace: WorkspaceConfig,
@@ -53,6 +62,7 @@ impl EffectiveConfig {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        let source = parse_source(&workflow.config)?;
         let tracker = parse_tracker(&workflow.config)?;
         let polling = parse_polling(&workflow.config)?;
         let workspace = parse_workspace(&workflow.config, &workflow_dir)?;
@@ -64,6 +74,7 @@ impl EffectiveConfig {
             workflow_path: workflow.path,
             workflow_dir,
             prompt_template: workflow.prompt_template,
+            source,
             tracker,
             polling,
             workspace,
@@ -151,9 +162,16 @@ pub struct TrackerConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubRepositoryConfig {
+    pub owner: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubConfig {
     pub repository_owner: String,
     pub repository_name: String,
+    pub repositories: Vec<GithubRepositoryConfig>,
     pub project_owner_type: GithubProjectOwnerType,
     pub project_owner_login: String,
     pub project_number: i64,
@@ -166,6 +184,11 @@ pub struct GithubConfig {
 
 impl GithubConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.repositories.is_empty() {
+            return Err(SymphonyError::MissingGithubConfig {
+                field: "repository",
+            });
+        }
         if self.repository_owner.trim().is_empty() {
             return Err(SymphonyError::MissingGithubConfig {
                 field: "repository.owner",
@@ -175,6 +198,18 @@ impl GithubConfig {
             return Err(SymphonyError::MissingGithubConfig {
                 field: "repository.name",
             });
+        }
+        for repository in &self.repositories {
+            if repository.owner.trim().is_empty() {
+                return Err(SymphonyError::MissingGithubConfig {
+                    field: "repository.owner",
+                });
+            }
+            if repository.name.trim().is_empty() {
+                return Err(SymphonyError::MissingGithubConfig {
+                    field: "repository.name",
+                });
+            }
         }
         if self.project_owner_login.trim().is_empty() {
             return Err(SymphonyError::MissingGithubConfig {
@@ -193,6 +228,13 @@ impl GithubConfig {
         }
         Ok(())
     }
+
+    pub fn issue_matches_configured_repository(&self, owner: &str, name: &str) -> bool {
+        self.repositories.iter().any(|repository| {
+            repository.owner.eq_ignore_ascii_case(owner)
+                && repository.name.eq_ignore_ascii_case(name)
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +252,33 @@ pub struct PollingConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub root: PathBuf,
+    pub cleanup: WorkspaceCleanupConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCleanupConfig {
+    pub after_success: WorkspaceCleanupAfterSuccess,
+}
+
+impl Default for WorkspaceCleanupConfig {
+    fn default() -> Self {
+        Self {
+            after_success: WorkspaceCleanupAfterSuccess::Committed,
+        }
+    }
+}
+
+impl WorkspaceCleanupConfig {
+    pub fn removes_after_committed_success(&self) -> bool {
+        matches!(self.after_success, WorkspaceCleanupAfterSuccess::Committed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceCleanupAfterSuccess {
+    Never,
+    Committed,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,9 +364,19 @@ impl ConfigReloader {
         &self.last_good
     }
 
+    pub fn source_id(&self) -> &str {
+        &self.last_good.source.id
+    }
+
     pub fn reload_now(&mut self) -> Result<&EffectiveConfig> {
         let next = EffectiveConfig::from_workflow(load_workflow(&self.path)?)?;
         next.validate_dispatch()?;
+        if next.source.id != self.last_good.source.id {
+            return Err(SymphonyError::config(
+                "source_id_change_requires_restart",
+                "source.id cannot change during dynamic reload",
+            ));
+        }
         self.last_modified = modified_time(&self.path).ok();
         self.last_good = next;
         Ok(&self.last_good)
@@ -329,8 +408,96 @@ impl ConfigReloader {
     }
 }
 
+pub struct ConfigSetReloader {
+    reloaders: Vec<ConfigReloader>,
+}
+
+impl ConfigSetReloader {
+    pub fn new(paths: Vec<PathBuf>) -> Result<Self> {
+        let paths = if paths.is_empty() {
+            vec![PathBuf::from("WORKFLOW.md")]
+        } else {
+            paths
+        };
+        let mut reloaders = Vec::with_capacity(paths.len());
+        for path in paths {
+            reloaders.push(ConfigReloader::new(Some(path))?);
+        }
+        validate_unique_source_ids(&reloaders)?;
+        Ok(Self { reloaders })
+    }
+
+    pub fn from_single(reloader: ConfigReloader) -> Self {
+        Self {
+            reloaders: vec![reloader],
+        }
+    }
+
+    pub fn current(&self) -> impl Iterator<Item = &EffectiveConfig> {
+        self.reloaders.iter().map(ConfigReloader::current)
+    }
+
+    pub fn current_cloned(&self) -> Vec<EffectiveConfig> {
+        self.current().cloned().collect()
+    }
+
+    pub fn poll_interval_ms(&self) -> u64 {
+        self.current()
+            .map(|config| config.polling.interval_ms)
+            .min()
+            .unwrap_or(30_000)
+    }
+
+    pub fn reload_if_changed(&mut self) -> Vec<(String, Result<bool>)> {
+        self.reloaders
+            .iter_mut()
+            .map(|reloader| {
+                let source_id = reloader.source_id().to_string();
+                (source_id, reloader.reload_if_changed())
+            })
+            .collect()
+    }
+}
+
+fn validate_unique_source_ids(reloaders: &[ConfigReloader]) -> Result<()> {
+    let mut seen = BTreeMap::new();
+    for reloader in reloaders {
+        let source_id = reloader.source_id();
+        if let Some(previous_path) = seen.insert(
+            source_id.to_string(),
+            reloader.current().workflow_path.clone(),
+        ) {
+            return Err(SymphonyError::config(
+                "duplicate_source_id",
+                format!(
+                    "source.id must be unique id={} first={} second={}",
+                    source_id,
+                    previous_path.display(),
+                    reloader.current().workflow_path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn modified_time(path: &Path) -> std::io::Result<SystemTime> {
     std::fs::metadata(path)?.modified()
+}
+
+fn parse_source(config: &Mapping) -> Result<SourceConfig> {
+    let source = get_map(config, "source");
+    let raw_id = get_string(source, "id")
+        .or_else(|| get_string(Some(config), "source_id"))
+        .unwrap_or_else(|| DEFAULT_SOURCE_ID.to_string());
+    let id = raw_id.trim();
+    if id.is_empty() {
+        return Err(SymphonyError::config(
+            "invalid_source_id",
+            "source.id must be non-empty",
+        ));
+    }
+    Ok(SourceConfig { id: id.to_string() })
 }
 
 fn parse_tracker(config: &Mapping) -> Result<TrackerConfig> {
@@ -376,12 +543,14 @@ fn parse_tracker(config: &Mapping) -> Result<TrackerConfig> {
 fn parse_github_config(tracker: Option<&Mapping>) -> Result<GithubConfig> {
     let repository = get_nested_map(tracker, "repository");
     let project = get_nested_map(tracker, "project");
-    let repository_owner = get_string(repository, "owner")
-        .or_else(|| get_string(tracker, "repository_owner"))
-        .unwrap_or_default();
-    let repository_name = get_string(repository, "name")
-        .or_else(|| get_string(tracker, "repository_name"))
-        .unwrap_or_default();
+    let repositories = parse_github_repositories(tracker, repository)?;
+    let primary_repository = repositories
+        .first()
+        .ok_or(SymphonyError::MissingGithubConfig {
+            field: "repository",
+        })?;
+    let repository_owner = primary_repository.owner.clone();
+    let repository_name = primary_repository.name.clone();
     let project_owner_login = get_string(project, "owner_login")
         .or_else(|| get_string(project, "owner"))
         .or_else(|| get_string(tracker, "project_owner_login"))
@@ -419,6 +588,7 @@ fn parse_github_config(tracker: Option<&Mapping>) -> Result<GithubConfig> {
     let result = GithubConfig {
         repository_owner,
         repository_name,
+        repositories,
         project_owner_type,
         project_owner_login,
         project_number,
@@ -430,6 +600,57 @@ fn parse_github_config(tracker: Option<&Mapping>) -> Result<GithubConfig> {
     };
     result.validate()?;
     Ok(result)
+}
+
+fn parse_github_repositories(
+    tracker: Option<&Mapping>,
+    repository: Option<&Mapping>,
+) -> Result<Vec<GithubRepositoryConfig>> {
+    let has_single_repository = repository.is_some()
+        || get_string(tracker, "repository_owner").is_some()
+        || get_string(tracker, "repository_name").is_some();
+    if let Some(value) = get_value(tracker, "repositories") {
+        if has_single_repository {
+            return Err(SymphonyError::config(
+                "invalid_github_repository_config",
+                "tracker.repository and tracker.repositories cannot both be set",
+            ));
+        }
+        let Some(items) = value.as_sequence() else {
+            return Err(SymphonyError::config(
+                "invalid_github_repositories",
+                "tracker.repositories must be a list",
+            ));
+        };
+        if items.is_empty() {
+            return Err(SymphonyError::MissingGithubConfig {
+                field: "repositories",
+            });
+        }
+        let mut repositories = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(mapping) = item.as_mapping() else {
+                return Err(SymphonyError::config(
+                    "invalid_github_repositories",
+                    "tracker.repositories entries must be maps",
+                ));
+            };
+            repositories.push(GithubRepositoryConfig {
+                owner: get_string(Some(mapping), "owner").unwrap_or_default(),
+                name: get_string(Some(mapping), "name").unwrap_or_default(),
+            });
+        }
+        return Ok(repositories);
+    }
+
+    Ok(vec![GithubRepositoryConfig {
+        owner: get_string(repository, "owner")
+            .or_else(|| get_string(tracker, "repository_owner"))
+            .unwrap_or_default(),
+        name: get_string(repository, "name")
+            .or_else(|| get_string(tracker, "repository_name"))
+            .unwrap_or_default(),
+    }])
 }
 
 fn parse_polling(config: &Mapping) -> Result<PollingConfig> {
@@ -459,7 +680,26 @@ fn parse_workspace(config: &Mapping, workflow_dir: &Path) -> Result<WorkspaceCon
     };
     Ok(WorkspaceConfig {
         root: normalize_absolute_path(&expanded)?,
+        cleanup: parse_workspace_cleanup(workspace)?,
     })
+}
+
+fn parse_workspace_cleanup(workspace: Option<&Mapping>) -> Result<WorkspaceCleanupConfig> {
+    let cleanup = get_nested_map(workspace, "cleanup");
+    let Some(after_success) = get_string(cleanup, "after_success") else {
+        return Ok(WorkspaceCleanupConfig::default());
+    };
+    let after_success = match after_success.trim().to_ascii_lowercase().as_str() {
+        "committed" => WorkspaceCleanupAfterSuccess::Committed,
+        "never" => WorkspaceCleanupAfterSuccess::Never,
+        _ => {
+            return Err(SymphonyError::config(
+                "invalid_workspace_cleanup_after_success",
+                "workspace.cleanup.after_success must be committed or never",
+            ));
+        }
+    };
+    Ok(WorkspaceCleanupConfig { after_success })
 }
 
 fn parse_hooks(config: &Mapping) -> Result<HooksConfig> {

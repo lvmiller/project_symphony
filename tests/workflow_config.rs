@@ -2,7 +2,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use symphony::config::{ConfigReloader, DEFAULT_GITHUB_ENDPOINT, EffectiveConfig};
+use symphony::config::{
+    ConfigReloader, ConfigSetReloader, DEFAULT_GITHUB_ENDPOINT, EffectiveConfig,
+    WorkspaceCleanupAfterSuccess,
+};
 use symphony::error::SymphonyError;
 use symphony::workflow::{parse_workflow, select_workflow_path};
 
@@ -94,6 +97,10 @@ fn github_defaults_and_default_token_indirection_are_applied() {
     assert_eq!(config.codex.read_timeout_ms, 5_000);
     assert_eq!(config.codex.stall_timeout_ms, 300_000);
     assert!(config.workspace.root.ends_with("symphony_workspaces"));
+    assert_eq!(
+        config.workspace.cleanup.after_success,
+        WorkspaceCleanupAfterSuccess::Committed
+    );
     assert!(!config.completion.direct_commit.enabled);
     assert_eq!(config.completion.direct_commit.base_branch, "main");
     assert_eq!(
@@ -102,6 +109,93 @@ fn github_defaults_and_default_token_indirection_are_applied() {
     );
     assert_eq!(config.completion.direct_commit.auto_approved_state, "Done");
     assert_eq!(config.completion.direct_commit.started_state, None);
+}
+
+#[test]
+fn workspace_cleanup_policy_is_parsed_and_validated() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let valid = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nworkspace:\n  cleanup:\n    after_success: never\n---\nPrompt\n",
+    );
+    let config = load_from_path(valid);
+    assert_eq!(
+        config.workspace.cleanup.after_success,
+        WorkspaceCleanupAfterSuccess::Never
+    );
+
+    let invalid = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nworkspace:\n  cleanup:\n    after_success: always\n---\nPrompt\n",
+    );
+    let error = EffectiveConfig::load(Some(invalid)).unwrap_err();
+    match error {
+        SymphonyError::ConfigValidation { code, .. } => {
+            assert_eq!(code, "invalid_workspace_cleanup_after_success");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn source_id_and_github_repository_list_are_parsed() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let workflow = "---\nsource:\n  id: api\ntracker:\n  kind: github\n  repositories:\n    - owner: octo\n      name: api\n    - owner: octo\n      name: worker\n  project:\n    owner_type: organization\n    owner_login: octo\n    number: 7\n---\nPrompt\n";
+    let path = write_workflow(temp.path(), workflow);
+
+    let config = load_from_path(path);
+    config.validate_dispatch().unwrap();
+    let github = config.tracker.github.as_ref().unwrap();
+
+    assert_eq!(config.source.id, "api");
+    assert_eq!(github.repository_owner, "octo");
+    assert_eq!(github.repository_name, "api");
+    assert_eq!(github.repositories.len(), 2);
+    assert_eq!(github.repositories[1].owner, "octo");
+    assert_eq!(github.repositories[1].name, "worker");
+}
+
+#[test]
+fn duplicate_source_ids_are_rejected_for_config_sets() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first.md");
+    let second = temp.path().join("second.md");
+    std::fs::write(&first, valid_workflow(None)).unwrap();
+    std::fs::write(&second, valid_workflow(None)).unwrap();
+
+    let error = match ConfigSetReloader::new(vec![first, second]) {
+        Ok(_) => panic!("expected duplicate source id error"),
+        Err(error) => error,
+    };
+
+    match error {
+        SymphonyError::ConfigValidation { code, .. } => assert_eq!(code, "duplicate_source_id"),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn repository_and_repositories_are_mutually_exclusive() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let workflow = "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  repositories:\n    - owner: octo\n      name: repo\n  project:\n    owner_login: octo\n    number: 7\n---\nPrompt\n";
+    let path = write_workflow(temp.path(), workflow);
+
+    let error = EffectiveConfig::load(Some(path)).unwrap_err();
+
+    match error {
+        SymphonyError::ConfigValidation { code, .. } => {
+            assert_eq!(code, "invalid_github_repository_config");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::config::{EffectiveConfig, normalize_state};
+use crate::config::{DEFAULT_SOURCE_ID, EffectiveConfig, normalize_state};
 use crate::domain::{
     CodexEvent, Issue, LiveSession, RetryEntry, RunningSnapshot, RuntimeSnapshot, StateCounts,
     TokenTotals, WorkerExitReason,
@@ -17,6 +17,7 @@ use crate::workspace::sanitize_workspace_key;
 #[derive(Clone, Debug)]
 pub struct RunningEntry {
     pub issue: Issue,
+    pub source_id: String,
     pub identifier: String,
     pub workspace_key: String,
     pub started_at: DateTime<Utc>,
@@ -38,6 +39,7 @@ pub enum ReconcileDecision {
 pub struct OrchestratorState {
     pub running: BTreeMap<String, RunningEntry>,
     pub claimed: BTreeSet<String>,
+    pub claimed_issue_ids: BTreeSet<String>,
     pub claimed_workspace_keys: BTreeSet<String>,
     pub retry_attempts: BTreeMap<String, RetryEntry>,
     pub completed: BTreeSet<String>,
@@ -48,22 +50,35 @@ pub struct OrchestratorState {
 
 impl OrchestratorState {
     pub fn claim_running(&mut self, issue: Issue, attempt: Option<u32>, started_at: DateTime<Utc>) {
+        self.claim_running_for_source(DEFAULT_SOURCE_ID, issue, attempt, started_at);
+    }
+
+    pub fn claim_running_for_source(
+        &mut self,
+        source_id: &str,
+        issue: Issue,
+        attempt: Option<u32>,
+        started_at: DateTime<Utc>,
+    ) {
+        let issue_key = source_issue_key(source_id, &issue.id);
         let issue_id = issue.id.clone();
         let identifier = issue.identifier.clone();
-        let workspace_key = sanitize_workspace_key(&identifier);
-        self.claimed.insert(issue_id.clone());
+        let workspace_key = source_workspace_key(source_id, &identifier);
+        self.claimed.insert(issue_key.clone());
+        self.claimed_issue_ids.insert(issue_id.clone());
         self.claimed_workspace_keys.insert(workspace_key.clone());
         let displaced_retry_workspace_key = self
             .retry_attempts
-            .remove(&issue_id)
+            .remove(&issue_key)
             .map(|retry| retry.workspace_key);
         let displaced_running_workspace_key = self
             .running
-            .get(&issue_id)
+            .get(&issue_key)
             .map(|entry| entry.workspace_key.clone());
         self.running.insert(
-            issue_id.clone(),
+            issue_key,
             RunningEntry {
+                source_id: source_id.to_string(),
                 issue,
                 identifier,
                 workspace_key,
@@ -79,6 +94,7 @@ impl OrchestratorState {
         {
             self.release_workspace_key_if_unowned(&workspace_key);
         }
+        self.release_tracker_issue_id_if_unowned(&issue_id);
     }
 
     pub fn running_state_counts(&self) -> StateCounts {
@@ -92,10 +108,41 @@ impl OrchestratorState {
     }
 
     pub fn is_issue_or_workspace_claimed(&self, issue: &Issue) -> bool {
-        self.claimed.contains(&issue.id)
+        self.is_issue_or_workspace_claimed_for_source(DEFAULT_SOURCE_ID, issue)
+    }
+
+    pub fn is_issue_or_workspace_claimed_for_source(&self, source_id: &str, issue: &Issue) -> bool {
+        self.claimed
+            .contains(&source_issue_key(source_id, &issue.id))
+            || self.claimed_issue_ids.contains(&issue.id)
             || self
                 .claimed_workspace_keys
-                .contains(&sanitize_workspace_key(&issue.identifier))
+                .contains(&source_workspace_key(source_id, &issue.identifier))
+    }
+
+    pub fn running_issue_ids_for_source(&self, source_id: &str) -> Vec<String> {
+        self.running
+            .values()
+            .filter(|entry| entry.source_id == source_id)
+            .map(|entry| entry.issue.id.clone())
+            .collect()
+    }
+
+    pub fn running_entry_mut_for_source(
+        &mut self,
+        source_id: &str,
+        issue_id: &str,
+    ) -> Option<&mut RunningEntry> {
+        let issue_key = source_issue_key(source_id, issue_id);
+        self.running.get_mut(&issue_key)
+    }
+
+    pub fn due_retry_keys_for_source(&self, source_id: &str, now_ms: u64) -> Vec<String> {
+        self.retry_attempts
+            .iter()
+            .filter(|(_, retry)| retry.source_id == source_id && retry.due_at_ms <= now_ms)
+            .map(|(issue_key, _)| issue_key.clone())
+            .collect()
     }
 
     pub fn apply_codex_event(&mut self, event: CodexEvent) {
@@ -159,60 +206,76 @@ impl OrchestratorState {
         now_ms: u64,
         now_utc: DateTime<Utc>,
     ) -> Option<RetryEntry> {
-        let entry = self.running.remove(issue_id)?;
+        self.worker_exit_for_source(DEFAULT_SOURCE_ID, issue_id, reason, config, now_ms, now_utc)
+    }
+
+    pub fn worker_exit_for_source(
+        &mut self,
+        source_id: &str,
+        issue_id: &str,
+        reason: WorkerExitReason,
+        config: &EffectiveConfig,
+        now_ms: u64,
+        now_utc: DateTime<Utc>,
+    ) -> Option<RetryEntry> {
+        let issue_key = source_issue_key(source_id, issue_id);
+        self.worker_exit_by_key(&issue_key, reason, config, now_ms, now_utc)
+    }
+
+    pub fn worker_exit_by_key(
+        &mut self,
+        issue_key: &str,
+        reason: WorkerExitReason,
+        config: &EffectiveConfig,
+        now_ms: u64,
+        now_utc: DateTime<Utc>,
+    ) -> Option<RetryEntry> {
+        let entry = self.running.remove(issue_key)?;
+        let issue_id = entry.issue.id.clone();
         self.ended_runtime_seconds += now_utc
             .signed_duration_since(entry.started_at)
             .num_milliseconds()
             .max(0) as f64
             / 1000.0;
-        if reason.is_normal() {
-            self.completed.insert(issue_id.to_string());
-            let retry = RetryEntry {
-                issue_id: issue_id.to_string(),
-                identifier: entry.identifier,
-                workspace_key: entry.workspace_key,
-                attempt: 1,
-                due_at_ms: continuation_retry_due_at_ms(now_ms),
-                error: None,
-            };
-            self.claimed.insert(issue_id.to_string());
-            self.claimed_workspace_keys
-                .insert(retry.workspace_key.clone());
-            self.retry_attempts
-                .insert(issue_id.to_string(), retry.clone());
-            Some(retry)
+        let (attempt, due_at_ms, error) = if reason.is_normal() {
+            self.completed.insert(issue_key.to_string());
+            (1, continuation_retry_due_at_ms(now_ms), None)
         } else {
             let next_attempt = entry.retry_attempt.unwrap_or(0).saturating_add(1).max(1);
-            let retry = RetryEntry {
-                issue_id: issue_id.to_string(),
-                identifier: entry.identifier,
-                workspace_key: entry.workspace_key,
-                attempt: next_attempt,
-                due_at_ms: failure_retry_due_at_ms(
-                    next_attempt,
-                    config.agent.max_retry_backoff_ms,
-                    now_ms,
-                ),
-                error: reason.error_message(),
-            };
-            self.claimed.insert(issue_id.to_string());
-            self.claimed_workspace_keys
-                .insert(retry.workspace_key.clone());
-            self.retry_attempts
-                .insert(issue_id.to_string(), retry.clone());
-            Some(retry)
-        }
+            (
+                next_attempt,
+                failure_retry_due_at_ms(next_attempt, config.agent.max_retry_backoff_ms, now_ms),
+                reason.error_message(),
+            )
+        };
+        let retry = RetryEntry {
+            source_id: entry.source_id,
+            issue_id,
+            identifier: entry.identifier,
+            workspace_key: entry.workspace_key,
+            attempt,
+            due_at_ms,
+            error,
+        };
+        self.requeue_retry(retry.clone());
+        Some(retry)
     }
 
     pub fn release(&mut self, issue_id: &str) {
+        self.release_for_source(DEFAULT_SOURCE_ID, issue_id);
+    }
+
+    pub fn release_for_source(&mut self, source_id: &str, issue_id: &str) {
+        let issue_key = source_issue_key(source_id, issue_id);
         let mut workspace_keys = Vec::new();
-        if let Some(entry) = self.running.remove(issue_id) {
+        if let Some(entry) = self.running.remove(&issue_key) {
             workspace_keys.push(entry.workspace_key);
         }
-        if let Some(retry) = self.retry_attempts.remove(issue_id) {
+        if let Some(retry) = self.retry_attempts.remove(&issue_key) {
             workspace_keys.push(retry.workspace_key);
         }
-        self.claimed.remove(issue_id);
+        self.claimed.remove(&issue_key);
+        self.release_tracker_issue_id_if_unowned(issue_id);
         for workspace_key in workspace_keys {
             self.release_workspace_key_if_unowned(&workspace_key);
         }
@@ -224,7 +287,18 @@ impl OrchestratorState {
         latest: Option<&Issue>,
         config: &EffectiveConfig,
     ) -> ReconcileDecision {
-        let Some(entry) = self.running.get_mut(issue_id) else {
+        self.reconcile_running_issue_for_source(DEFAULT_SOURCE_ID, issue_id, latest, config)
+    }
+
+    pub fn reconcile_running_issue_for_source(
+        &mut self,
+        source_id: &str,
+        issue_id: &str,
+        latest: Option<&Issue>,
+        config: &EffectiveConfig,
+    ) -> ReconcileDecision {
+        let issue_key = source_issue_key(source_id, issue_id);
+        let Some(entry) = self.running.get_mut(&issue_key) else {
             return ReconcileDecision::NoRunningEntry;
         };
         let Some(latest) = latest else {
@@ -249,19 +323,29 @@ impl OrchestratorState {
     }
 
     pub fn stalled_issue_ids(&self, config: &EffectiveConfig, now: DateTime<Utc>) -> Vec<String> {
+        self.stalled_issue_ids_for_source(DEFAULT_SOURCE_ID, config, now)
+    }
+
+    pub fn stalled_issue_ids_for_source(
+        &self,
+        source_id: &str,
+        config: &EffectiveConfig,
+        now: DateTime<Utc>,
+    ) -> Vec<String> {
         if config.codex.stall_timeout_ms <= 0 {
             return Vec::new();
         }
         let timeout_ms = config.codex.stall_timeout_ms as u64;
         self.running
-            .iter()
-            .filter_map(|(issue_id, entry)| {
+            .values()
+            .filter(|entry| entry.source_id == source_id)
+            .filter_map(|entry| {
                 let since = entry
                     .live_session
                     .as_ref()
                     .and_then(|session| session.last_codex_timestamp)
                     .unwrap_or(entry.started_at);
-                (utc_elapsed_ms(since, now) > timeout_ms).then(|| issue_id.clone())
+                (utc_elapsed_ms(since, now) > timeout_ms).then(|| entry.issue.id.clone())
             })
             .collect()
     }
@@ -269,9 +353,10 @@ impl OrchestratorState {
     pub fn snapshot(&self, now: DateTime<Utc>) -> RuntimeSnapshot {
         let running = self
             .running
-            .iter()
-            .map(|(issue_id, entry)| RunningSnapshot {
-                issue_id: issue_id.clone(),
+            .values()
+            .map(|entry| RunningSnapshot {
+                source_id: entry.source_id.clone(),
+                issue_id: entry.issue.id.clone(),
                 issue_identifier: entry.identifier.clone(),
                 state: entry.issue.state.clone(),
                 session_id: entry
@@ -311,25 +396,70 @@ impl OrchestratorState {
         attempt: u32,
         error: impl Into<Option<String>>,
     ) -> RetryEntry {
+        self.schedule_retry_now_for_source(DEFAULT_SOURCE_ID, issue, attempt, error)
+    }
+
+    pub fn schedule_retry_now_for_source(
+        &mut self,
+        source_id: &str,
+        issue: &Issue,
+        attempt: u32,
+        error: impl Into<Option<String>>,
+    ) -> RetryEntry {
         let retry = RetryEntry {
+            source_id: source_id.to_string(),
             issue_id: issue.id.clone(),
             identifier: issue.identifier.clone(),
-            workspace_key: sanitize_workspace_key(&issue.identifier),
+            workspace_key: source_workspace_key(source_id, &issue.identifier),
             attempt,
             due_at_ms: ms_from_now(failure_retry_delay_ms(attempt, u64::MAX)),
             error: error.into(),
         };
-        self.claimed.insert(issue.id.clone());
-        self.claimed_workspace_keys
-            .insert(retry.workspace_key.clone());
+        let issue_key = source_issue_key(source_id, &issue.id);
         let displaced_retry_workspace_key = self
             .retry_attempts
-            .insert(issue.id.clone(), retry.clone())
+            .insert(issue_key, retry.clone())
             .map(|retry| retry.workspace_key);
+        self.claim_retry(&retry);
         if let Some(workspace_key) = displaced_retry_workspace_key {
             self.release_workspace_key_if_unowned(&workspace_key);
         }
         retry
+    }
+
+    pub fn requeue_retry(&mut self, retry: RetryEntry) {
+        let issue_key = source_issue_key(&retry.source_id, &retry.issue_id);
+        self.retry_attempts.insert(issue_key, retry.clone());
+        self.claim_retry(&retry);
+    }
+
+    pub fn release_retry_claim(&mut self, retry: &RetryEntry) {
+        let issue_key = source_issue_key(&retry.source_id, &retry.issue_id);
+        self.claimed.remove(&issue_key);
+        self.release_tracker_issue_id_if_unowned(&retry.issue_id);
+        self.release_workspace_key_if_unowned(&retry.workspace_key);
+    }
+
+    fn claim_retry(&mut self, retry: &RetryEntry) {
+        self.claimed
+            .insert(source_issue_key(&retry.source_id, &retry.issue_id));
+        self.claimed_issue_ids.insert(retry.issue_id.clone());
+        self.claimed_workspace_keys
+            .insert(retry.workspace_key.clone());
+    }
+
+    pub(crate) fn release_tracker_issue_id_if_unowned(&mut self, issue_id: &str) {
+        let owned_by_running = self
+            .running
+            .values()
+            .any(|entry| entry.issue.id == issue_id);
+        let owned_by_retry = self
+            .retry_attempts
+            .values()
+            .any(|retry| retry.issue_id == issue_id);
+        if !owned_by_running && !owned_by_retry {
+            self.claimed_issue_ids.remove(issue_id);
+        }
     }
 
     pub(crate) fn release_workspace_key_if_unowned(&mut self, workspace_key: &str) {
@@ -344,6 +474,23 @@ impl OrchestratorState {
         if !owned_by_running && !owned_by_retry {
             self.claimed_workspace_keys.remove(workspace_key);
         }
+    }
+}
+
+pub fn source_issue_key(source_id: &str, issue_id: &str) -> String {
+    if source_id == DEFAULT_SOURCE_ID {
+        issue_id.to_string()
+    } else {
+        format!("{}:{}{}", source_id.len(), source_id, issue_id)
+    }
+}
+
+pub fn source_workspace_key(source_id: &str, identifier: &str) -> String {
+    let issue_key = sanitize_workspace_key(identifier);
+    if source_id == DEFAULT_SOURCE_ID {
+        issue_key
+    } else {
+        format!("{}/{}", sanitize_workspace_key(source_id), issue_key)
     }
 }
 

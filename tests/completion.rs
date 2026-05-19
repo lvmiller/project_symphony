@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use symphony::completion::GitHubCompletionClient;
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
-    GithubConfig, GithubProjectOwnerType, HooksConfig, PollingConfig, TrackerConfig,
-    WorkspaceConfig,
+    GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig,
+    SourceConfig, TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
 };
 use symphony::domain::Issue;
 
@@ -486,6 +486,9 @@ fn config(endpoint: String) -> EffectiveConfig {
         workflow_path: "WORKFLOW.md".into(),
         workflow_dir: ".".into(),
         prompt_template: String::new(),
+        source: SourceConfig {
+            id: "default".to_string(),
+        },
         tracker: TrackerConfig {
             kind: "github".to_string(),
             endpoint,
@@ -495,6 +498,10 @@ fn config(endpoint: String) -> EffectiveConfig {
             github: Some(GithubConfig {
                 repository_owner: "lvmiller".to_string(),
                 repository_name: "project_symphony".to_string(),
+                repositories: vec![GithubRepositoryConfig {
+                    owner: "lvmiller".to_string(),
+                    name: "project_symphony".to_string(),
+                }],
                 project_owner_type: GithubProjectOwnerType::User,
                 project_owner_login: "lvmiller".to_string(),
                 project_number: 2,
@@ -508,6 +515,7 @@ fn config(endpoint: String) -> EffectiveConfig {
         polling: PollingConfig { interval_ms: 1_000 },
         workspace: WorkspaceConfig {
             root: "workspaces".into(),
+            cleanup: WorkspaceCleanupConfig::default(),
         },
         hooks: HooksConfig::default(),
         agent: AgentConfig {

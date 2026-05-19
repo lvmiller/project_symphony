@@ -118,6 +118,7 @@ impl LiveSession {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RetryEntry {
+    pub source_id: String,
     pub issue_id: String,
     pub identifier: String,
     pub workspace_key: String,
@@ -137,6 +138,7 @@ pub struct RuntimeSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunningSnapshot {
+    pub source_id: String,
     pub issue_id: String,
     pub issue_identifier: String,
     pub state: String,

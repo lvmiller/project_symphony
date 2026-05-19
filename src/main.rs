@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use symphony::config::ConfigReloader;
+use symphony::config::ConfigSetReloader;
 use symphony::logging::init_logging;
-use symphony::service::run_service_until_shutdown;
+use symphony::service::run_multi_source_service_until_shutdown;
 use symphony::shutdown::shutdown_signal;
 use tracing::info;
 
@@ -14,8 +14,8 @@ use tracing::info;
     about = "Symphony coding-agent orchestrator"
 )]
 struct Cli {
-    #[arg(value_name = "WORKFLOW.md", default_value = "WORKFLOW.md")]
-    workflow: PathBuf,
+    #[arg(value_name = "WORKFLOW.md")]
+    workflows: Vec<PathBuf>,
 
     #[arg(long, hide = true)]
     check: bool,
@@ -25,14 +25,25 @@ struct Cli {
 async fn main() {
     init_logging();
     let cli = Cli::parse();
-    match ConfigReloader::new(Some(cli.workflow)) {
+    let workflow_paths = if cli.workflows.is_empty() {
+        vec![PathBuf::from("WORKFLOW.md")]
+    } else {
+        cli.workflows
+    };
+    match ConfigSetReloader::new(workflow_paths) {
         Ok(reloader) => {
-            info!(workflow_path = %reloader.current().workflow_path.display(), "startup completed");
+            let sources: Vec<_> = reloader
+                .current()
+                .map(|config| format!("{}:{}", config.source.id, config.workflow_path.display()))
+                .collect();
+            info!(sources = %sources.join(","), "startup completed");
             if cli.check {
                 info!("check completed");
                 return;
             }
-            if let Err(error) = run_service_until_shutdown(reloader, shutdown_signal()).await {
+            if let Err(error) =
+                run_multi_source_service_until_shutdown(reloader, shutdown_signal()).await
+            {
                 eprintln!("host_error error=\"{error}\"");
                 std::process::exit(1);
             }

@@ -737,15 +737,10 @@ fn normalize_project_item(github: &GithubConfig, item: ProjectItem) -> Result<Op
 }
 
 fn issue_matches_configured_repository(github: &GithubConfig, content: &IssueNode) -> bool {
-    content
-        .repository
-        .owner
-        .login
-        .eq_ignore_ascii_case(&github.repository_owner)
-        && content
-            .repository
-            .name
-            .eq_ignore_ascii_case(&github.repository_name)
+    github.issue_matches_configured_repository(
+        &content.repository.owner.login,
+        &content.repository.name,
+    )
 }
 
 fn normalize_issue(

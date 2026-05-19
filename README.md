@@ -64,13 +64,31 @@ The binary validates startup config before entering the service loop. It exits n
 
 ## Run in Docker
 
-Use container paths in `WORKFLOW.md`. The committed example's `workspace.root: ./.symphony-workspaces`
-works with the mount below because the container workdir is `/app`.
-Pass any additional Codex authentication variables or mounted credential files required by the
-installed `codex` CLI. The image includes `tini` as PID 1 for signal forwarding and child reaping.
+Use container paths in `WORKFLOW.md`. The committed `docker-compose.example.yml` mounts
+`WORKFLOW.md` and `./.symphony-workspaces` at the container paths expected by the image, and
+the committed example's `workspace.root: ./.symphony-workspaces` works because the container
+workdir is `/app`.
+
+Create the workspace directory, then run Compose against the committed example (or copy it to
+`docker-compose.yml` if you prefer a local editable file):
 
 ```sh
 mkdir -p .symphony-workspaces
+docker compose -f docker-compose.example.yml up --build
+```
+
+For configuration-only validation:
+
+```sh
+docker compose -f docker-compose.example.yml run --rm --build symphony --check
+```
+
+Pass any additional Codex authentication variables or mounted credential files required by the
+installed `codex` CLI. The image includes `tini` as PID 1 for signal forwarding and child reaping.
+
+Equivalent `docker run` commands:
+
+```sh
 docker run --rm \
   -e GITHUB_TOKEN \
   -e OPENAI_API_KEY \
@@ -78,8 +96,6 @@ docker run --rm \
   -v "$PWD/.symphony-workspaces:/app/.symphony-workspaces" \
   symphony:local
 ```
-
-For configuration-only validation:
 
 ```sh
 docker run --rm \
@@ -117,6 +133,8 @@ tracker:
 
 workspace:
   root: ./.symphony-workspaces
+  cleanup:
+    after_success: committed
 
 agent:
   max_concurrent_agents: 2
@@ -139,7 +157,10 @@ Implementation-defined choices are part of the runtime contract:
 
 - Tracker adapter: `tracker.kind: github`; repository-only issues are not dispatched unless they are in the configured Project v2.
 - State source: GitHub Project v2 Status field maps to `issue.state`.
-- Workspace population: Symphony creates/reuses directories only. Checkout, sync, dependency bootstrap, or cleanup policy belongs in hooks.
+- Workspace lifecycle: Symphony creates/reuses directories only; this Rust runtime removes a workspace
+  after successful direct-commit completion by default (`workspace.cleanup.after_success:
+  committed`). Set it to `never` to retain successful-run workspaces. Checkout, sync, bootstrap, and
+  any additional cleanup policy still belong in hooks.
 - Existing non-directory workspace path: fail safely; never replace user data.
 - Codex default posture: high-trust defaults are used unless overridden in `WORKFLOW.md` with schema-valid Codex values.
 - User input required by Codex: treated as a run failure so the worker does not stall indefinitely.
@@ -150,28 +171,31 @@ Implementation-defined choices are part of the runtime contract:
 ## Repository layout
 
 ```text
+.github/workflows/  CI workflow definitions
 src/
-  agent/          Codex protocol client and runner composition
-  orchestrator/   Scheduler, retry, state, reconciliation helpers
-  tracker/        GitHub Project v2 tracker adapter
-  config.rs       Typed config and reload handling
-  workflow.rs     WORKFLOW.md loader
-  workspace.rs    Workspace path safety and lifecycle
-  hooks.rs        Shell hook execution
-  prompt.rs       Strict prompt rendering
-  service.rs      Host service loop
-  main.rs         CLI entrypoint
+  agent/             Codex protocol client and runner composition
+  orchestrator/      Scheduler, retry, state, reconciliation helpers
+  tracker/           GitHub Project v2 tracker adapter
+  config.rs          Typed config and reload handling
+  workflow.rs        WORKFLOW.md loader
+  workspace.rs       Workspace path safety and lifecycle
+  hooks.rs           Shell hook execution
+  prompt.rs          Strict prompt rendering
+  service.rs         Host service loop
+  main.rs            CLI entrypoint
 
-tests/            Conformance-focused integration tests
-SPEC.md           Normative service specification
-AGENTS.md         Repository guidance
-Dockerfile        Container image build for Symphony + Codex CLI
-.dockerignore     Container build context exclusions
+tests/               Conformance-focused integration tests
+SPEC.md              Normative service specification
+AGENTS.md            Repository guidance
+Dockerfile           Container image build for Symphony + Codex CLI
+docker-compose.example.yml
+                     Container runtime example for Docker Compose
+.dockerignore        Container build context exclusions
 ```
 
 ## GitHub upload notes
 
-Commit source, tests, `Cargo.toml`, `Cargo.lock`, `SPEC.md`, `AGENTS.md`, `.gitignore`, `.dockerignore`, `Dockerfile`, `WORKFLOW.example.md`, and this README.
+Commit source, tests, `.github/workflows/`, `Cargo.toml`, `Cargo.lock`, `SPEC.md`, `AGENTS.md`, `.gitignore`, `.dockerignore`, `Dockerfile`, `docker-compose.example.yml`, `WORKFLOW.example.md`, and this README.
 
 Do not upload generated or local-only artifacts:
 

@@ -5,14 +5,16 @@ use chrono::{TimeZone, Utc};
 use serde_json::json;
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, EffectiveConfig, GithubConfig,
-    GithubProjectOwnerType, HooksConfig, PollingConfig, TrackerConfig, WorkspaceConfig,
+    GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig, SourceConfig,
+    TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
 };
 use symphony::domain::{BlockerRef, CodexEvent, Issue, TokenTotals, WorkerExitReason};
 use symphony::orchestrator::retry::{
     continuation_retry_due_at_ms, failure_retry_delay_ms, retry_is_due,
 };
 use symphony::orchestrator::scheduler::{
-    DispatchIneligibleReason, dispatch_ineligible_reason, is_dispatch_eligible, sort_for_dispatch,
+    DispatchIneligibleReason, dispatch_ineligible_reason, dispatch_ineligible_reason_for_source,
+    is_dispatch_eligible, is_dispatch_eligible_for_source, sort_for_dispatch,
 };
 use symphony::orchestrator::state::{OrchestratorState, ReconcileDecision};
 
@@ -28,6 +30,9 @@ fn config(
         workflow_path: PathBuf::from("workflow.yml"),
         workflow_dir: PathBuf::from("."),
         prompt_template: String::new(),
+        source: SourceConfig {
+            id: "default".to_string(),
+        },
         tracker: TrackerConfig {
             kind: "github".to_string(),
             endpoint: "https://api.github.com/graphql".to_string(),
@@ -41,6 +46,10 @@ fn config(
             github: Some(GithubConfig {
                 repository_owner: "owner".to_string(),
                 repository_name: "repo".to_string(),
+                repositories: vec![GithubRepositoryConfig {
+                    owner: "owner".to_string(),
+                    name: "repo".to_string(),
+                }],
                 project_owner_type: GithubProjectOwnerType::Organization,
                 project_owner_login: "org".to_string(),
                 project_number: 1,
@@ -54,6 +63,7 @@ fn config(
         polling: PollingConfig { interval_ms: 1_000 },
         workspace: WorkspaceConfig {
             root: PathBuf::from("work"),
+            cleanup: WorkspaceCleanupConfig::default(),
         },
         hooks: HooksConfig::default(),
         agent: AgentConfig {
@@ -233,6 +243,35 @@ fn releasing_one_owner_does_not_free_workspace_key_still_owned_by_another_entry(
 
     state.release(&second.id);
     assert!(is_dispatch_eligible(&third, &state, &config));
+}
+
+#[test]
+fn source_scoped_workspaces_do_not_collide_but_duplicate_tracker_issue_is_blocked() {
+    let config = config(3, []);
+    let mut state = OrchestratorState::default();
+    let running = issue("same-id", "S/001", "Todo");
+    let same_identifier_other_source = issue("other-id", "S?001", "Todo");
+    let same_tracker_issue_other_source = issue("same-id", "S-999", "Todo");
+
+    state.claim_running_for_source("api", running.clone(), None, ts(0));
+
+    assert!(is_dispatch_eligible_for_source(
+        "worker",
+        &same_identifier_other_source,
+        &state,
+        &config
+    ));
+    assert_eq!(
+        dispatch_ineligible_reason_for_source(
+            "worker",
+            &same_tracker_issue_other_source,
+            &state,
+            &config
+        ),
+        Some(DispatchIneligibleReason::AlreadyRunningOrClaimed)
+    );
+    assert!(state.claimed.contains("3:apisame-id"));
+    assert!(state.claimed_workspace_keys.contains("api/S_001"));
 }
 
 #[test]

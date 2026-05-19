@@ -47,7 +47,7 @@ Important boundary:
 
 - Poll the issue tracker on a fixed cadence and dispatch work with bounded concurrency.
 - Maintain a single authoritative orchestrator state for dispatch, retries, and reconciliation.
-- Create deterministic per-issue workspaces and preserve them across runs.
+- Create deterministic per-issue workspaces and reuse them across runs until cleanup policy removes them.
 - Stop active runs when issue state changes make them ineligible.
 - Recover from transient failures with exponential backoff.
 - Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
@@ -421,6 +421,16 @@ Fields:
   - `~` is expanded.
   - Relative paths are resolved relative to the directory containing `WORKFLOW.md`.
   - The effective workspace root is normalized to an absolute path before use.
+- `cleanup` (object, OPTIONAL)
+  - Controls successful-run workspace retention. Terminal-state cleanup remains active regardless of
+    this setting.
+  - Fields:
+    - `after_success` (string), OPTIONAL, one of:
+      - `committed` (default): remove the workspace only after the runtime verifies a durable
+        direct-commit completion: at least one commit was pushed and any configured issue handoff
+        succeeded.
+      - `never`: keep workspaces after successful runs; operators or hooks own any cleanup beyond
+        terminal-state cleanup.
 
 #### 5.3.4 `hooks` (object)
 
@@ -871,8 +881,11 @@ Per-issue workspace path:
 
 Workspace persistence:
 
-- Workspaces are reused across runs for the same issue.
-- Successful runs do not auto-delete workspaces.
+- Workspaces are reused across runs for the same issue while they exist.
+- `workspace.cleanup.after_success: committed` removes a workspace only after verified changes have
+  been committed and any configured completion/state handoff succeeds.
+- `workspace.cleanup.after_success: never` leaves successful-run workspaces in place for operators
+  or hooks to manage.
 
 ### 9.2 Workspace Creation and Reuse
 
@@ -1181,7 +1194,8 @@ Behavior:
 
 Note:
 
-- Workspaces are intentionally preserved after successful runs.
+- A successful run removes its workspace only when `workspace.cleanup.after_success` allows it and
+  the implementation reached the matching durable completion point.
 
 ## 11. Issue Tracker Integration Contract (GitHub Projects v2)
 
@@ -1633,7 +1647,7 @@ API design notes:
 
 Current design is intentionally in-memory for scheduler state.
 Restart recovery means the service can resume useful operation by polling tracker state and reusing
-preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
+any still-present workspaces. It does not mean retry timers, running sessions, or live worker state survive
 process restart.
 
 After restart:
@@ -2159,6 +2173,8 @@ Use the same validation profiles as Section 17:
 - TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
   of only via agent tools.
 - TODO: Add pluggable issue tracker adapters beyond GitHub Projects v2.
+- Multi-project/multi-repository execution extension lets one Symphony process manage multiple
+  configured work sources; see Appendix B.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 
@@ -2228,3 +2244,162 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+## Appendix B. Multi-Project / Multi-Repository Extension (OPTIONAL)
+
+This appendix describes a feasible extension profile in which one Symphony process manages work
+from multiple GitHub Project v2 boards and/or multiple repositories.
+
+This extension is not REQUIRED for core conformance. The single-workflow, single-tracker scope
+defined by the core specification remains valid and is equivalent to a multi-source deployment with
+one configured source.
+
+Key constraint:
+
+- A multi-source implementation MUST preserve the core single-authority scheduler invariant. Adding
+  sources must not create independent schedulers that can dispatch the same issue concurrently.
+
+Terminology:
+
+- `Work source`
+  - One independently loadable workflow/tracker scope.
+  - Usually consists of a source ID, a `WORKFLOW.md` path, a GitHub Project v2 configuration, and one
+    or more eligible repositories.
+- `Source ID`
+  - Stable operator-selected identifier for one work source.
+  - MUST be unique within one Symphony process.
+  - SHOULD contain only characters accepted by the workspace-key sanitizer.
+- `Source issue key`
+  - Composite scheduler key derived from `(source_id, issue.id)`.
+  - Used for `running`, `claimed`, retry queue, logs, and status surfaces when this extension is
+    enabled.
+
+### B.1 Configuration Model
+
+A conforming implementation of this extension MAY accept either:
+
+1. Multiple explicit workflow paths at startup; or
+2. A top-level extension-owned `sources` list whose entries each point at a workflow file and/or
+   include source-scoped config overrides.
+
+Each source MUST resolve to an effective core `Service Config` before it can dispatch work.
+
+Source validation rules:
+
+- `source_id` is REQUIRED and unique.
+- Each source MUST have a workflow path or an implementation-defined way to derive one.
+- Each source MUST independently satisfy the core dispatch preflight validation in Section 6.3.
+- An invalid source MUST block dispatch for that source, but SHOULD NOT block reconciliation or
+  dispatch for other valid sources.
+- Dynamic reload SHOULD be tracked per source; an invalid reload keeps that source's last known good
+  effective config.
+
+GitHub repository/project mapping:
+
+- Multiple GitHub Projects v2 boards SHOULD be represented as multiple work sources.
+- The existing `tracker.project` object identifies one Project v2 board for one source.
+- The existing `tracker.repository` object remains the single-repository form.
+- This extension MAY add `tracker.repositories` as a non-empty list of `{owner, name}` objects.
+- A source MUST NOT specify both `tracker.repository` and `tracker.repositories` unless the
+  implementation documents deterministic precedence and validation behavior.
+- Candidate issue queries for a source MUST only normalize GitHub Issue items whose repository
+  matches one of that source's configured repositories.
+
+Authentication:
+
+- Tracker auth MAY be shared across sources or configured per source.
+- Logs and status surfaces MUST NOT expose raw tokens or secret-derived values.
+- Client-side tools such as `github_graphql` MUST use the current session's source-scoped GitHub
+  endpoint and auth.
+
+### B.2 Scheduling Semantics
+
+The orchestrator still owns one global runtime state. With this extension enabled:
+
+- `running`, `claimed`, and retry entries are keyed by source issue key, not raw issue ID alone.
+- Running entries MUST retain `source_id` and the source's effective tracker config needed for
+  reconciliation and cleanup.
+- Global concurrency limits apply across all sources unless the implementation documents source-local
+  limits.
+- Implementations MAY add per-source concurrency limits, but they MUST NOT bypass the global
+  `agent.max_concurrent_agents` limit.
+- Candidate sorting across sources SHOULD use:
+  1. `priority` ascending
+  2. `created_at` oldest first
+  3. `source_id` lexicographic tie-breaker
+  4. `identifier` lexicographic tie-breaker
+- Failures to fetch one source's candidates SHOULD skip that source for the tick without preventing
+  other sources from dispatching.
+
+Duplicate issue protection:
+
+- The same tracker issue can appear in more than one GitHub Project v2 board.
+- A multi-source implementation MUST prevent concurrent execution of the same normalized tracker
+  issue ID across sources by default.
+- If an implementation intentionally supports multiple workflows for the same tracker issue, it MUST
+  require explicit opt-in and document how conflicting workspace changes, tracker comments, and PRs
+  are avoided.
+
+Retry behavior:
+
+- Retry attempts are scoped to the source issue key.
+- If a source is removed or becomes invalid while retry entries exist, those entries SHOULD be
+  released or marked source-invalid rather than retried against another source.
+
+### B.3 Workspace Layout
+
+Workspace paths MUST include source identity to avoid collisions between repositories that use the
+same issue identifier.
+
+Recommended layout:
+
+- `<workspace.root>/<sanitized_source_id>/<sanitized_issue_identifier>`
+
+Workspace rules:
+
+- The full path MUST remain under `workspace.root` after normalization.
+- Terminal cleanup for one source MUST NOT remove another source's workspace.
+- Hooks execute with the source's effective workflow config.
+- Implementations SHOULD expose source metadata to hooks through documented environment variables
+  such as `SYMPHONY_SOURCE_ID`, `SYMPHONY_REPOSITORY_OWNER`, and `SYMPHONY_REPOSITORY_NAME`.
+
+### B.4 Prompt and Observability Additions
+
+Prompt rendering SHOULD include a `source` object when this extension is enabled.
+
+Recommended `source` fields:
+
+- `id`
+- `workflow_path`
+- `repository_owner`
+- `repository_name`
+- `repositories`
+- `project_owner_login`
+- `project_number`
+
+Structured logs and status surfaces SHOULD include:
+
+- `source_id`
+- `repository` or `repositories`
+- `project_owner_login`
+- `project_number`
+- `issue_id`
+- `issue_identifier`
+- `session_id` when available
+
+This extension does not turn Symphony into a multi-tenant control plane. All configured sources are
+assumed to be administered under one trust boundary unless an implementation explicitly documents
+stronger isolation.
+
+### B.5 Extension Conformance Checks
+
+If this extension is implemented, deterministic tests SHOULD cover:
+
+- Single-source behavior remains backward-compatible with the core configuration.
+- Duplicate `source_id` values are rejected.
+- `tracker.repositories` accepts multiple repositories and rejects malformed entries.
+- Workspace keys include source identity and cannot escape `workspace.root`.
+- A candidate fetch failure in one source does not block dispatch from another valid source.
+- The same tracker issue ID appearing in two sources is not dispatched concurrently by default.
+- Per-source reload keeps the last known good config for only the invalid source.
+- Reconciliation and terminal cleanup use the source-scoped tracker config.
