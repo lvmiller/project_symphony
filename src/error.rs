@@ -9,6 +9,9 @@ pub enum SymphonyError {
     #[error("missing_workflow_file path={path}")]
     MissingWorkflowFile { path: PathBuf },
 
+    #[error("workflow_path_not_file path={path}")]
+    WorkflowPathNotFile { path: PathBuf },
+
     #[error("workflow_parse_error path={path} message={message}")]
     WorkflowParseError { path: PathBuf, message: String },
 

@@ -13,8 +13,8 @@ use symphony::agent::runner::{AgentRunner, SymphonyAgentRunner};
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
     GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig,
-    SourceConfig, TrackerConfig, WorkspaceCleanupAfterSuccess, WorkspaceCleanupConfig,
-    WorkspaceConfig,
+    ServerConfig, SourceConfig, TrackerConfig, WorkspaceCleanupAfterSuccess,
+    WorkspaceCleanupConfig, WorkspaceConfig,
 };
 use symphony::domain::{CodexEvent, Issue, WorkerExitReason};
 use symphony::error::{Result, SymphonyError};
@@ -427,6 +427,7 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
             stall_timeout_ms: 1_000,
         },
         completion: CompletionConfig::default(),
+        server: ServerConfig::default(),
     }
 }
 

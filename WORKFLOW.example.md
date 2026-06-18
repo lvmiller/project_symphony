@@ -2,9 +2,9 @@
 tracker:
   kind: github
   api_key: $GITHUB_TOKEN
-  repository:
-    owner: your-org-or-user
-    name: your-repo
+  repositories:
+    - owner: your-org-or-user
+      name: your-repo
   project:
     owner_type: user # user or organization
     owner_login: your-org-or-user
@@ -21,6 +21,10 @@ tracker:
     P0: 100
     P1: 75
     P2: 50
+
+server:
+  host: 127.0.0.1
+  port: 8080
 
 polling:
   interval_ms: 60000

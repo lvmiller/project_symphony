@@ -1,10 +1,47 @@
+x-symphony-common: &symphony-common
+  build: .
+  image: symphony:local
+  command: ["--host", "0.0.0.0", "--port", "8080"]
+  environment:
+    - GITHUB_TOKEN=${GITHUB_TOKEN:?set GITHUB_TOKEN}
+    - OPENAI_API_KEY
+  ports:
+    - "127.0.0.1:8080:8080"
+  volumes:
+    - type: bind
+      source: ./WORKFLOW.md
+      target: /app/WORKFLOW.md
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ./.symphony-workspaces
+      target: /app/.symphony-workspaces
+      bind:
+        create_host_path: false
+
 services:
   symphony:
-    build: .
-    image: symphony:local
+    <<: *symphony-common
+
+  symphony-codex-home:
+    <<: *symphony-common
+    profiles:
+      - codex-home
     environment:
-      GITHUB_TOKEN: ${GITHUB_TOKEN:?set GITHUB_TOKEN}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:?set GITHUB_TOKEN}
     volumes:
-      - ./WORKFLOW.md:/app/WORKFLOW.md:ro
-      - ./.symphony-workspaces:/app/.symphony-workspaces
+      - type: bind
+        source: ./WORKFLOW.md
+        target: /app/WORKFLOW.md
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.symphony-workspaces
+        target: /app/.symphony-workspaces
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CODEX_HOME:-${HOME}/.codex}
+        target: /home/symphony/.codex
+        bind:
+          create_host_path: false

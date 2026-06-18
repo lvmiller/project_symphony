@@ -7,7 +7,7 @@ use symphony::config::{
     WorkspaceCleanupAfterSuccess,
 };
 use symphony::error::SymphonyError;
-use symphony::workflow::{parse_workflow, select_workflow_path};
+use symphony::workflow::{load_workflow, parse_workflow, select_workflow_path};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -66,6 +66,20 @@ fn parse_yaml_front_matter_and_reject_non_map_front_matter() {
         error,
         SymphonyError::WorkflowFrontMatterNotMap { .. }
     ));
+}
+
+#[test]
+fn load_workflow_rejects_directory_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("WORKFLOW.md");
+    std::fs::create_dir(&path).unwrap();
+
+    let error = load_workflow(&path).unwrap_err();
+
+    match error {
+        SymphonyError::WorkflowPathNotFile { path: actual } => assert_eq!(actual, path),
+        other => panic!("expected workflow_path_not_file, got {other}"),
+    }
 }
 
 #[test]
@@ -325,6 +339,85 @@ fn completion_direct_commit_config_is_parsed_and_validated() {
         SymphonyError::ConfigValidation { code, .. } => {
             assert_eq!(code, "invalid_completion_high_review_state");
         }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn server_config_is_parsed_and_validated() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let valid = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nserver:\n  host: 127.0.0.1\n  port: 0\n---\nPrompt\n",
+    );
+    let config = load_from_path(valid);
+    assert_eq!(
+        config.server.host,
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+    );
+    assert_eq!(config.server.port, Some(0));
+
+    let invalid_host = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nserver:\n  host: not-an-ip\n  port: 8080\n---\nPrompt\n",
+    );
+    assert_config_code(invalid_host, "invalid_server_host");
+
+    let invalid_negative = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nserver:\n  port: -1\n---\nPrompt\n",
+    );
+    assert_config_code(invalid_negative, "invalid_server_port");
+
+    let invalid_large = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nserver:\n  port: 65536\n---\nPrompt\n",
+    );
+    assert_config_code(invalid_large, "invalid_server_port");
+}
+
+#[test]
+fn conflicting_server_binds_are_rejected_without_cli_override() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first.md");
+    let second = temp.path().join("second.md");
+    std::fs::write(&first, server_workflow("first", 8080)).unwrap();
+    std::fs::write(&second, server_workflow("second", 9090)).unwrap();
+    let reloader = ConfigSetReloader::new(vec![first, second]).unwrap();
+
+    let error = reloader.initial_server_bind(None, None).unwrap_err();
+    match error {
+        SymphonyError::ConfigValidation { code, .. } => {
+            assert_eq!(code, "conflicting_server_bind");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let bind = reloader
+        .initial_server_bind(
+            Some("0.0.0.0".parse::<std::net::IpAddr>().unwrap()),
+            Some(0),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(bind.ip(), "0.0.0.0".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(bind.port(), 0);
+}
+
+fn server_workflow(source_id: &str, port: u16) -> String {
+    format!(
+        "---\nsource:\n  id: {source_id}\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nserver:\n  host: 127.0.0.1\n  port: {port}\n---\nPrompt\n"
+    )
+}
+
+fn assert_config_code(path: PathBuf, expected: &'static str) {
+    let error = EffectiveConfig::load(Some(path)).unwrap_err();
+    match error {
+        SymphonyError::ConfigValidation { code, .. } => assert_eq!(code, expected),
         other => panic!("unexpected error: {other:?}"),
     }
 }

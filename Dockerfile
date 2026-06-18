@@ -30,6 +30,7 @@ RUN apt-get update \
 COPY --from=build /src/target/release/symphony /usr/local/bin/symphony
 WORKDIR /app
 USER symphony
+EXPOSE 8080
 VOLUME ["/app/.symphony-workspaces"]
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/symphony"]

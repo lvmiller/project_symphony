@@ -7,6 +7,7 @@ pub mod domain;
 pub mod error;
 pub mod hooks;
 pub mod logging;
+pub mod observability;
 pub mod orchestrator;
 pub mod prompt;
 pub mod service;
@@ -14,6 +15,7 @@ pub mod shutdown;
 pub mod time;
 pub mod tracker;
 pub mod workflow;
+pub mod workflow_store;
 pub mod workspace;
 
 pub use crate::config::{ConfigReloader, ConfigSetReloader, EffectiveConfig};

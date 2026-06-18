@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -11,6 +13,7 @@ use crate::agent::runner::{AgentRunner, SymphonyAgentRunner, WorkerOutcome};
 use crate::config::{ConfigReloader, ConfigSetReloader, EffectiveConfig};
 use crate::domain::{CodexEvent, Issue, WorkerExitReason};
 use crate::error::Result;
+use crate::observability::http::{SharedStatus, spawn_http_server};
 use crate::orchestrator::state::source_issue_key;
 use crate::orchestrator::{OrchestratorState, is_dispatch_eligible_for_source};
 use crate::time::{ms_from_now, now_utc, system_monotonic_ms};
@@ -28,24 +31,49 @@ pub async fn run_service_until_shutdown(
     reloader: ConfigReloader,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    run_multi_source_service_until_shutdown(ConfigSetReloader::from_single(reloader), shutdown)
-        .await
+    run_multi_source_service_until_shutdown(
+        ConfigSetReloader::from_single(reloader),
+        shutdown,
+        None,
+    )
+    .await
 }
 
 pub async fn run_multi_source_service_until_shutdown(
     mut reloaders: ConfigSetReloader,
     shutdown: impl std::future::Future<Output = ()>,
+    server_bind: Option<SocketAddr>,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<CodexEvent>();
     let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel::<WorkerOutcome>();
     let mut state = OrchestratorState::default();
+    let initial_configs = reloaders.current_cloned();
+    let shared_status = SharedStatus::new(&initial_configs);
+    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel::<()>();
+    let refresh_pending = Arc::new(AtomicBool::new(false));
+    let http_server = if let Some(bind_addr) = server_bind {
+        let server = spawn_http_server(
+            bind_addr,
+            shared_status.clone(),
+            refresh_tx.clone(),
+            refresh_pending.clone(),
+        )
+        .await?;
+        info!(bind_addr = %server.local_addr, "http_server_started");
+        Some(server)
+    } else {
+        None
+    };
 
     for config in reloaders.current() {
         startup_terminal_cleanup(config).await;
     }
+    shared_status
+        .publish(&state, &reloaders.current_cloned())
+        .await;
     tokio::pin!(shutdown);
 
-    loop {
+    let result = loop {
         let configs = reloaders.current_cloned();
         drain_events(&mut state, &mut event_rx);
         drain_outcomes(&mut state, &configs, &mut outcome_rx);
@@ -61,16 +89,30 @@ pub async fn run_multi_source_service_until_shutdown(
             outcome_tx.clone(),
         )
         .await;
+        shared_status
+            .publish(&state, &reloaders.current_cloned())
+            .await;
 
         let delay = Duration::from_millis(reloaders.poll_interval_ms());
         tokio::select! {
             _ = &mut shutdown => {
                 info!("shutdown_requested");
-                return Ok(());
+                break Ok(());
             }
             _ = sleep(delay) => {}
+            refresh = refresh_rx.recv() => {
+                if refresh.is_some() {
+                    while refresh_rx.try_recv().is_ok() {}
+                    refresh_pending.store(false, AtomicOrdering::Release);
+                    continue;
+                }
+            }
         }
+    };
+    if let Some(server) = http_server {
+        server.task.abort();
     }
+    result
 }
 
 async fn startup_terminal_cleanup(config: &EffectiveConfig) {

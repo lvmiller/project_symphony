@@ -5,8 +5,8 @@ use chrono::{TimeZone, Utc};
 use serde_json::json;
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, EffectiveConfig, GithubConfig,
-    GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig, SourceConfig,
-    TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
+    GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig, ServerConfig,
+    SourceConfig, TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
 };
 use symphony::domain::{BlockerRef, CodexEvent, Issue, TokenTotals, WorkerExitReason};
 use symphony::orchestrator::retry::{
@@ -85,6 +85,7 @@ fn config(
             stall_timeout_ms: 0,
         },
         completion: CompletionConfig::default(),
+        server: ServerConfig::default(),
     }
 }
 

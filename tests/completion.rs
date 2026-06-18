@@ -12,7 +12,7 @@ use symphony::completion::GitHubCompletionClient;
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
     GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig,
-    SourceConfig, TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
+    ServerConfig, SourceConfig, TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
 };
 use symphony::domain::Issue;
 
@@ -544,6 +544,7 @@ fn config(endpoint: String) -> EffectiveConfig {
                 commit_author_email: "symphony@users.noreply.github.com".to_string(),
             },
         },
+        server: ServerConfig::default(),
     }
 }
 

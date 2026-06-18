@@ -19,13 +19,25 @@ pub fn select_workflow_path(explicit_path: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 pub fn load_workflow(path: &Path) -> Result<WorkflowDefinition> {
-    let contents = std::fs::read_to_string(path).map_err(|err| match err.kind() {
+    let metadata = std::fs::metadata(path).map_err(|err| workflow_path_io_error(path, err))?;
+    if !metadata.is_file() {
+        return Err(SymphonyError::WorkflowPathNotFile {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let contents =
+        std::fs::read_to_string(path).map_err(|err| workflow_path_io_error(path, err))?;
+    parse_workflow(path.to_path_buf(), &contents)
+}
+
+fn workflow_path_io_error(path: &Path, err: std::io::Error) -> SymphonyError {
+    match err.kind() {
         std::io::ErrorKind::NotFound => SymphonyError::MissingWorkflowFile {
             path: path.to_path_buf(),
         },
         _ => SymphonyError::io(Some(path.to_path_buf()), err),
-    })?;
-    parse_workflow(path.to_path_buf(), &contents)
+    }
 }
 
 pub fn parse_workflow(path: PathBuf, contents: &str) -> Result<WorkflowDefinition> {

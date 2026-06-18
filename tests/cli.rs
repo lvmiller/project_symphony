@@ -21,6 +21,25 @@ fn cli_fails_cleanly_when_default_workflow_is_missing() {
 }
 
 #[test]
+fn cli_fails_cleanly_when_default_workflow_path_is_directory() {
+    let temp = TempDir::new().unwrap();
+    std::fs::create_dir(temp.path().join("WORKFLOW.md")).unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .arg("--check")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            predicate::str::contains("startup_failed")
+                .and(predicate::str::contains("workflow_path_not_file"))
+                .and(predicate::str::contains("WORKFLOW.md")),
+        );
+}
+
+#[test]
 fn cli_uses_default_workflow_path_for_check_success() {
     let temp = TempDir::new().unwrap();
     std::fs::write(temp.path().join("WORKFLOW.md"), valid_workflow()).unwrap();
@@ -97,6 +116,44 @@ fn cli_accepts_multiple_workflow_paths_for_check_success() {
                 .and(predicate::str::contains("api:"))
                 .and(predicate::str::contains("worker:")),
         );
+}
+
+#[test]
+fn cli_accepts_port_in_check_mode_without_binding() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("custom.md");
+    std::fs::write(&workflow, valid_workflow()).unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("GITHUB_TOKEN", "test-token")
+        .arg("--check")
+        .arg("--port")
+        .arg("0")
+        .arg(&workflow)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("check completed"));
+}
+
+#[test]
+fn cli_rejects_invalid_host() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("WORKFLOW.md"), valid_workflow()).unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("GITHUB_TOKEN", "test-token")
+        .arg("--host")
+        .arg("not-an-ip")
+        .arg("--check")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("not-an-ip"));
 }
 
 fn valid_workflow() -> &'static str {

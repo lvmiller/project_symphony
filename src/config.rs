@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -40,6 +41,21 @@ pub struct SourceConfig {
     pub id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub host: IpAddr,
+    pub port: Option<u16>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: IpAddr::from(Ipv4Addr::LOCALHOST),
+            port: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectiveConfig {
     pub workflow_path: PathBuf,
@@ -53,6 +69,7 @@ pub struct EffectiveConfig {
     pub agent: AgentConfig,
     pub codex: CodexConfig,
     pub completion: CompletionConfig,
+    pub server: ServerConfig,
 }
 
 impl EffectiveConfig {
@@ -70,6 +87,7 @@ impl EffectiveConfig {
         let agent = parse_agent(&workflow.config)?;
         let codex = parse_codex(&workflow.config)?;
         let completion = parse_completion(&workflow.config)?;
+        let server = parse_server(&workflow.config)?;
         Ok(Self {
             workflow_path: workflow.path,
             workflow_dir,
@@ -82,6 +100,7 @@ impl EffectiveConfig {
             agent,
             codex,
             completion,
+            server,
         })
     }
 
@@ -448,6 +467,48 @@ impl ConfigSetReloader {
             .unwrap_or(30_000)
     }
 
+    pub fn initial_server_bind(
+        &self,
+        cli_host: Option<IpAddr>,
+        cli_port: Option<u16>,
+    ) -> Result<Option<SocketAddr>> {
+        let enabled: Vec<&EffectiveConfig> = self
+            .current()
+            .filter(|config| config.server.port.is_some())
+            .collect();
+        if cli_port.is_none() && enabled.is_empty() {
+            return Ok(None);
+        }
+
+        let port = match cli_port {
+            Some(port) => port,
+            None => {
+                let first = enabled[0].server.port.expect("enabled configs have ports");
+                if enabled
+                    .iter()
+                    .any(|config| config.server.port != Some(first))
+                {
+                    return Err(conflicting_server_bind());
+                }
+                first
+            }
+        };
+
+        let host = match cli_host {
+            Some(host) => host,
+            None if enabled.is_empty() => ServerConfig::default().host,
+            None => {
+                let first = enabled[0].server.host;
+                if enabled.iter().any(|config| config.server.host != first) {
+                    return Err(conflicting_server_bind());
+                }
+                first
+            }
+        };
+
+        Ok(Some(SocketAddr::new(host, port)))
+    }
+
     pub fn reload_if_changed(&mut self) -> Vec<(String, Result<bool>)> {
         self.reloaders
             .iter_mut()
@@ -457,6 +518,13 @@ impl ConfigSetReloader {
             })
             .collect()
     }
+}
+
+fn conflicting_server_bind() -> SymphonyError {
+    SymphonyError::config(
+        "conflicting_server_bind",
+        "multiple workflow sources configure different server host/port values; use CLI --host/--port to override",
+    )
 }
 
 fn validate_unique_source_ids(reloaders: &[ConfigReloader]) -> Result<()> {
@@ -861,6 +929,45 @@ fn parse_completion(config: &Mapping) -> Result<CompletionConfig> {
     Ok(CompletionConfig {
         direct_commit: direct_commit_config,
     })
+}
+fn parse_server(config: &Mapping) -> Result<ServerConfig> {
+    let Some(server) = get_map(config, "server") else {
+        return Ok(ServerConfig::default());
+    };
+
+    let host = match get_value(Some(server), "host") {
+        Some(Value::String(value)) => value.trim().parse::<IpAddr>().map_err(|_| {
+            SymphonyError::config("invalid_server_host", "server.host must be an IP address")
+        })?,
+        Some(_) => {
+            return Err(SymphonyError::config(
+                "invalid_server_host",
+                "server.host must be an IP address",
+            ));
+        }
+        None => ServerConfig::default().host,
+    };
+
+    let port = match get_value(Some(server), "port") {
+        Some(value) => {
+            let Some(port) = value.as_i64() else {
+                return Err(SymphonyError::config(
+                    "invalid_server_port",
+                    "server.port must be an integer between 0 and 65535",
+                ));
+            };
+            if !(0..=65_535).contains(&port) {
+                return Err(SymphonyError::config(
+                    "invalid_server_port",
+                    "server.port must be an integer between 0 and 65535",
+                ));
+            }
+            Some(port as u16)
+        }
+        None => None,
+    };
+
+    Ok(ServerConfig { host, port })
 }
 
 pub fn normalize_state(state: &str) -> String {

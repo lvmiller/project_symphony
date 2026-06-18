@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -16,6 +17,12 @@ use tracing::info;
 struct Cli {
     #[arg(value_name = "WORKFLOW.md")]
     workflows: Vec<PathBuf>,
+
+    #[arg(long, value_name = "HOST")]
+    host: Option<IpAddr>,
+
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
 
     #[arg(long, hide = true)]
     check: bool,
@@ -41,8 +48,16 @@ async fn main() {
                 info!("check completed");
                 return;
             }
+            let server_bind = match reloader.initial_server_bind(cli.host, cli.port) {
+                Ok(server_bind) => server_bind,
+                Err(error) => {
+                    eprintln!("startup_failed error=\"{error}\"");
+                    std::process::exit(1);
+                }
+            };
             if let Err(error) =
-                run_multi_source_service_until_shutdown(reloader, shutdown_signal()).await
+                run_multi_source_service_until_shutdown(reloader, shutdown_signal(), server_bind)
+                    .await
             {
                 eprintln!("host_error error=\"{error}\"");
                 std::process::exit(1);

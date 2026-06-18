@@ -12,6 +12,7 @@ name = "symphony"
 path = "src/main.rs"
 
 [dependencies]
+axum = "0.8"
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }

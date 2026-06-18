@@ -15,7 +15,7 @@ This implementation targets GitHub Issues in GitHub Projects v2. The configured 
 - Orchestrator state, dispatch eligibility, retries, stall detection, reconciliation decisions, token/rate-limit aggregation, and runtime snapshots.
 - CLI startup validation and structured logs to stderr.
 
-Optional `SPEC.md` extensions are intentionally not included: HTTP status server, tracker write tools, and SSH worker support.
+The optional local HTTP UI/API is implemented. Tracker write tools and SSH worker support remain intentionally outside this implementation.
 
 ## Requirements
 
@@ -52,6 +52,23 @@ CARGO_INCREMENTAL=0 cargo test
 cargo run -- path/to/WORKFLOW.md
 ```
 
+Run with the local dashboard/API enabled from the CLI:
+
+```sh
+cargo run -- --port 8080 path/to/WORKFLOW.md
+```
+
+Or enable it from workflow front matter:
+
+```sh
+cargo run -- path/to/WORKFLOW.md
+```
+
+```yaml
+server:
+  port: 8080
+```
+
 If no path is provided, Symphony uses `./WORKFLOW.md`.
 
 For local setup, copy the committed example and customize repository/project values:
@@ -60,50 +77,85 @@ For local setup, copy the committed example and customize repository/project val
 cp WORKFLOW.example.md WORKFLOW.md
 ```
 
-The binary validates startup config before entering the service loop. It exits nonzero on startup failures and logs structured `key=value` events to stderr.
+The binary validates startup config before entering the service loop. It exits nonzero on startup failures and logs structured `key=value` events to stderr. `--check` validates config and exits without binding the optional HTTP listener, even when `--port` is supplied.
+
+The dashboard binds to loopback `127.0.0.1` by default when enabled. Use `--host 0.0.0.0 --port 8080` only behind trusted network controls. Repository management edits `tracker.repositories` in the loaded `WORKFLOW.md`; reload happens on the next tick or via `POST /api/v1/refresh`. Removing a repository prevents future dispatch after reload, but it does not cancel running workers or delete existing workspaces.
+
+HTTP API routes:
+
+- `GET /` serves the dashboard.
+- `GET /api/v1/state` returns runtime counts, running/retrying issues, token totals, seconds running, and rate-limit data.
+- `GET /api/v1/sources` returns loaded workflow source summaries without secrets.
+- `GET /api/v1/repositories?source_id=<id>` returns configured guided repositories for one source.
+- `POST /api/v1/repositories` with `{"source_id":"default","owner":"octo","name":"repo"}` adds a repository.
+- `DELETE /api/v1/repositories?source_id=<id>&owner=<owner>&name=<name>` removes a repository.
+- `POST /api/v1/refresh` queues an immediate poll/reconcile pass.
+- `GET /api/v1/{issue_identifier}` returns issue detail; percent-encode identifiers containing `#`.
+
+Errors use `{"error":{"code":"<code>","message":"<message>"}}`.
 
 ## Run in Docker
 
-Use container paths in `WORKFLOW.md`. The committed `docker-compose.example.yml` mounts
-`WORKFLOW.md` and `./.symphony-workspaces` at the container paths expected by the image, and
-the committed example's `workspace.root: ./.symphony-workspaces` works because the container
-workdir is `/app`.
+Use container paths in `WORKFLOW.md`. The committed `docker-compose.example.yml` bind-mounts
+`WORKFLOW.md` writable so repository management can persist `tracker.repositories`, and mounts
+`./.symphony-workspaces` at the container path expected by the image without auto-creating missing
+host paths. Because the container workdir is `/app`, the committed example's relative
+`workspace.root` points at `/app/.symphony-workspaces`.
 
-Create the workspace directory, then run Compose against the committed example (or copy it to
-`docker-compose.yml` if you prefer a local editable file):
+Create `WORKFLOW.md` and the workspace directory, then run one Compose service for the Codex auth
+method you use.
+For API-key auth, export `OPENAI_API_KEY` and run the default service:
 
 ```sh
+cp -n WORKFLOW.example.md WORKFLOW.md
 mkdir -p .symphony-workspaces
-docker compose -f docker-compose.example.yml up --build
+docker compose -f docker-compose.example.yml up --build symphony
 ```
 
-For configuration-only validation:
+For Codex subscription/login auth, mount your Codex home instead. By default the example uses
+`$HOME/.codex`; set `CODEX_HOME` if your credentials live elsewhere:
+
+```sh
+cp -n WORKFLOW.example.md WORKFLOW.md
+mkdir -p .symphony-workspaces
+docker compose -f docker-compose.example.yml up --build symphony-codex-home
+```
+
+For configuration-only validation, use the same service name with `run --rm --build`:
 
 ```sh
 docker compose -f docker-compose.example.yml run --rm --build symphony --check
+docker compose -f docker-compose.example.yml run --rm --build symphony-codex-home --check
 ```
 
 Pass any additional Codex authentication variables or mounted credential files required by the
 installed `codex` CLI. The image includes `tini` as PID 1 for signal forwarding and child reaping.
 
-Equivalent `docker run` commands:
+Equivalent `docker run` commands use the same Codex auth choice. API-key auth:
 
 ```sh
 docker run --rm \
   -e GITHUB_TOKEN \
   -e OPENAI_API_KEY \
-  -v "$PWD/WORKFLOW.md:/app/WORKFLOW.md:ro" \
-  -v "$PWD/.symphony-workspaces:/app/.symphony-workspaces" \
-  symphony:local
+  -p 127.0.0.1:8080:8080 \
+  --mount type=bind,src="$PWD/WORKFLOW.md",dst=/app/WORKFLOW.md \
+  --mount type=bind,src="$PWD/.symphony-workspaces",dst=/app/.symphony-workspaces \
+  symphony:local --host 0.0.0.0 --port 8080
 ```
+
+Codex home auth:
 
 ```sh
 docker run --rm \
   -e GITHUB_TOKEN \
-  -v "$PWD/WORKFLOW.md:/app/WORKFLOW.md:ro" \
-  -v "$PWD/.symphony-workspaces:/app/.symphony-workspaces" \
-  symphony:local --check
+  -p 127.0.0.1:8080:8080 \
+  --mount type=bind,src="$PWD/WORKFLOW.md",dst=/app/WORKFLOW.md \
+  --mount type=bind,src="$PWD/.symphony-workspaces",dst=/app/.symphony-workspaces \
+  --mount type=bind,src="${CODEX_HOME:-$HOME/.codex}",dst=/home/symphony/.codex \
+  symphony:local --host 0.0.0.0 --port 8080
 ```
+
+Add `--check` after `symphony:local` for configuration-only validation. Add `--host 0.0.0.0 --port 8080` after `symphony:local` when publishing the container listener through a host-loopback port mapping.
 
 If a workflow uses `workspace.root: $SYMPHONY_WORKSPACE_ROOT`, the image sets that variable to
 `/app/.symphony-workspaces` by default.
@@ -115,9 +167,9 @@ If a workflow uses `workspace.root: $SYMPHONY_WORKSPACE_ROOT`, the image sets th
 tracker:
   kind: github
   api_key: $GITHUB_TOKEN
-  repository:
-    owner: octo-org
-    name: octo-repo
+  repositories:
+    - owner: octo-org
+      name: octo-repo
   project:
     owner_type: organization
     owner_login: octo-org
@@ -130,6 +182,10 @@ tracker:
     - Done
     - Closed
     - Canceled
+
+server:
+  host: 127.0.0.1
+  port: 8080
 
 workspace:
   root: ./.symphony-workspaces
@@ -167,6 +223,7 @@ Implementation-defined choices are part of the runtime contract:
 - Container runtime: the image uses `tini` for PID 1 signal forwarding/reaping, handles
   SIGINT/SIGTERM, and executes hooks plus `codex.command` inside the container namespace.
 - Logging: structured logs are emitted to stderr; secrets must not be logged.
+- HTTP UI/API: disabled unless `server.port` or CLI `--port` is set; responses omit tracker secrets, environment values, hook script contents, and prompt text.
 
 ## Repository layout
 
