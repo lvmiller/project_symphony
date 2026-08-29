@@ -35,6 +35,190 @@ pub const DEFAULT_PROMPT: &str = "You are working on an issue from GitHub.";
 
 pub const DEFAULT_SOURCE_ID: &str = "default";
 
+/// Returns the stable JSON Schema for raw `WORKFLOW.md` YAML front matter.
+///
+/// This describes accepted source keys rather than [`EffectiveConfig`], which contains resolved
+/// paths and secrets. The schema is static: it neither loads a workflow nor reads environment
+/// variables, so secret values cannot appear in its output.
+pub fn raw_workflow_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Symphony workflow front matter",
+        "description": "Raw YAML front matter for WORKFLOW.md. Unknown top-level keys are accepted as forward-compatible extensions. Fields documented as supporting `$VAR_NAME` resolve that environment variable at workflow load time; this schema never reads or embeds environment values. Required dispatch fields are intentionally not globally required because schema validation also supports incomplete editor drafts.",
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "source": {
+                "type": "object",
+                "description": "Optional source identity. Changes apply to future dispatch after dynamic reload.",
+                "properties": {
+                    "id": { "type": "string", "minLength": 1, "default": DEFAULT_SOURCE_ID }
+                },
+                "additionalProperties": true
+            },
+            "tracker": {
+                "type": "object",
+                "description": "Issue tracker configuration. `kind`, credentials, repository, and project fields are required only for dispatch.",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["github"], "description": "Required for dispatch." },
+                    "endpoint": { "type": "string", "format": "uri", "default": DEFAULT_GITHUB_ENDPOINT, "description": "GitHub GraphQL endpoint when kind is github." },
+                    "api_key": { "type": "string", "writeOnly": true, "description": "Literal credential or `$VAR_NAME`; `$GITHUB_TOKEN` is used by default for GitHub. No secret value is included in this schema." },
+                    "active_states": { "type": "array", "items": { "type": "string" }, "default": ["Todo", "In Progress"] },
+                    "terminal_states": { "type": "array", "items": { "type": "string" }, "default": ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"] },
+                    "repository": {
+                        "type": "object",
+                        "description": "Required for GitHub dispatch unless `repositories` is used.",
+                        "properties": {
+                            "owner": { "type": "string", "minLength": 1 },
+                            "name": { "type": "string", "minLength": 1 }
+                        },
+                        "additionalProperties": true
+                    },
+                    "repositories": {
+                        "type": "array",
+                        "description": "Alternative to `repository`; cannot be combined with it.",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "owner": { "type": "string", "minLength": 1 },
+                                "name": { "type": "string", "minLength": 1 }
+                            },
+                            "additionalProperties": true
+                        }
+                    },
+                    "project": {
+                        "type": "object",
+                        "description": "Required for GitHub dispatch.",
+                        "properties": {
+                            "owner_type": { "type": "string", "enum": ["organization", "org", "user"], "default": "organization" },
+                            "owner_login": { "type": "string", "minLength": 1 },
+                            "number": { "type": "integer", "minimum": 1 },
+                            "status_field": { "type": "string", "minLength": 1, "default": "Status" },
+                            "priority_field": { "type": "string", "minLength": 1, "default": "Priority" },
+                            "blocker_field": { "type": "string", "minLength": 1 },
+                            "blocker_label_prefix": { "type": "string", "minLength": 1 }
+                        },
+                        "additionalProperties": true
+                    },
+                    "priority_labels": {
+                        "type": "object",
+                        "additionalProperties": { "type": "integer" },
+                        "default": {}
+                    }
+                },
+                "additionalProperties": true
+            },
+            "polling": {
+                "type": "object",
+                "description": "Changes apply to future tick scheduling after dynamic reload.",
+                "properties": {
+                    "interval_ms": { "type": "integer", "minimum": 1, "default": 30000 }
+                },
+                "additionalProperties": true
+            },
+            "workspace": {
+                "type": "object",
+                "description": "Changes apply to future workspace preparation after dynamic reload.",
+                "properties": {
+                    "root": { "type": "string", "description": "Workspace path. Supports `~` and `$VAR_NAME`; relative paths resolve from WORKFLOW.md. Default is `<system-temp>/symphony_workspaces`." },
+                    "cleanup": {
+                        "type": "object",
+                        "properties": {
+                            "after_success": { "type": "string", "enum": ["committed", "never"], "default": "committed" }
+                        },
+                        "additionalProperties": true
+                    },
+                    "population": {
+                        "type": "object",
+                        "description": "Built-in workspace population. Git requires a non-empty repository_url; `ref` and `branch` are mutually exclusive.",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["none", "git"], "default": "none" },
+                            "repository_url": { "type": "string", "minLength": 1, "format": "uri" },
+                            "ref": { "type": "string", "minLength": 1 },
+                            "branch": { "type": "string", "minLength": 1 },
+                            "depth": { "type": "integer", "minimum": 1 },
+                            "reuse": { "type": "string", "enum": ["skip", "fetch_ff_only"], "default": "skip" }
+                        },
+                        "additionalProperties": true
+                    }
+                },
+                "additionalProperties": true
+            },
+            "hooks": {
+                "type": "object",
+                "description": "Workspace hook configuration. Changes apply to future hook execution after dynamic reload.",
+                "properties": {
+                    "after_create": { "type": "string" },
+                    "before_run": { "type": "string" },
+                    "after_run": { "type": "string" },
+                    "before_remove": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "default": 60000 }
+                },
+                "additionalProperties": true
+            },
+            "agent": {
+                "type": "object",
+                "description": "Changes apply to future agent dispatch after dynamic reload.",
+                "properties": {
+                    "max_concurrent_agents": { "type": "integer", "minimum": 1, "default": 10 },
+                    "max_turns": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295u64, "default": 20 },
+                    "max_retry_backoff_ms": { "type": "integer", "minimum": 1, "default": 300000 },
+                    "max_concurrent_agents_by_state": {
+                        "type": "object",
+                        "additionalProperties": { "type": "integer", "minimum": 1 },
+                        "default": {}
+                    }
+                },
+                "additionalProperties": true
+            },
+            "codex": {
+                "type": "object",
+                "description": "Changes apply to future agent launches after dynamic reload.",
+                "properties": {
+                    "command": { "type": "string", "minLength": 1, "default": "codex app-server" },
+                    "approval_policy": { "description": "Pass-through Codex approval policy.", "default": "never" },
+                    "thread_sandbox": { "description": "Pass-through Codex thread sandbox.", "default": "danger-full-access" },
+                    "turn_sandbox_policy": { "description": "Pass-through Codex turn sandbox policy.", "default": { "type": "dangerFullAccess" } },
+                    "turn_timeout_ms": { "type": "integer", "minimum": 1, "default": 3600000 },
+                    "read_timeout_ms": { "type": "integer", "minimum": 1, "default": 5000 },
+                    "stall_timeout_ms": { "type": "integer", "default": 300000 }
+                },
+                "additionalProperties": true
+            },
+            "completion": {
+                "type": "object",
+                "properties": {
+                    "direct_commit": {
+                        "type": "object",
+                        "properties": {
+                            "enabled": { "type": "boolean", "default": false },
+                            "dry_run": { "type": "boolean", "default": false, "description": "Perform completion checks without mutating Git or the tracker." },
+                            "base_branch": { "type": "string", "minLength": 1, "default": "main" },
+                            "high_review_state": { "type": "string", "minLength": 1, "default": "In review" },
+                            "auto_approved_state": { "type": "string", "minLength": 1, "default": "Done" },
+                            "started_state": { "type": "string", "minLength": 1 },
+                            "commit_author_name": { "type": "string", "minLength": 1, "default": "Symphony" },
+                            "commit_author_email": { "type": "string", "minLength": 1, "default": "symphony@users.noreply.github.com" }
+                        },
+                        "additionalProperties": true
+                    }
+                },
+                "additionalProperties": true
+            },
+            "server": {
+                "type": "object",
+                "description": "Changing listener settings may require restart.",
+                "properties": {
+                    "host": { "type": "string", "default": "127.0.0.1", "description": "IP address." },
+                    "port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+                },
+                "additionalProperties": true
+            }
+        }
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub id: String,
@@ -271,6 +455,7 @@ pub struct PollingConfig {
 pub struct WorkspaceConfig {
     pub root: PathBuf,
     pub cleanup: WorkspaceCleanupConfig,
+    pub population: WorkspacePopulationConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +482,45 @@ impl WorkspaceCleanupConfig {
 pub enum WorkspaceCleanupAfterSuccess {
     Never,
     Committed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePopulationConfig {
+    pub kind: WorkspacePopulationKind,
+    pub repository_url: Option<String>,
+    pub reference: Option<String>,
+    pub branch: Option<String>,
+    pub depth: Option<u64>,
+    pub reuse: WorkspacePopulationReusePolicy,
+}
+
+impl Default for WorkspacePopulationConfig {
+    fn default() -> Self {
+        Self {
+            kind: WorkspacePopulationKind::None,
+            repository_url: None,
+            reference: None,
+            branch: None,
+            depth: None,
+            reuse: WorkspacePopulationReusePolicy::Skip,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspacePopulationKind {
+    #[default]
+    None,
+    Git,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePopulationReusePolicy {
+    #[default]
+    Skip,
+    FetchFfOnly,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +559,7 @@ pub struct CompletionConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectCommitCompletionConfig {
     pub enabled: bool,
+    pub dry_run: bool,
     pub base_branch: String,
     pub high_review_state: String,
     pub auto_approved_state: String,
@@ -347,6 +572,7 @@ impl Default for DirectCommitCompletionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            dry_run: false,
             base_branch: "main".to_string(),
             high_review_state: "In review".to_string(),
             auto_approved_state: "Done".to_string(),
@@ -768,6 +994,7 @@ fn parse_workspace(config: &Mapping, workflow_dir: &Path) -> Result<WorkspaceCon
     Ok(WorkspaceConfig {
         root: normalize_absolute_path(&expanded)?,
         cleanup: parse_workspace_cleanup(workspace)?,
+        population: parse_workspace_population(workspace)?,
     })
 }
 
@@ -787,6 +1014,117 @@ fn parse_workspace_cleanup(workspace: Option<&Mapping>) -> Result<WorkspaceClean
         }
     };
     Ok(WorkspaceCleanupConfig { after_success })
+}
+
+fn parse_workspace_population(workspace: Option<&Mapping>) -> Result<WorkspacePopulationConfig> {
+    let population = get_nested_map(workspace, "population");
+    let Some(population) = population else {
+        return Ok(WorkspacePopulationConfig::default());
+    };
+
+    let kind = match get_string(Some(population), "kind")
+        .unwrap_or_else(|| "none".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "none" => WorkspacePopulationKind::None,
+        "git" => WorkspacePopulationKind::Git,
+        _ => {
+            return Err(SymphonyError::config(
+                "invalid_workspace_population_kind",
+                "workspace.population.kind must be none or git",
+            ));
+        }
+    };
+    let repository_url =
+        get_string(Some(population), "repository_url").map(|value| value.trim().to_string());
+    let reference = get_string(Some(population), "ref").map(|value| value.trim().to_string());
+    let branch = get_string(Some(population), "branch").map(|value| value.trim().to_string());
+    let depth = get_i64(Some(population), "depth")
+        .map(|value| {
+            u64::try_from(value)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    SymphonyError::config(
+                        "invalid_workspace_population_depth",
+                        "workspace.population.depth must be a positive integer",
+                    )
+                })
+        })
+        .transpose()?;
+    let reuse = match get_string(Some(population), "reuse")
+        .unwrap_or_else(|| "skip".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "skip" => WorkspacePopulationReusePolicy::Skip,
+        "fetch_ff_only" => WorkspacePopulationReusePolicy::FetchFfOnly,
+        _ => {
+            return Err(SymphonyError::config(
+                "invalid_workspace_population_reuse",
+                "workspace.population.reuse must be skip or fetch_ff_only",
+            ));
+        }
+    };
+
+    if reference.is_some() && branch.is_some() {
+        return Err(SymphonyError::config(
+            "invalid_workspace_population_reference",
+            "workspace.population.ref and workspace.population.branch cannot both be set",
+        ));
+    }
+    match kind {
+        WorkspacePopulationKind::None => {
+            if repository_url.is_some()
+                || reference.is_some()
+                || branch.is_some()
+                || depth.is_some()
+            {
+                return Err(SymphonyError::config(
+                    "invalid_workspace_population_none",
+                    "workspace.population settings require kind: git",
+                ));
+            }
+        }
+        WorkspacePopulationKind::Git => {
+            if repository_url.as_deref().is_none_or(str::is_empty) {
+                return Err(SymphonyError::config(
+                    "missing_workspace_population_repository_url",
+                    "workspace.population.repository_url must be non-empty when kind is git",
+                ));
+            }
+            if reference.as_deref().is_some_and(str::is_empty)
+                || branch.as_deref().is_some_and(str::is_empty)
+            {
+                return Err(SymphonyError::config(
+                    "invalid_workspace_population_reference",
+                    "workspace.population.ref and workspace.population.branch must be non-empty when set",
+                ));
+            }
+            if reference
+                .as_deref()
+                .or(branch.as_deref())
+                .is_some_and(|target| target.starts_with('-') || target.contains('\0'))
+            {
+                return Err(SymphonyError::config(
+                    "invalid_workspace_population_reference",
+                    "workspace.population.ref and workspace.population.branch must not start with '-' or contain NUL",
+                ));
+            }
+        }
+    }
+
+    Ok(WorkspacePopulationConfig {
+        kind,
+        repository_url,
+        reference,
+        branch,
+        depth,
+        reuse,
+    })
 }
 
 fn parse_hooks(config: &Mapping) -> Result<HooksConfig> {
@@ -887,6 +1225,7 @@ fn parse_completion(config: &Mapping) -> Result<CompletionConfig> {
         .map(|state| state.trim().to_string());
     let mut direct_commit_config = DirectCommitCompletionConfig {
         enabled: get_bool(direct_commit, "enabled").unwrap_or(false),
+        dry_run: get_bool(direct_commit, "dry_run").unwrap_or(false),
         base_branch: get_string(direct_commit, "base_branch").unwrap_or_else(|| "main".to_string()),
         high_review_state: get_string(direct_commit, "high_review_state")
             .or_else(|| get_string(completion, "high_review_state"))

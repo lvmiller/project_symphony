@@ -4,7 +4,8 @@ use std::sync::Mutex;
 
 use symphony::config::{
     ConfigReloader, ConfigSetReloader, DEFAULT_GITHUB_ENDPOINT, EffectiveConfig,
-    WorkspaceCleanupAfterSuccess,
+    WorkspaceCleanupAfterSuccess, WorkspacePopulationKind, WorkspacePopulationReusePolicy,
+    raw_workflow_json_schema,
 };
 use symphony::error::SymphonyError;
 use symphony::workflow::{load_workflow, parse_workflow, select_workflow_path};
@@ -116,6 +117,7 @@ fn github_defaults_and_default_token_indirection_are_applied() {
         WorkspaceCleanupAfterSuccess::Committed
     );
     assert!(!config.completion.direct_commit.enabled);
+    assert!(!config.completion.direct_commit.dry_run);
     assert_eq!(config.completion.direct_commit.base_branch, "main");
     assert_eq!(
         config.completion.direct_commit.high_review_state,
@@ -151,6 +153,59 @@ fn workspace_cleanup_policy_is_parsed_and_validated() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn workspace_population_is_defaulted_parsed_and_validated() {
+    let temp = tempfile::tempdir().unwrap();
+    let default_config = load_from_path(write_workflow(temp.path(), &valid_workflow(None)));
+    assert_eq!(
+        default_config.workspace.population.kind,
+        WorkspacePopulationKind::None
+    );
+    assert_eq!(
+        default_config.workspace.population.reuse,
+        WorkspacePopulationReusePolicy::Skip
+    );
+
+    let git = write_workflow(
+        temp.path(),
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nworkspace:\n  population:\n    kind: git\n    repository_url: https://github.com/octo/repo.git\n    ref: refs/tags/v1\n    depth: 1\n    reuse: fetch_ff_only\n---\nPrompt\n",
+    );
+    let config = load_from_path(git);
+    assert_eq!(
+        config.workspace.population.kind,
+        WorkspacePopulationKind::Git
+    );
+    assert_eq!(
+        config.workspace.population.repository_url.as_deref(),
+        Some("https://github.com/octo/repo.git")
+    );
+    assert_eq!(
+        config.workspace.population.reference.as_deref(),
+        Some("refs/tags/v1")
+    );
+    assert_eq!(config.workspace.population.depth, Some(1));
+    assert_eq!(
+        config.workspace.population.reuse,
+        WorkspacePopulationReusePolicy::FetchFfOnly
+    );
+
+    let missing_url = write_workflow(
+        temp.path(),
+        "---\nworkspace:\n  population:\n    kind: git\n---\nPrompt\n",
+    );
+    assert_config_code(missing_url, "missing_workspace_population_repository_url");
+    let conflicting_target = write_workflow(
+        temp.path(),
+        "---\nworkspace:\n  population:\n    kind: git\n    repository_url: https://github.com/octo/repo.git\n    ref: refs/heads/main\n    branch: main\n---\nPrompt\n",
+    );
+    assert_config_code(conflicting_target, "invalid_workspace_population_reference");
+    let option_like_branch = write_workflow(
+        temp.path(),
+        "---\nworkspace:\n  population:\n    kind: git\n    repository_url: https://github.com/octo/repo.git\n    branch: --upload-pack=malicious\n---\nPrompt\n",
+    );
+    assert_config_code(option_like_branch, "invalid_workspace_population_reference");
 }
 
 #[test]
@@ -383,10 +438,11 @@ fn completion_direct_commit_config_is_parsed_and_validated() {
     let temp = tempfile::tempdir().unwrap();
     let valid = write_workflow(
         temp.path(),
-        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\ncompletion:\n  direct_commit:\n    enabled: true\n    base_branch: trunk\n    started_state: In progress\n    high_review_state: In review\n    auto_approved_state: Done\n    commit_author_name: Bot\n    commit_author_email: bot@example.test\n---\nPrompt\n",
+        "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\ncompletion:\n  direct_commit:\n    enabled: true\n    dry_run: true\n    base_branch: trunk\n    started_state: In progress\n    high_review_state: In review\n    auto_approved_state: Done\n    commit_author_name: Bot\n    commit_author_email: bot@example.test\n---\nPrompt\n",
     );
     let config = load_from_path(valid);
     assert!(config.completion.direct_commit.enabled);
+    assert!(config.completion.direct_commit.dry_run);
     assert_eq!(config.completion.direct_commit.base_branch, "trunk");
     assert_eq!(
         config.completion.direct_commit.high_review_state,
@@ -414,6 +470,51 @@ fn completion_direct_commit_config_is_parsed_and_validated() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn raw_workflow_schema_is_static_extensible_and_documents_defaults() {
+    let schema = raw_workflow_json_schema();
+    assert_eq!(
+        schema["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(schema["additionalProperties"], true);
+    assert_eq!(
+        schema["properties"]["polling"]["properties"]["interval_ms"]["default"],
+        30_000
+    );
+    assert_eq!(
+        schema["properties"]["agent"]["properties"]["max_turns"]["default"],
+        20
+    );
+    assert_eq!(
+        schema["properties"]["completion"]["properties"]["direct_commit"]["properties"]["dry_run"]
+            ["default"],
+        false
+    );
+    assert_eq!(
+        schema["properties"]["workspace"]["properties"]["population"]["properties"]["kind"]["default"],
+        "none"
+    );
+    assert!(
+        schema["properties"]["tracker"]["properties"]["api_key"]
+            .get("default")
+            .is_none()
+    );
+    assert!(
+        schema["properties"]["tracker"]["properties"]["api_key"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("$VAR_NAME")
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = load_from_path(write_workflow(
+        temp.path(),
+        "---\nfuture_extension:\n  feature: enabled\n---\nPrompt\n",
+    ));
+    assert_eq!(config.polling.interval_ms, 30_000);
 }
 
 #[test]
