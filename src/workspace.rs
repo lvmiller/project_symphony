@@ -10,13 +10,15 @@ use crate::config::{
     DEFAULT_SOURCE_ID, HooksConfig, WorkspaceConfig, WorkspacePopulationConfig,
     normalize_absolute_path,
 };
-use crate::domain::{Issue, Workspace};
+use crate::domain::{ExecutionTarget, Issue, Workspace};
 use crate::error::{Result, SymphonyError};
 use crate::hooks::{HookContext, HookKind, populate_workspace, run_hook, run_hook_best_effort};
+use tokio::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceManager {
     root: PathBuf,
+    remote_root: String,
     population: WorkspacePopulationConfig,
     hooks: HooksConfig,
 }
@@ -26,6 +28,7 @@ impl WorkspaceManager {
         let root = canonicalize_if_exists(&normalize_absolute_path(&config.root)?)?;
         Ok(Self {
             root,
+            remote_root: config.remote_root.clone(),
             population: config.population.clone(),
             hooks,
         })
@@ -50,8 +53,71 @@ impl WorkspaceManager {
         Ok((key, path))
     }
 
+    fn remote_workspace_path_for_source_identifier(
+        &self,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<(String, PathBuf)> {
+        let key = source_workspace_key(source_id, identifier);
+        let root = self.remote_root.trim_end_matches('/');
+        let path = PathBuf::from(format!("{root}/{key}"));
+        if !self.remote_root.starts_with('/') || !path.to_string_lossy().starts_with('/') {
+            return Err(SymphonyError::Workspace(format!(
+                "remote workspace root must be an absolute POSIX path root={}",
+                self.remote_root
+            )));
+        }
+        Ok((key, path))
+    }
+
+    fn ensure_remote_contained(&self, workspace: &Path) -> Result<()> {
+        let root = self.remote_root.trim_end_matches('/');
+        let workspace = workspace.to_string_lossy();
+        if self.remote_root.starts_with('/')
+            && workspace.starts_with(root)
+            && workspace.len() > root.len()
+            && workspace.as_bytes().get(root.len()) == Some(&b'/')
+        {
+            Ok(())
+        } else {
+            Err(SymphonyError::Workspace(format!(
+                "remote workspace path escapes root root={} path={workspace}",
+                self.remote_root
+            )))
+        }
+    }
+
+    pub async fn create_for_target(
+        &self,
+        target: &ExecutionTarget,
+        source_id: &str,
+        issue: &Issue,
+    ) -> Result<Workspace> {
+        self.create_for_target_identifier(target, source_id, &issue.identifier)
+            .await
+    }
+
+    async fn create_for_target_identifier(
+        &self,
+        target: &ExecutionTarget,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<Workspace> {
+        match target {
+            ExecutionTarget::Local => {
+                self.create_local_for_source_identifier(source_id, identifier)
+                    .await
+            }
+            ExecutionTarget::Ssh { host } => {
+                self.create_remote_for_source_identifier(host, source_id, identifier)
+                    .await
+            }
+        }
+    }
+
     pub async fn create_for_issue(&self, issue: &Issue) -> Result<Workspace> {
-        self.create_for_identifier(&issue.identifier).await
+        self.create_for_target(&ExecutionTarget::Local, DEFAULT_SOURCE_ID, issue)
+            .await
     }
 
     pub async fn create_for_source_issue(
@@ -59,12 +125,12 @@ impl WorkspaceManager {
         source_id: &str,
         issue: &Issue,
     ) -> Result<Workspace> {
-        self.create_for_source_identifier(source_id, &issue.identifier)
+        self.create_for_target(&ExecutionTarget::Local, source_id, issue)
             .await
     }
 
     pub async fn create_for_identifier(&self, identifier: &str) -> Result<Workspace> {
-        self.create_for_source_identifier(DEFAULT_SOURCE_ID, identifier)
+        self.create_for_target_identifier(&ExecutionTarget::Local, DEFAULT_SOURCE_ID, identifier)
             .await
     }
 
@@ -73,10 +139,19 @@ impl WorkspaceManager {
         source_id: &str,
         identifier: &str,
     ) -> Result<Workspace> {
+        self.create_for_target_identifier(&ExecutionTarget::Local, source_id, identifier)
+            .await
+    }
+
+    async fn create_local_for_source_identifier(
+        &self,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<Workspace> {
         fs::create_dir_all(&self.root)
             .map_err(|err| SymphonyError::io(Some(self.root.clone()), err))?;
         let canonical_root = canonicalize_dir(&self.root)?;
-        let source_key = sanitize_workspace_key(source_id);
+        let source_key = source_workspace_namespace(source_id);
         let workspace_key = source_workspace_key(source_id, identifier);
         let workspace_parent = if source_id == DEFAULT_SOURCE_ID {
             canonical_root.clone()
@@ -141,7 +216,43 @@ impl WorkspaceManager {
         Ok(workspace)
     }
 
+    pub async fn before_run_for_target(
+        &self,
+        target: &ExecutionTarget,
+        source_id: &str,
+        issue: &Issue,
+        workspace: &Path,
+    ) -> Result<()> {
+        match target {
+            ExecutionTarget::Local => {
+                self.before_run_local_for_source_issue(source_id, issue, workspace)
+                    .await
+            }
+            ExecutionTarget::Ssh { host } => {
+                self.run_remote_hook(
+                    host,
+                    HookKind::BeforeRun,
+                    source_id,
+                    &issue.identifier,
+                    workspace,
+                    false,
+                )
+                .await
+            }
+        }
+    }
+
     pub async fn before_run_for_source_issue(
+        &self,
+        source_id: &str,
+        issue: &Issue,
+        workspace: &Path,
+    ) -> Result<()> {
+        self.before_run_for_target(&ExecutionTarget::Local, source_id, issue, workspace)
+            .await
+    }
+
+    async fn before_run_local_for_source_issue(
         &self,
         source_id: &str,
         issue: &Issue,
@@ -162,7 +273,47 @@ impl WorkspaceManager {
         .await
     }
 
+    pub async fn after_run_best_effort_for_target(
+        &self,
+        target: &ExecutionTarget,
+        source_id: &str,
+        issue: &Issue,
+        workspace: &Path,
+    ) {
+        match target {
+            ExecutionTarget::Local => {
+                self.after_run_local_best_effort_for_source_issue(source_id, issue, workspace)
+                    .await
+            }
+            ExecutionTarget::Ssh { host } => {
+                if let Err(error) = self
+                    .run_remote_hook(
+                        host,
+                        HookKind::AfterRun,
+                        source_id,
+                        &issue.identifier,
+                        workspace,
+                        true,
+                    )
+                    .await
+                {
+                    warn!(host, error = %error, "remote after_run hook failed ignored");
+                }
+            }
+        }
+    }
+
     pub async fn after_run_best_effort_for_source_issue(
+        &self,
+        source_id: &str,
+        issue: &Issue,
+        workspace: &Path,
+    ) {
+        self.after_run_best_effort_for_target(&ExecutionTarget::Local, source_id, issue, workspace)
+            .await;
+    }
+
+    async fn after_run_local_best_effort_for_source_issue(
         &self,
         source_id: &str,
         issue: &Issue,
@@ -195,21 +346,58 @@ impl WorkspaceManager {
         .await;
     }
 
+    pub async fn remove_for_target(
+        &self,
+        target: &ExecutionTarget,
+        source_id: &str,
+        issue: &Issue,
+    ) -> Result<()> {
+        match target {
+            ExecutionTarget::Local => {
+                self.remove_local_for_source_identifier(source_id, &issue.identifier)
+                    .await
+            }
+            ExecutionTarget::Ssh { host } => {
+                self.remove_remote_for_source_identifier(host, source_id, &issue.identifier)
+                    .await
+            }
+        }
+    }
+
     pub async fn remove_for_issue(&self, issue: &Issue) -> Result<()> {
-        self.remove_for_identifier(&issue.identifier).await
+        self.remove_for_target(&ExecutionTarget::Local, DEFAULT_SOURCE_ID, issue)
+            .await
     }
 
     pub async fn remove_for_source_issue(&self, source_id: &str, issue: &Issue) -> Result<()> {
-        self.remove_for_source_identifier(source_id, &issue.identifier)
+        self.remove_for_target(&ExecutionTarget::Local, source_id, issue)
             .await
     }
 
     pub async fn remove_for_identifier(&self, identifier: &str) -> Result<()> {
-        self.remove_for_source_identifier(DEFAULT_SOURCE_ID, identifier)
+        self.remove_for_target_identifier(&ExecutionTarget::Local, DEFAULT_SOURCE_ID, identifier)
             .await
     }
 
-    pub async fn remove_for_source_identifier(
+    async fn remove_for_target_identifier(
+        &self,
+        target: &ExecutionTarget,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<()> {
+        match target {
+            ExecutionTarget::Local => {
+                self.remove_local_for_source_identifier(source_id, identifier)
+                    .await
+            }
+            ExecutionTarget::Ssh { host } => {
+                self.remove_remote_for_source_identifier(host, source_id, identifier)
+                    .await
+            }
+        }
+    }
+
+    async fn remove_local_for_source_identifier(
         &self,
         source_id: &str,
         identifier: &str,
@@ -248,6 +436,157 @@ impl WorkspaceManager {
             .map_err(|err| SymphonyError::io(Some(workspace.clone()), err))?;
         info!(workspace = %workspace.display(), "workspace removed");
         Ok(())
+    }
+
+    async fn create_remote_for_source_identifier(
+        &self,
+        host: &str,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<Workspace> {
+        let (workspace_key, path) =
+            self.remote_workspace_path_for_source_identifier(source_id, identifier)?;
+        let parent = path.parent().ok_or_else(|| {
+            SymphonyError::Workspace(format!(
+                "remote workspace has no parent path={}",
+                path.display()
+            ))
+        })?;
+        let output = self
+            .run_ssh(
+                host,
+                &remote_create_script(Path::new(&self.remote_root), parent, &path),
+            )
+            .await?;
+        let created_now = match String::from_utf8_lossy(&output.stdout).trim() {
+            "created" => true,
+            "reused" => false,
+            result => {
+                return Err(SymphonyError::Workspace(format!(
+                    "remote workspace create returned an invalid result host={host} result={result:?}"
+                )));
+            }
+        };
+        let workspace = Workspace {
+            path: path.clone(),
+            workspace_key,
+            created_now,
+        };
+        if let Err(error) = self
+            .populate_remote_workspace(host, &path, created_now)
+            .await
+        {
+            if created_now {
+                let _ = self
+                    .remove_remote_for_source_identifier(host, source_id, identifier)
+                    .await;
+            }
+            return Err(error);
+        }
+        if created_now
+            && let Err(error) = self
+                .run_remote_hook(
+                    host,
+                    HookKind::AfterCreate,
+                    source_id,
+                    identifier,
+                    &path,
+                    false,
+                )
+                .await
+        {
+            let _ = self
+                .remove_remote_for_source_identifier(host, source_id, identifier)
+                .await;
+            return Err(error);
+        }
+        Ok(workspace)
+    }
+
+    async fn remove_remote_for_source_identifier(
+        &self,
+        host: &str,
+        source_id: &str,
+        identifier: &str,
+    ) -> Result<()> {
+        let (_, path) = self.remote_workspace_path_for_source_identifier(source_id, identifier)?;
+        if let Err(error) = self
+            .run_remote_hook(
+                host,
+                HookKind::BeforeRemove,
+                source_id,
+                identifier,
+                &path,
+                true,
+            )
+            .await
+        {
+            warn!(host, error = %error, "remote before_remove hook failed ignored");
+        }
+        self.run_ssh(
+            host,
+            &remote_remove_script(Path::new(&self.remote_root), &path),
+        )
+        .await?;
+        info!(host, workspace = %path.display(), "remote workspace removed");
+        Ok(())
+    }
+
+    async fn populate_remote_workspace(
+        &self,
+        host: &str,
+        workspace: &Path,
+        created_now: bool,
+    ) -> Result<()> {
+        self.ensure_remote_contained(workspace)?;
+        let script = remote_population_script(&self.population, workspace, created_now)?;
+        if let Some(script) = script {
+            self.run_ssh(host, &script).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_remote_hook(
+        &self,
+        host: &str,
+        kind: HookKind,
+        source_id: &str,
+        identifier: &str,
+        workspace: &Path,
+        ignore_missing_workspace: bool,
+    ) -> Result<()> {
+        self.ensure_remote_contained(workspace)?;
+        let Some(script) = remote_hook_script(
+            kind,
+            &self.hooks,
+            source_id,
+            identifier,
+            workspace,
+            ignore_missing_workspace,
+        ) else {
+            return Ok(());
+        };
+        self.run_ssh(host, &script).await.map(|_| ())
+    }
+
+    async fn run_ssh(&self, host: &str, script: &str) -> Result<std::process::Output> {
+        let output = Command::new("ssh")
+            .args(ssh_command_arguments(host, script))
+            .output()
+            .await
+            .map_err(|error| {
+                SymphonyError::Workspace(format!(
+                    "remote SSH command failed to start host={host}: {error}"
+                ))
+            })?;
+        if output.status.success() {
+            Ok(output)
+        } else {
+            Err(SymphonyError::Workspace(format!(
+                "remote SSH command failed host={host} exit_status={}",
+                output.status
+            )))
+        }
     }
 
     /// Removes stale, unclaimed workspace directories in one source namespace.
@@ -309,7 +648,7 @@ impl WorkspaceManager {
         let namespace = if source_id == DEFAULT_SOURCE_ID {
             canonical_root.clone()
         } else {
-            let source_key = sanitize_workspace_key(source_id);
+            let source_key = source_workspace_namespace(source_id);
             let path = normalize_absolute_path(&canonical_root.join(&source_key))?;
             ensure_contained(&canonical_root, &path)?;
             match fs::symlink_metadata(&path) {
@@ -411,6 +750,160 @@ impl WorkspaceManager {
     }
 }
 
+fn ssh_command_arguments(host: &str, script: &str) -> [String; 4] {
+    [
+        host.to_string(),
+        "sh".to_string(),
+        "-lc".to_string(),
+        script.to_string(),
+    ]
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn remote_create_script(root: &Path, parent: &Path, workspace: &Path) -> String {
+    let root = shell_quote(&root.to_string_lossy());
+    let parent = shell_quote(&parent.to_string_lossy());
+    let workspace = shell_quote(&workspace.to_string_lossy());
+    format!(
+        "set -eu; root={root}; parent={parent}; workspace={workspace}; \
+         case \"$workspace\" in \"$root\"/*) ;; *) exit 64 ;; esac; \
+         [ ! -L \"$root\" ] || exit 65; mkdir -p \"$root\"; \
+         [ ! -L \"$parent\" ] || exit 66; mkdir -p \"$parent\"; \
+         if [ -e \"$workspace\" ] || [ -L \"$workspace\" ]; then \
+           [ ! -L \"$workspace\" ] && [ -d \"$workspace\" ] || exit 67; printf reused; \
+         else mkdir \"$workspace\"; printf created; fi"
+    )
+}
+
+fn remote_remove_script(root: &Path, workspace: &Path) -> String {
+    let root = shell_quote(&root.to_string_lossy());
+    let workspace = shell_quote(&workspace.to_string_lossy());
+    format!(
+        "set -eu; root={root}; workspace={workspace}; \
+         case \"$workspace\" in \"$root\"/*) ;; *) exit 64 ;; esac; \
+         if [ ! -e \"$workspace\" ] && [ ! -L \"$workspace\" ]; then exit 0; fi; \
+         [ ! -L \"$workspace\" ] && [ -d \"$workspace\" ] || exit 67; \
+         rm -rf \"$workspace\""
+    )
+}
+
+fn remote_population_script(
+    population: &WorkspacePopulationConfig,
+    workspace: &Path,
+    created_now: bool,
+) -> Result<Option<String>> {
+    let workspace = shell_quote(&workspace.to_string_lossy());
+    let Some(repository_url) = population.repository_url.as_deref() else {
+        return match population.kind {
+            crate::config::WorkspacePopulationKind::None => Ok(None),
+            crate::config::WorkspacePopulationKind::Git => Err(SymphonyError::Workspace(
+                "git workspace population is missing repository_url".to_string(),
+            )),
+        };
+    };
+    match population.kind {
+        crate::config::WorkspacePopulationKind::None => Ok(None),
+        crate::config::WorkspacePopulationKind::Git if created_now => {
+            let mut command = String::from("git clone");
+            if let Some(depth) = population.depth {
+                command.push_str(&format!(" --depth {depth}"));
+            }
+            if let Some(branch) = &population.branch {
+                command.push_str(" --branch ");
+                command.push_str(&shell_quote(branch));
+            }
+            command.push_str(" -- ");
+            command.push_str(&shell_quote(repository_url));
+            command.push_str(" .");
+            if let Some(reference) = &population.reference {
+                command.push_str(" && git checkout --detach ");
+                command.push_str(&shell_quote(reference));
+            }
+            Ok(Some(format!("set -eu; cd {workspace}; {command}")))
+        }
+        crate::config::WorkspacePopulationKind::Git
+            if matches!(
+                population.reuse,
+                crate::config::WorkspacePopulationReusePolicy::FetchFfOnly
+            ) =>
+        {
+            let target = population
+                .branch
+                .as_deref()
+                .or(population.reference.as_deref())
+                .unwrap_or("");
+            let fetch_target = if target.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", shell_quote(target))
+            };
+            let merge_target = if target.is_empty() {
+                "@{upstream}"
+            } else {
+                "FETCH_HEAD"
+            };
+            Ok(Some(format!(
+                "set -eu; cd {workspace}; git fetch --no-tags origin{fetch_target}; git merge --ff-only {merge_target}"
+            )))
+        }
+        crate::config::WorkspacePopulationKind::Git => Ok(None),
+    }
+}
+
+fn remote_hook_script(
+    kind: HookKind,
+    hooks: &HooksConfig,
+    source_id: &str,
+    identifier: &str,
+    workspace: &Path,
+    ignore_missing_workspace: bool,
+) -> Option<String> {
+    let hook = match kind {
+        HookKind::AfterCreate => hooks.after_create.as_deref(),
+        HookKind::BeforeRun => hooks.before_run.as_deref(),
+        HookKind::AfterRun => hooks.after_run.as_deref(),
+        HookKind::BeforeRemove => hooks.before_remove.as_deref(),
+    }?;
+    let workspace = shell_quote(&workspace.to_string_lossy());
+    let workspace_key = shell_quote(&source_workspace_key(source_id, identifier));
+    let source_key = shell_quote(&source_workspace_namespace(source_id));
+    let issue_key = shell_quote(&sanitize_workspace_key(identifier));
+    let source_id = shell_quote(source_id);
+    let identifier = shell_quote(identifier);
+    let missing = if ignore_missing_workspace {
+        "if [ ! -d \"$workspace\" ] || [ -L \"$workspace\" ]; then exit 0; fi; "
+    } else {
+        "[ -d \"$workspace\" ] && [ ! -L \"$workspace\" ] || exit 67; "
+    };
+    Some(format!(
+        "set -eu; workspace={workspace}; {missing} cd \"$workspace\"; \
+         export SYMPHONY_HOOK_NAME={} SYMPHONY_WORKSPACE_PATH=\"$workspace\" \
+         SYMPHONY_WORKSPACE_KEY={workspace_key} SYMPHONY_SOURCE_ID={source_id} \
+         SYMPHONY_SOURCE_KEY={source_key} SYMPHONY_ISSUE_IDENTIFIER={identifier} \
+         SYMPHONY_ISSUE_KEY={issue_key}; sh -lc {}",
+        shell_quote(kind.name()),
+        shell_quote(hook),
+    ))
+}
+
+/// Returns an injective, lowercase-ASCII namespace segment for a source ID.
+///
+/// Encoding UTF-8 bytes avoids aliases caused by filesystem case folding or Unicode
+/// normalization while remaining deterministic on every supported platform.
+pub fn source_workspace_namespace(source_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut namespace = String::with_capacity("source-".len() + source_id.len() * 2);
+    namespace.push_str("source-");
+    for &byte in source_id.as_bytes() {
+        namespace.push(HEX[usize::from(byte >> 4)] as char);
+        namespace.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    namespace
+}
+
 fn is_workspace_segment(segment: &str) -> bool {
     !segment.is_empty() && sanitize_workspace_key(segment) == segment
 }
@@ -420,6 +913,11 @@ fn is_older_than(modified: SystemTime, now: SystemTime, max_age: Duration) -> bo
         .is_ok_and(|elapsed| elapsed >= max_age)
 }
 
+/// Produces a single safe directory segment for an issue identifier.
+///
+/// This remains deliberately separate from [`source_workspace_namespace`]: issue
+/// identifiers retain the established readable key format, while source namespaces
+/// must be injective across case and Unicode filesystem aliases.
 pub fn sanitize_workspace_key(identifier: &str) -> String {
     let key: String = identifier
         .chars()
@@ -444,7 +942,7 @@ pub fn source_workspace_key(source_id: &str, identifier: &str) -> String {
     if source_id == DEFAULT_SOURCE_ID {
         issue_key
     } else {
-        format!("{}/{}", sanitize_workspace_key(source_id), issue_key)
+        format!("{}/{}", source_workspace_namespace(source_id), issue_key)
     }
 }
 
@@ -567,6 +1065,7 @@ mod tests {
         WorkspaceManager::new(
             &WorkspaceConfig {
                 root: root.to_path_buf(),
+                remote_root: root.to_string_lossy().replace('\\', "/"),
                 cleanup: Default::default(),
                 retention: Default::default(),
                 population: Default::default(),
@@ -574,6 +1073,54 @@ mod tests {
             hooks,
         )
         .expect("workspace manager")
+    }
+
+    #[test]
+    fn remote_workspace_commands_use_posix_paths_and_fixed_ssh_argv() {
+        let root = Path::new("/srv/symphony");
+        let workspace = Path::new("/srv/symphony/source-5465616d/issue_123");
+        let script = remote_create_script(root, workspace.parent().unwrap(), workspace);
+        let arguments = ssh_command_arguments("worker-a", &script);
+
+        assert_eq!(arguments[0], "worker-a");
+        assert_eq!(arguments[1], "sh");
+        assert_eq!(arguments[2], "-lc");
+        assert!(arguments[3].contains("workspace='/srv/symphony/source-5465616d/issue_123'"));
+        assert!(arguments[3].contains("case \"$workspace\" in \"$root\"/*)"));
+        assert!(arguments[3].contains("[ ! -L \"$workspace\" ]"));
+    }
+
+    #[test]
+    fn remote_workspace_paths_are_posix_and_contained() {
+        let temp = TempDir::new().expect("tempdir");
+        let manager = WorkspaceManager::new(
+            &WorkspaceConfig {
+                root: temp.path().to_path_buf(),
+                remote_root: "/srv/symphony".to_string(),
+                cleanup: Default::default(),
+                retention: Default::default(),
+                population: Default::default(),
+            },
+            HooksConfig::default(),
+        )
+        .expect("workspace manager");
+        let (key, path) = manager
+            .remote_workspace_path_for_source_identifier("Team", "issue/123")
+            .expect("remote path");
+
+        assert_eq!(key, "source-5465616d/issue_123");
+        assert_eq!(
+            path.to_string_lossy(),
+            "/srv/symphony/source-5465616d/issue_123"
+        );
+        manager
+            .ensure_remote_contained(&path)
+            .expect("contained remote path");
+        assert!(
+            manager
+                .ensure_remote_contained(Path::new("/tmp/escape"))
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn retention_removes_only_old_unprotected_valid_orphans() {

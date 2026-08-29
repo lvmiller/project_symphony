@@ -28,7 +28,7 @@ use serde_yaml::{Mapping, Value};
 use crate::domain::WorkflowDefinition;
 use crate::error::{Result, SymphonyError};
 use crate::workflow::{load_workflow, select_workflow_path};
-use crate::workspace::sanitize_workspace_key;
+use crate::workspace::source_workspace_namespace;
 
 pub const DEFAULT_GITHUB_ENDPOINT: &str = "https://api.github.com/graphql";
 pub const DEFAULT_PROMPT: &str = "You are working on an issue from GitHub.";
@@ -299,6 +299,23 @@ pub fn raw_workflow_json_schema() -> serde_json::Value {
                 },
                 "additionalProperties": true
             },
+            "worker": {
+                "type": "object",
+                "description": "Optional SSH worker pool. Omit ssh_hosts to keep execution local.",
+                "properties": {
+                    "ssh_hosts": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "default": []
+                    },
+                    "max_concurrent_agents_per_host": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 1
+                    }
+                },
+                "additionalProperties": true
+            },
             "workspace": {
                 "type": "object",
                 "description": "Changes apply to future workspace preparation after dynamic reload.",
@@ -438,6 +455,7 @@ pub struct EffectiveConfig {
     pub tracker: TrackerConfig,
     pub polling: PollingConfig,
     pub workspace: WorkspaceConfig,
+    pub worker: WorkerConfig,
     pub hooks: HooksConfig,
     pub agent: AgentConfig,
     pub codex: CodexConfig,
@@ -455,7 +473,14 @@ impl EffectiveConfig {
         let source = parse_source(&workflow.config)?;
         let tracker = parse_tracker(&workflow.config)?;
         let polling = parse_polling(&workflow.config)?;
+        let worker = parse_worker(&workflow.config)?;
         let workspace = parse_workspace(&workflow.config, &workflow_dir)?;
+        if !worker.ssh_hosts.is_empty() && !workspace.remote_root.starts_with('/') {
+            return Err(SymphonyError::config(
+                "invalid_remote_workspace_root",
+                "workspace.root must be an absolute POSIX path when worker.ssh_hosts is configured",
+            ));
+        }
         let hooks = parse_hooks(&workflow.config)?;
         let agent = parse_agent(&workflow.config)?;
         let codex = parse_codex(&workflow.config)?;
@@ -469,6 +494,7 @@ impl EffectiveConfig {
             tracker,
             polling,
             workspace,
+            worker,
             hooks,
             agent,
             codex,
@@ -642,8 +668,27 @@ pub struct PollingConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    /// SSH destinations used for remote worker execution. An empty list keeps all work local.
+    pub ssh_hosts: Vec<String>,
+    /// Maximum active agents on each configured SSH host.
+    pub max_concurrent_agents_per_host: usize,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            ssh_hosts: Vec::new(),
+            max_concurrent_agents_per_host: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub root: PathBuf,
+    /// POSIX root interpreted on SSH worker hosts. It is ignored for local execution.
+    pub remote_root: String,
     pub cleanup: WorkspaceCleanupConfig,
     pub retention: WorkspaceRetentionConfig,
     pub population: WorkspacePopulationConfig,
@@ -973,7 +1018,7 @@ fn validate_unique_source_ids(reloaders: &[ConfigReloader]) -> Result<()> {
             ));
         }
 
-        let segment = sanitize_workspace_key(source_id);
+        let segment = source_workspace_namespace(source_id);
         if let Some((previous_source_id, previous_path)) = source_segments.insert(
             segment.clone(),
             (source_id.to_string(), workflow_path.clone()),
@@ -1182,10 +1227,80 @@ fn parse_polling(config: &Mapping) -> Result<PollingConfig> {
     })
 }
 
+fn parse_worker(config: &Mapping) -> Result<WorkerConfig> {
+    let worker = get_map(config, "worker");
+    let hosts = match get_value(worker, "ssh_hosts") {
+        None => Vec::new(),
+        Some(Value::Sequence(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|host| !host.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        SymphonyError::config(
+                            "invalid_worker_ssh_hosts",
+                            "worker.ssh_hosts must contain non-empty strings",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => {
+            return Err(SymphonyError::config(
+                "invalid_worker_ssh_hosts",
+                "worker.ssh_hosts must be a list of SSH host strings",
+            ));
+        }
+    };
+    let mut seen_hosts = BTreeMap::new();
+    for host in &hosts {
+        if !host.is_ascii()
+            || host.starts_with('-')
+            || host
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte == b'\0')
+        {
+            return Err(SymphonyError::config(
+                "invalid_worker_ssh_host",
+                "worker.ssh_hosts entries must be ASCII, non-option, whitespace-free SSH host strings",
+            ));
+        }
+        let collision_key = host.to_ascii_lowercase();
+        if seen_hosts.insert(collision_key, host).is_some() {
+            return Err(SymphonyError::config(
+                "duplicate_worker_ssh_host",
+                "worker.ssh_hosts entries must be unique without case distinctions",
+            ));
+        }
+    }
+    let max_concurrent_agents_per_host = positive_u64_or_default(
+        worker,
+        "max_concurrent_agents_per_host",
+        WorkerConfig::default().max_concurrent_agents_per_host as u64,
+        "invalid_worker_max_concurrent_agents_per_host",
+        "worker.max_concurrent_agents_per_host",
+    )?;
+    let max_concurrent_agents_per_host =
+        usize::try_from(max_concurrent_agents_per_host).map_err(|_| {
+            SymphonyError::config(
+                "invalid_worker_max_concurrent_agents_per_host",
+                "worker.max_concurrent_agents_per_host is too large",
+            )
+        })?;
+    Ok(WorkerConfig {
+        ssh_hosts: hosts,
+        max_concurrent_agents_per_host,
+    })
+}
+
 fn parse_workspace(config: &Mapping, workflow_dir: &Path) -> Result<WorkspaceConfig> {
     let workspace = get_map(config, "workspace");
-    let root = get_string(workspace, "root")
-        .map(|value| resolve_path_value(&value))
+    let configured_root = get_string(workspace, "root");
+    let root = configured_root
+        .as_deref()
+        .map(resolve_path_value)
         .transpose()?
         .unwrap_or_else(|| env::temp_dir().join("symphony_workspaces"));
     let expanded = if root.is_absolute() {
@@ -1193,8 +1308,12 @@ fn parse_workspace(config: &Mapping, workflow_dir: &Path) -> Result<WorkspaceCon
     } else {
         workflow_dir.join(root)
     };
+    let remote_root = configured_root
+        .filter(|root| root.starts_with('/'))
+        .unwrap_or_else(|| expanded.to_string_lossy().replace('\\', "/"));
     Ok(WorkspaceConfig {
         root: normalize_absolute_path(&expanded)?,
+        remote_root,
         cleanup: parse_workspace_cleanup(workspace)?,
         retention: parse_workspace_retention(workspace)?,
         population: parse_workspace_population(workspace)?,

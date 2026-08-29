@@ -29,8 +29,20 @@ server:
 polling:
   interval_ms: 60000
 
+# Optional SSH worker pool. Omit this entire section to execute workers locally.
+# workspace.root and hooks are evaluated on the selected remote host; install Codex,
+# Git, and required hook dependencies there. Symphony keeps protocol/session control
+# locally and never falls back to local execution while every configured host is full.
+worker:
+  ssh_hosts:
+    - symphony-worker-a
+    - symphony-worker-b
+  max_concurrent_agents_per_host: 2
+
+# This path is interpreted on remote SSH hosts when worker.ssh_hosts is configured.
+# Use an absolute POSIX path for an SSH worker pool.
 workspace:
-  root: ./.symphony-workspaces
+  root: /var/lib/symphony/workspaces
   cleanup:
     after_success: committed
   # Optional, startup-only pruning for stale orphan directories. Omit to disable
@@ -55,8 +67,9 @@ hooks:
   # Symphony provides SYMPHONY_HOOK_NAME, SYMPHONY_WORKSPACE_PATH,
   # SYMPHONY_WORKSPACE_KEY, SYMPHONY_SOURCE_ID, SYMPHONY_SOURCE_KEY,
   # SYMPHONY_ISSUE_IDENTIFIER, and SYMPHONY_ISSUE_KEY. The *_KEY values are
-  # sanitized identifiers suitable for paths. Failure diagnostics retain bounded,
-  # redacted stdout/stderr excerpts.
+  # path-safe identifiers; source workspace namespaces are lowercase UTF-8 byte
+  # encodings to prevent case-folding or Unicode-normalization collisions. Failure
+  # diagnostics retain bounded, redacted stdout/stderr excerpts.
   after_create: |
     printf 'preparing %s for %s\n' "$SYMPHONY_WORKSPACE_PATH" "$SYMPHONY_ISSUE_IDENTIFIER"
 agent:

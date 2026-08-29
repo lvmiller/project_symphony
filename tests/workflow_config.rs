@@ -280,33 +280,99 @@ fn duplicate_source_ids_are_rejected_for_config_sets() {
 }
 
 #[test]
-fn source_ids_with_colliding_workspace_segments_are_rejected() {
+fn case_and_unicode_variant_source_ids_have_distinct_workspace_namespaces() {
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("first.md");
     let second = temp.path().join("second.md");
+    let third = temp.path().join("third.md");
+    let fourth = temp.path().join("fourth.md");
     std::fs::write(
         &first,
-        valid_workflow(None).replacen("tracker:", "source:\n  id: api/service\ntracker:", 1),
+        valid_workflow(None).replacen("tracker:", "source:\n  id: Team\ntracker:", 1),
     )
     .unwrap();
     std::fs::write(
         &second,
-        valid_workflow(None).replacen("tracker:", "source:\n  id: api?service\ntracker:", 1),
+        valid_workflow(None).replacen("tracker:", "source:\n  id: team\ntracker:", 1),
+    )
+    .unwrap();
+    std::fs::write(
+        &third,
+        valid_workflow(None).replacen("tracker:", "source:\n  id: \"é\"\ntracker:", 1),
+    )
+    .unwrap();
+    std::fs::write(
+        &fourth,
+        valid_workflow(None).replacen("tracker:", "source:\n  id: \"e\u{301}\"\ntracker:", 1),
     )
     .unwrap();
 
-    let error = match ConfigSetReloader::new(vec![first, second]) {
-        Ok(_) => panic!("expected colliding workspace source segment error"),
-        Err(error) => error,
-    };
-    match error {
-        SymphonyError::ConfigValidation { code, .. } => {
-            assert_eq!(code, "colliding_source_workspace_key");
-        }
-        other => panic!("unexpected error: {other:?}"),
+    let reloaders = ConfigSetReloader::new(vec![first, second, third, fourth]).unwrap();
+    assert_eq!(reloaders.current().count(), 4);
+}
+
+#[test]
+fn worker_ssh_configuration_defaults_parses_and_rejects_invalid_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let default = load_from_path(write_workflow(temp.path(), &valid_workflow(None)));
+    assert!(default.worker.ssh_hosts.is_empty());
+    assert_eq!(default.worker.max_concurrent_agents_per_host, 1);
+
+    let configured = load_from_path(write_workflow(
+        temp.path(),
+        &valid_workflow(None).replacen(
+            "---\ntracker:",
+            "---\nworker:\n  ssh_hosts: [build-a, build-b]\n  max_concurrent_agents_per_host: 2\nworkspace:\n  root: /srv/symphony\ntracker:",
+            1,
+        ),
+    ));
+    assert_eq!(configured.worker.ssh_hosts, ["build-a", "build-b"]);
+    assert_eq!(configured.worker.max_concurrent_agents_per_host, 2);
+
+    for (worker, code) in [
+        (
+            "worker:\n  ssh_hosts: [Team, team]\n",
+            "duplicate_worker_ssh_host",
+        ),
+        (
+            "worker:\n  ssh_hosts: [\"   \"]\n",
+            "invalid_worker_ssh_hosts",
+        ),
+        (
+            "worker:\n  ssh_hosts: not-a-list\n",
+            "invalid_worker_ssh_hosts",
+        ),
+        (
+            "worker:\n  max_concurrent_agents_per_host: 0\n",
+            "invalid_worker_max_concurrent_agents_per_host",
+        ),
+    ] {
+        assert_config_code(
+            write_workflow(
+                temp.path(),
+                &valid_workflow(None).replacen(
+                    "---\ntracker:",
+                    &format!("---\n{worker}tracker:"),
+                    1,
+                ),
+            ),
+            code,
+        );
     }
+
+    assert_config_code(
+        write_workflow(
+            temp.path(),
+            &valid_workflow(Some("relative-workspaces")).replacen(
+                "---\ntracker:",
+                "---\nworker:\n  ssh_hosts: [build-a]\ntracker:",
+                1,
+            ),
+        ),
+        "invalid_remote_workspace_root",
+    );
 }
 
 #[test]

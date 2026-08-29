@@ -9,7 +9,9 @@ use symphony::config::{
 };
 use symphony::domain::Issue;
 use symphony::error::SymphonyError;
-use symphony::workspace::{WorkspaceManager, sanitize_workspace_key, source_workspace_key};
+use symphony::workspace::{
+    WorkspaceManager, sanitize_workspace_key, source_workspace_key, source_workspace_namespace,
+};
 use tempfile::TempDir;
 
 fn hooks_with_timeout(timeout_ms: u64) -> HooksConfig {
@@ -48,6 +50,7 @@ fn manager_with_population(
     WorkspaceManager::new(
         &WorkspaceConfig {
             root: root.to_path_buf(),
+            remote_root: root.to_string_lossy().replace('\\', "/"),
             cleanup: WorkspaceCleanupConfig::default(),
             retention: WorkspaceRetentionConfig::default(),
             population,
@@ -164,6 +167,35 @@ fn sanitizes_workspace_keys_to_safe_path_segments() {
     assert_eq!(path, manager.root().join("_"));
 }
 
+#[test]
+fn source_workspace_namespaces_are_case_stable_and_injective() {
+    let variants = ["Team", "team", "é", "e\u{301}"];
+    let namespaces: std::collections::BTreeSet<_> = variants
+        .iter()
+        .map(|source| source_workspace_namespace(source))
+        .collect();
+    assert_eq!(namespaces.len(), variants.len());
+    assert_eq!(source_workspace_namespace("Team"), "source-5465616d");
+    assert!(namespaces.iter().all(|namespace| {
+        namespace.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+    }));
+
+    let temp = TempDir::new().expect("tempdir");
+    let manager = manager(temp.path(), hooks_with_timeout(1_000));
+    let paths: std::collections::BTreeSet<_> = variants
+        .iter()
+        .map(|source| {
+            manager
+                .workspace_path_for_source_identifier(source, "issue")
+                .expect("encoded path must be contained")
+                .1
+        })
+        .collect();
+    assert_eq!(paths.len(), variants.len());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn existing_symlink_workspace_path_is_rejected_on_create() {
@@ -227,7 +259,11 @@ async fn source_workspaces_are_namespaced_and_hooks_receive_source_id() {
         .await
         .expect("source workspace should be created");
 
-    assert_eq!(workspace.workspace_key, "api_service/issue_123");
+    let source_namespace = source_workspace_namespace("api/service");
+    assert_eq!(
+        workspace.workspace_key,
+        format!("{source_namespace}/issue_123")
+    );
     assert_eq!(
         source_workspace_key("api/service", "issue/123"),
         workspace.workspace_key
@@ -236,7 +272,7 @@ async fn source_workspaces_are_namespaced_and_hooks_receive_source_id() {
         workspace.path,
         fs::canonicalize(temp.path())
             .unwrap()
-            .join("api_service")
+            .join(&source_namespace)
             .join("issue_123")
     );
     assert_eq!(
@@ -256,9 +292,9 @@ async fn source_workspaces_are_namespaced_and_hooks_receive_source_id() {
         vec![
             "after_create",
             expected_workspace_path.as_str(),
-            "api_service/issue_123",
+            workspace.workspace_key.as_str(),
             "api/service",
-            "api_service",
+            source_namespace.as_str(),
             "issue/123",
             "issue_123",
         ]
