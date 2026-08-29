@@ -100,12 +100,50 @@ while True:
     start_result["turn"]["id"] = turn_id
     send({"id": str(turn["id"]) if scenario == "string_response_ids" else turn["id"], "result": start_result})
 
-    if scenario in ("complete", "string_response_ids"):
+    if scenario in ("complete", "string_response_ids", "repeated_telemetry"):
         token_usage = fresh_fixture("turn", "token_usage_notification")
         token_usage["params"]["turnId"] = turn_id
         send(token_usage)
+        if scenario == "repeated_telemetry":
+            token_usage = fresh_fixture("turn", "token_usage_notification")
+            token_usage["params"]["turnId"] = turn_id
+            token_usage["params"]["tokenUsage"]["total"] = {
+                "inputTokens": 15,
+                "outputTokens": 25,
+                "totalTokens": 40,
+            }
+            send(token_usage)
         send(fresh_fixture("turn", "rate_limits_notification"))
         send({"method":"notice","params":{"message":"hello"}})
+        completed = fresh_fixture("turn", "completed_notification")
+        completed["params"]["turn"]["id"] = turn_id
+        send(completed)
+    elif scenario == "summary_safety":
+        send({
+            "id": "tool-sensitive",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": turn_id,
+                "namespace": "unknown_namespace",
+                "tool": "unknown_tool",
+                "callId": "call-sensitive",
+                "arguments": {
+                    "prompt": "PROMPT_SENTINEL",
+                    "token": "ghp_CREDENTIAL_SENTINEL",
+                    "json": {"full": "TOOL_ARGUMENT_SENTINEL"},
+                },
+            },
+        })
+        log({"tool_response": recv()})
+        send({
+            "method": "notice/" + ("é" * 600),
+            "params": {
+                "prompt": "PROMPT_SENTINEL",
+                "token": "ghp_CREDENTIAL_SENTINEL",
+                "arguments": {"full": "TOOL_ARGUMENT_SENTINEL"},
+            },
+        })
         completed = fresh_fixture("turn", "completed_notification")
         completed["params"]["turn"]["id"] = turn_id
         send(completed)
@@ -475,16 +513,33 @@ async fn sends_schema_shaped_startup_messages_and_streams_completion() {
         received[3]["params"]["input"],
         json!([{ "type": "text", "text": "do the work" }])
     );
-
-    assert!(events.iter().any(|event| event.event == "session_started"
-        && event.session_id.as_deref() == Some("thread-1-turn-1")));
-    assert!(events.iter().any(|event| event.event == "turn_started"));
-    assert!(events.iter().any(|event| event.event == "turn_completed"));
-    assert!(
-        events.iter().any(
-            |event| event.event == "notification" && event.message.as_deref() == Some("notice")
-        )
-    );
+    assert!(events.iter().any(|event| {
+        event.event == "thread_started" && event.message.as_deref() == Some("Codex thread started")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "session_started"
+            && event.session_id.as_deref() == Some("thread-1-turn-1")
+            && event.message.as_deref() == Some("Codex session started")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "turn_started" && event.message.as_deref() == Some("Codex turn started")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "turn_completed" && event.message.as_deref() == Some("Codex turn completed")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "token_totals"
+            && event.message.as_deref()
+                == Some("token totals updated: input=10, output=20, total=30")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "rate_limits"
+            && event.message.as_deref() == Some("Codex rate limits updated")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "notification"
+            && event.message.as_deref() == Some("Codex notification: notice")
+    }));
 }
 
 #[tokio::test]
@@ -576,6 +631,28 @@ async fn extracts_token_totals_and_rate_limits() {
 }
 
 #[tokio::test]
+async fn preserves_repeated_token_and_rate_limit_payloads() {
+    let (_harness, result) = run_scenario("repeated_telemetry").await;
+    let events = result.expect("run completes");
+    let totals: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.absolute_token_totals.as_ref())
+        .collect();
+    assert_eq!(totals.len(), 2);
+    assert_eq!(totals[0].input_tokens, 10);
+    assert_eq!(totals[0].output_tokens, 20);
+    assert_eq!(totals[0].total_tokens, 30);
+    assert_eq!(totals[1].input_tokens, 15);
+    assert_eq!(totals[1].output_tokens, 25);
+    assert_eq!(totals[1].total_tokens, 40);
+    assert!(events.iter().any(|event| {
+        event.rate_limits.as_ref().is_some_and(|limits| {
+            limits["limitId"] == "codex" && limits["primary"]["usedPercent"] == 42
+        })
+    }));
+}
+
+#[tokio::test]
 async fn times_out_when_turn_does_not_complete() {
     let (harness, result) = run_scenario("timeout").await;
     let error = result.expect_err("timeout should fail").to_string();
@@ -628,6 +705,18 @@ async fn auto_approves_command_and_file_requests_for_session() {
             .count(),
         2
     );
+    let approval_summaries: Vec<&str> = events
+        .iter()
+        .filter(|event| event.event == "approval_auto_approved")
+        .filter_map(|event| event.message.as_deref())
+        .collect();
+    assert_eq!(
+        approval_summaries,
+        vec![
+            "command approval auto-approved",
+            "file-change approval auto-approved"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -640,11 +729,47 @@ async fn unsupported_dynamic_tool_calls_return_unsuccessful_response() {
         response["result"]["contentItems"][0]["text"],
         json!({ "error": "unsupported_tool" }).to_string()
     );
+    assert!(events.iter().any(|event| {
+        event.event == "unsupported_tool_call"
+            && event.message.as_deref() == Some("unsupported dynamic tool request")
+    }));
+}
+
+#[tokio::test]
+async fn event_summaries_are_bounded_utf8_safe_and_redacted() {
+    let (_harness, result) = run_scenario("summary_safety").await;
+    let events = result.expect("summary scenario completes");
+    let messages: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event.message.as_deref())
+        .collect();
+
     assert!(
-        events
+        messages
             .iter()
-            .any(|event| event.event == "unsupported_tool_call")
+            .all(|message| message.len() <= 1024 && message.is_char_boundary(message.len()))
     );
+    for sentinel in [
+        "PROMPT_SENTINEL",
+        "ghp_CREDENTIAL_SENTINEL",
+        "TOOL_ARGUMENT_SENTINEL",
+    ] {
+        assert!(
+            messages.iter().all(|message| !message.contains(sentinel)),
+            "summary exposed {sentinel}"
+        );
+    }
+    assert!(events.iter().any(|event| {
+        event.event == "unsupported_tool_call"
+            && event.message.as_deref() == Some("unsupported dynamic tool request")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "notification"
+            && event
+                .message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Codex notification: notice/"))
+    }));
 }
 
 fn tool_failure_code(response: &Value) -> String {
@@ -667,7 +792,7 @@ async fn github_graphql_advertises_the_v2_namespace_and_returns_the_full_success
     let (harness, result) =
         run_scenario_with_github_graphql("tool_success", Some(github_executor(server.url.clone())))
             .await;
-    result.expect("tool call completes without stalling");
+    let events = result.expect("tool call completes without stalling");
 
     let received: Vec<Value> = log_entries(&harness.log_path)
         .into_iter()
@@ -710,6 +835,10 @@ async fn github_graphql_advertises_the_v2_namespace_and_returns_the_full_success
         .expect("JSON success body"),
         body
     );
+    assert!(events.iter().any(|event| {
+        event.event == "dynamic_tool_call"
+            && event.message.as_deref() == Some("GitHub GraphQL dynamic tool request")
+    }));
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
@@ -807,7 +936,7 @@ async fn github_graphql_status_and_transport_failures_are_safe_and_secret_free()
 #[tokio::test]
 async fn unknown_server_requests_receive_a_method_not_found_response() {
     let (harness, result) = run_scenario("unknown_request").await;
-    result.expect("unknown request does not fail the turn");
+    let events = result.expect("unknown request does not fail the turn");
     let log = log_entries(&harness.log_path);
     let response = log
         .iter()
@@ -815,6 +944,10 @@ async fn unknown_server_requests_receive_a_method_not_found_response() {
         .expect("unknown request response");
     assert_eq!(response["id"], "unknown-1");
     assert_eq!(response["error"]["code"], -32601);
+    assert!(events.iter().any(|event| {
+        event.event == "other_message"
+            && event.message.as_deref() == Some("unsupported Codex server request: item/unknown")
+    }));
 }
 
 #[tokio::test]
@@ -850,13 +983,10 @@ async fn user_input_required_fails_without_stalling() {
         input_response["result"],
         fixture["server_requests"]["user_input_result"]
     );
-    assert!(
-        events
-            .lock()
-            .expect("events mutex")
-            .iter()
-            .any(|event| event.event == "turn_input_required")
-    );
+    assert!(events.lock().expect("events mutex").iter().any(|event| {
+        event.event == "turn_input_required"
+            && event.message.as_deref() == Some("Codex requires user input")
+    }));
 }
 
 #[tokio::test]
@@ -916,11 +1046,34 @@ async fn malformed_startup_responses_are_typed_and_reap_the_child() {
 
 #[tokio::test]
 async fn malformed_messages_are_reported_and_fail_the_run() {
-    let (_harness, result) = run_scenario("malformed").await;
-    let error = result
+    let harness = harness("malformed");
+    let client = CodexAppServerClient::new(config(harness.command.clone()));
+    let workspace_path = fs::canonicalize(harness.workspace.path()).expect("canonical workspace");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let mut on_event = move |event| {
+        captured.lock().expect("events mutex").push(event);
+    };
+    let mut session = client
+        .start_session(&workspace_path, &mut on_event)
+        .await
+        .expect("session starts");
+    let error = session
+        .run_turn("malformed")
+        .await
         .expect_err("malformed message should fail")
         .to_string();
+    session.shutdown().await;
+    drop(session);
+
     assert!(error.contains("protocol_error"), "{error}");
+    assert!(events.lock().expect("events mutex").iter().any(|event| {
+        event.event == "malformed"
+            && event.message.as_deref() == Some("malformed Codex protocol message")
+    }));
+    assert!(events.lock().expect("events mutex").iter().any(|event| {
+        event.event == "protocol_error" && event.message.as_deref() == Some("Codex protocol error")
+    }));
 }
 
 #[tokio::test]

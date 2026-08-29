@@ -11,11 +11,12 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{Instant, timeout};
 
 use crate::config::CodexConfig;
-use crate::domain::{CodexEvent, TokenTotals};
+use crate::domain::{CodexEvent, ExecutionTarget, TokenTotals};
 use crate::error::{Result, SymphonyError};
 use crate::tracker::github::GitHubGraphqlExecutor;
 
 const MAX_JSONL_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_EVENT_SUMMARY_BYTES: usize = 1024;
 const METHOD_INITIALIZE: &str = "initialize";
 const METHOD_INITIALIZED: &str = "initialized";
 const METHOD_THREAD_START: &str = "thread/start";
@@ -130,6 +131,22 @@ pub trait CodexClient: Send + Sync {
         workspace: &Path,
         on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
     ) -> Result<Box<dyn CodexSession + 'a>>;
+
+    async fn start_session_on_target<'a>(
+        &'a self,
+        target: &ExecutionTarget,
+        workspace: &Path,
+        on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
+    ) -> Result<Box<dyn CodexSession + 'a>> {
+        if target.is_local() {
+            self.start_session(workspace, on_event).await
+        } else {
+            Err(SymphonyError::codex(
+                "unsupported_execution_target",
+                "Codex client does not support SSH execution targets",
+            ))
+        }
+    }
 }
 
 #[async_trait]
@@ -167,9 +184,20 @@ impl CodexClient for CodexAppServerClient {
         workspace: &Path,
         on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
     ) -> Result<Box<dyn CodexSession + 'a>> {
+        self.start_session_on_target(&ExecutionTarget::Local, workspace, on_event)
+            .await
+    }
+
+    async fn start_session_on_target<'a>(
+        &'a self,
+        target: &ExecutionTarget,
+        workspace: &Path,
+        on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
+    ) -> Result<Box<dyn CodexSession + 'a>> {
         let mut session = CodexJsonlSession::spawn(
             &self.config,
             self.github_graphql.as_ref(),
+            target,
             workspace,
             on_event,
         )
@@ -178,13 +206,19 @@ impl CodexClient for CodexAppServerClient {
             session.initialize().await?;
             let thread_id = session.start_thread().await?;
             session.thread_id = Some(thread_id);
+            session.emit("thread_started", None, None, None);
             Ok(())
         }
         .await;
         match startup {
             Ok(()) => Ok(Box::new(session)),
             Err(error) => {
-                session.emit("startup_failed", Some(error.to_string()), None, None);
+                session.emit(
+                    "startup_failed",
+                    Some(startup_failure_summary(&error)),
+                    None,
+                    None,
+                );
                 session.shutdown().await;
                 Err(error)
             }
@@ -201,7 +235,7 @@ fn emit_startup_failed(on_event: &mut (dyn FnMut(CodexEvent) + Send), error: &Sy
         thread_id: None,
         turn_id: None,
         codex_app_server_pid: None,
-        message: Some(error.to_string()),
+        message: event_summary("startup_failed", Some(startup_failure_summary(error)), None),
         absolute_token_totals: None,
         rate_limits: None,
     });
@@ -210,6 +244,7 @@ fn emit_startup_failed(on_event: &mut (dyn FnMut(CodexEvent) + Send), error: &Sy
 struct CodexJsonlSession<'a> {
     config: &'a CodexConfig,
     github_graphql: Option<&'a GitHubGraphqlExecutor>,
+    target: ExecutionTarget,
     workspace: PathBuf,
     child: Child,
     stdin: ChildStdin,
@@ -225,26 +260,45 @@ impl<'a> CodexJsonlSession<'a> {
     async fn spawn(
         config: &'a CodexConfig,
         github_graphql: Option<&'a GitHubGraphqlExecutor>,
+        target: &ExecutionTarget,
         workspace: &Path,
         on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
     ) -> Result<Self> {
-        let bash_command = match bash_command_in_workspace(workspace, &config.command) {
-            Ok(command) => command,
-            Err(error) => {
-                emit_startup_failed(on_event, &error);
-                return Err(error);
+        let mut command = match target {
+            ExecutionTarget::Local => {
+                let bash_command = match bash_command_in_workspace(workspace, &config.command) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        emit_startup_failed(on_event, &error);
+                        return Err(error);
+                    }
+                };
+                let mut command = Command::new("bash");
+                command.arg("-lc").arg(bash_command);
+                command
+            }
+            ExecutionTarget::Ssh { host } => {
+                let script = match remote_codex_command(workspace, &config.command) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        emit_startup_failed(on_event, &error);
+                        return Err(error);
+                    }
+                };
+                let mut command = Command::new("ssh");
+                command.args(["--", host, "sh", "-lc"]).arg(script);
+                command
             }
         };
-        let mut command = Command::new("bash");
         command
-            .arg("-lc")
-            .arg(bash_command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
         #[cfg(not(windows))]
-        command.current_dir(workspace);
+        if target.is_local() {
+            command.current_dir(workspace);
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(source) => {
@@ -282,6 +336,7 @@ impl<'a> CodexJsonlSession<'a> {
         Ok(Self {
             config,
             github_graphql,
+            target: target.clone(),
             workspace: workspace.to_path_buf(),
             child,
             stdin,
@@ -490,12 +545,7 @@ impl<'a> CodexJsonlSession<'a> {
                             protocol_error(format!("response {id} missing result"))
                         });
                     }
-                    self.emit(
-                        "other_message",
-                        Some(format!("response for unexpected request {message_id}")),
-                        None,
-                        None,
-                    );
+                    self.emit("other_message", None, None, None);
                 }
             }
         }
@@ -567,6 +617,7 @@ impl<'a> CodexJsonlSession<'a> {
                 let tool = params.get("tool").and_then(Value::as_str);
                 let result = match (namespace, tool) {
                     (Some("github_graphql"), Some("query")) => {
+                        self.emit("dynamic_tool_call", None, None, None);
                         self.handle_github_graphql_tool(params).await
                     }
                     _ => {
@@ -576,7 +627,6 @@ impl<'a> CodexJsonlSession<'a> {
                 };
                 self.send_response(id.into_value(), result).await
             }
-
             METHOD_USER_INPUT => {
                 let params = validate_request_fields(value, &["itemId", "threadId", "turnId"])?;
                 if !params.get("questions").is_some_and(Value::is_array) {
@@ -817,14 +867,24 @@ impl<'a> CodexJsonlSession<'a> {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
             codex_app_server_pid: self.child.id(),
-            message,
+            message: event_summary(event, message, absolute_token_totals.as_ref()),
             absolute_token_totals,
             rate_limits,
         });
     }
 
     fn workspace_string(&self) -> Result<String> {
-        bash_path(&self.workspace)
+        match &self.target {
+            ExecutionTarget::Local => bash_path(&self.workspace),
+            ExecutionTarget::Ssh { .. } => {
+                self.workspace.to_str().map(str::to_owned).ok_or_else(|| {
+                    SymphonyError::codex(
+                        "invalid_workspace_cwd",
+                        "remote Codex workspace path is not valid UTF-8",
+                    )
+                })
+            }
+        }
     }
 
     async fn shutdown(&mut self) {
@@ -862,6 +922,7 @@ impl CodexSession for CodexJsonlSession<'_> {
         }
         .await;
         if is_protocol_error(&result) {
+            self.emit("protocol_error", None, None, None);
             self.shutdown().await;
         }
         result
@@ -1027,7 +1088,26 @@ fn bash_command_in_workspace(workspace: &Path, command: &str) -> Result<String> 
     }
 }
 
-#[cfg(windows)]
+fn remote_codex_command(workspace: &Path, command: &str) -> Result<String> {
+    let workspace = workspace.to_str().ok_or_else(|| {
+        SymphonyError::codex(
+            "invalid_workspace_cwd",
+            "remote Codex workspace path is not valid UTF-8",
+        )
+    })?;
+    if workspace.is_empty() {
+        return Err(SymphonyError::codex(
+            "invalid_workspace_cwd",
+            "remote Codex workspace path is empty",
+        ));
+    }
+    Ok(format!(
+        "cd -- {} && exec bash -lc {}",
+        shell_quote(workspace),
+        shell_quote(command)
+    ))
+}
+
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
@@ -1179,7 +1259,7 @@ fn required_nonnegative_i64(value: &serde_json::Map<String, Value>, field: &str)
         .get(field)
         .and_then(Value::as_i64)
         .filter(|number| *number >= 0)
-        .ok_or_else(|| protocol_error(format!("message missing non-negative integer {field}")))
+        .ok_or_else(|| protocol_error(format!("message missing nonnegative integer {field}")))
 }
 
 fn validate_request_fields<'a>(
@@ -1217,4 +1297,99 @@ fn turn_error_message(turn: &serde_json::Map<String, Value>) -> Option<String> {
 
 fn compose_session_id(thread_id: &str, turn_id: &str) -> String {
     format!("{thread_id}-{turn_id}")
+}
+
+fn startup_failure_summary(error: &SymphonyError) -> String {
+    let SymphonyError::Codex { kind, message } = error else {
+        return "Codex session startup failed".to_string();
+    };
+    if *kind == "timeout" && message.contains("initialize response") {
+        "Codex session startup failed waiting for initialize response".to_string()
+    } else if *kind == "timeout" && message.contains("thread/start response") {
+        "Codex session startup failed waiting for thread/start response".to_string()
+    } else {
+        "Codex session startup failed".to_string()
+    }
+}
+fn event_summary(
+    event: &str,
+    detail: Option<String>,
+    absolute_token_totals: Option<&TokenTotals>,
+) -> Option<String> {
+    let summary = match event {
+        "startup_failed" => detail.or_else(|| Some("Codex session startup failed".to_string())),
+        "thread_started" => Some("Codex thread started".to_string()),
+        "session_started" => Some("Codex session started".to_string()),
+        "turn_started" => Some("Codex turn started".to_string()),
+        "turn_completed" => Some("Codex turn completed".to_string()),
+        "turn_failed" => Some("Codex turn failed".to_string()),
+        "turn_cancelled" => Some("Codex turn interrupted".to_string()),
+        "token_totals" => absolute_token_totals.map(|totals| {
+            format!(
+                "token totals updated: input={}, output={}, total={}",
+                totals.input_tokens, totals.output_tokens, totals.total_tokens
+            )
+        }),
+        "rate_limits" => Some("Codex rate limits updated".to_string()),
+        "approval_auto_approved" => match detail.as_deref() {
+            Some(METHOD_COMMAND_APPROVAL) => Some("command approval auto-approved".to_string()),
+            Some(METHOD_FILE_APPROVAL) => Some("file-change approval auto-approved".to_string()),
+            _ => Some("approval auto-approved".to_string()),
+        },
+        "turn_input_required" => Some("Codex requires user input".to_string()),
+        "unsupported_tool_call" => Some("unsupported dynamic tool request".to_string()),
+        "dynamic_tool_call" => Some("GitHub GraphQL dynamic tool request".to_string()),
+        "notification" => detail.map(|method| {
+            format!(
+                "Codex notification: {}",
+                protocol_method_summary(method.as_str())
+            )
+        }),
+        "other_message" => detail.map(|method| {
+            format!(
+                "unsupported Codex server request: {}",
+                protocol_method_summary(method.as_str())
+            )
+        }),
+        "malformed" => Some("malformed Codex protocol message".to_string()),
+        "protocol_error" => Some("Codex protocol error".to_string()),
+        _ => None,
+    };
+    summary.map(truncate_event_summary)
+}
+
+fn protocol_method_summary(method: &str) -> String {
+    let method = method.trim();
+    if method.is_empty() {
+        return "unknown".to_string();
+    }
+    let method_lowercase = method.to_ascii_lowercase();
+    if [
+        "authorization",
+        "api_key",
+        "credential",
+        "password",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|label| method_lowercase.contains(label))
+    {
+        "[redacted]".to_string()
+    } else {
+        method.to_string()
+    }
+}
+
+fn truncate_event_summary(summary: String) -> String {
+    if summary.len() <= MAX_EVENT_SUMMARY_BYTES {
+        return summary;
+    }
+
+    let content_limit = MAX_EVENT_SUMMARY_BYTES - '…'.len_utf8();
+    let mut end = content_limit;
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &summary[..end])
 }
