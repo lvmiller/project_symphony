@@ -127,10 +127,29 @@ pub struct RetryEntry {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RetrySnapshot {
+    pub source_id: String,
+    pub issue_id: String,
+    pub issue_identifier: String,
+    pub workspace_key: String,
+    pub attempt: u32,
+    pub error: Option<String>,
+    /// Delay relative to the snapshot's monotonic observation point.
+    pub remaining_delay_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSnapshotCounts {
+    pub running: usize,
+    pub retrying: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {
     pub running: Vec<RunningSnapshot>,
-    pub retrying: Vec<RetryEntry>,
+    pub retrying: Vec<RetrySnapshot>,
+    pub counts: RuntimeSnapshotCounts,
     pub codex_totals: TokenTotals,
     pub seconds_running: f64,
     pub rate_limits: Option<serde_json::Value>,
@@ -142,9 +161,26 @@ pub struct RunningSnapshot {
     pub issue_id: String,
     pub issue_identifier: String,
     pub state: String,
+    pub workspace_key: String,
+    pub retry_attempt: Option<u32>,
+    pub cancel_requested: bool,
     pub session_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
+    pub last_event: Option<String>,
+    pub last_message: Option<String>,
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub tokens: TokenTotals,
     pub started_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum IssueSnapshot {
+    Running(RunningSnapshot),
+    Retrying(RetrySnapshot),
+    NotFound,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

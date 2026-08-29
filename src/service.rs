@@ -12,15 +12,17 @@ use tracing::{info, warn};
 
 use crate::agent::codex::CodexAppServerClient;
 use crate::agent::runner::{AgentRunner, SymphonyAgentRunner, WorkerOutcome};
-use crate::config::{ConfigReloader, ConfigSetReloader, EffectiveConfig};
+use crate::config::{
+    ConfigReloader, ConfigSetReloader, EffectiveConfig, config_reload_error_class,
+};
 use crate::domain::{CodexEvent, Issue, WorkerExitReason};
 use crate::error::Result;
 use crate::observability::http::{SharedStatus, spawn_http_server};
 use crate::orchestrator::state::{ReconcileDecision, source_issue_key};
 use crate::orchestrator::{OrchestratorState, is_dispatch_eligible_for_source};
 use crate::time::{ms_from_now, now_utc, system_monotonic_ms};
-use crate::tracker::TrackerClient;
 use crate::tracker::github::GitHubTrackerClient;
+use crate::tracker::{TrackerClient, TrackerWriter};
 use crate::workspace::WorkspaceManager;
 
 struct WorkerEvent {
@@ -143,9 +145,27 @@ pub async fn run_multi_source_service_until_shutdown(
     tokio::pin!(shutdown);
 
     let result = loop {
-        for (source_id, result) in reloaders.reload_if_changed() {
-            if let Err(error) = result {
-                warn!(source_id = %source_id, error = %error, "workflow_reload_failed keeping_last_good=true");
+        for (source_id, workflow_path, result) in reloaders.reload_if_changed() {
+            let workflow_path = workflow_path.display().to_string();
+            match result {
+                Ok(true) => {
+                    info!(
+                        source_id = %source_id,
+                        workflow_path = %workflow_path,
+                        last_known_good_active = true,
+                        "workflow_reload_succeeded"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        source_id = %source_id,
+                        workflow_path = %workflow_path,
+                        error_class = config_reload_error_class(&error),
+                        last_known_good_active = true,
+                        "workflow_reload_failed"
+                    );
+                }
             }
         }
         tick(
@@ -547,8 +567,12 @@ async fn dispatch_issue(
         }
     };
     let generation = workers.allocate_generation();
+    let writer = config.completion.direct_commit.enabled.then(|| {
+        let writer: Arc<dyn TrackerWriter> = tracker.clone();
+        writer
+    });
     let codex = Arc::new(CodexAppServerClient::new(config.codex.clone()));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker, codex);
+    let runner = SymphonyAgentRunner::new(config, workspace, tracker, writer, codex);
     let worker_issue_key = issue_key.clone();
     let handle = tokio::spawn(async move {
         let event_issue_key = worker_issue_key.clone();

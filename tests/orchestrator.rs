@@ -8,7 +8,9 @@ use symphony::config::{
     GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig, ServerConfig,
     SourceConfig, TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
 };
-use symphony::domain::{BlockerRef, CodexEvent, Issue, TokenTotals, WorkerExitReason};
+use symphony::domain::{
+    BlockerRef, CodexEvent, Issue, IssueSnapshot, TokenTotals, WorkerExitReason,
+};
 use symphony::orchestrator::retry::{
     continuation_retry_due_at_ms, failure_retry_delay_ms, retry_is_due,
 };
@@ -566,7 +568,7 @@ fn snapshot_contains_running_retry_token_rate_limit_and_elapsed_fields() {
     let config = config(1, []);
     let mut state = OrchestratorState::default();
     let running_issue = issue("id", "S-001", "In Progress");
-    state.claim_running(running_issue.clone(), None, ts(1_000));
+    state.claim_running(running_issue.clone(), Some(2), ts(1_000));
     state.apply_codex_event(CodexEvent {
         issue_id: running_issue.id.clone(),
         event: "turn_started".to_string(),
@@ -574,8 +576,8 @@ fn snapshot_contains_running_retry_token_rate_limit_and_elapsed_fields() {
         session_id: Some("session".to_string()),
         thread_id: Some("thread".to_string()),
         turn_id: Some("turn".to_string()),
-        codex_app_server_pid: None,
-        message: None,
+        codex_app_server_pid: Some(42),
+        message: Some("working".to_string()),
         absolute_token_totals: Some(TokenTotals {
             input_tokens: 1,
             output_tokens: 2,
@@ -585,7 +587,7 @@ fn snapshot_contains_running_retry_token_rate_limit_and_elapsed_fields() {
     });
     let other = issue("other", "S-002", "In Progress");
     state.claim_running(other.clone(), None, ts(0));
-    state
+    let retry = state
         .worker_exit(
             &other.id,
             WorkerExitReason::TimedOut("timeout".to_string()),
@@ -595,16 +597,39 @@ fn snapshot_contains_running_retry_token_rate_limit_and_elapsed_fields() {
         )
         .unwrap();
 
-    let snapshot = state.snapshot(ts(3_500));
+    let snapshot = state.snapshot_at(ts(3_500), retry.due_at_ms.saturating_sub(250));
 
+    assert_eq!(snapshot.counts.running, 1);
+    assert_eq!(snapshot.counts.retrying, 1);
     assert_eq!(snapshot.running.len(), 1);
-    assert_eq!(snapshot.running[0].issue_id, "id");
-    assert_eq!(snapshot.running[0].issue_identifier, "S-001");
-    assert_eq!(snapshot.running[0].state, "In Progress");
-    assert_eq!(snapshot.running[0].session_id.as_deref(), Some("session"));
-    assert_eq!(snapshot.running[0].turn_count, 1);
+    let running = &snapshot.running[0];
+    assert_eq!(running.issue_id, "id");
+    assert_eq!(running.issue_identifier, "S-001");
+    assert_eq!(running.state, "In Progress");
+    assert_eq!(running.workspace_key, "S-001");
+    assert_eq!(running.retry_attempt, Some(2));
+    assert!(!running.cancel_requested);
+    assert_eq!(running.session_id.as_deref(), Some("session"));
+    assert_eq!(running.thread_id.as_deref(), Some("thread"));
+    assert_eq!(running.turn_id.as_deref(), Some("turn"));
+    assert_eq!(running.codex_app_server_pid, Some(42));
+    assert_eq!(running.turn_count, 1);
+    assert_eq!(running.last_event.as_deref(), Some("turn_started"));
+    assert_eq!(running.last_message.as_deref(), Some("working"));
+    assert_eq!(running.last_event_at, Some(ts(1_100)));
+    assert_eq!(
+        running.tokens,
+        TokenTotals {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3
+        }
+    );
     assert_eq!(snapshot.retrying.len(), 1);
     assert_eq!(snapshot.retrying[0].issue_id, "other");
+    assert_eq!(snapshot.retrying[0].attempt, 1);
+    assert_eq!(snapshot.retrying[0].error.as_deref(), Some("timeout"));
+    assert_eq!(snapshot.retrying[0].remaining_delay_ms, 250);
     assert_eq!(
         snapshot.codex_totals,
         TokenTotals {
@@ -615,6 +640,19 @@ fn snapshot_contains_running_retry_token_rate_limit_and_elapsed_fields() {
     );
     assert_eq!(snapshot.rate_limits, Some(json!({"reset": 123})));
     assert_eq!(snapshot.seconds_running, 4.5);
+
+    assert!(matches!(
+        state.issue_snapshot("S-001", retry.due_at_ms),
+        IssueSnapshot::Running(_)
+    ));
+    assert!(matches!(
+        state.issue_snapshot("S-002", retry.due_at_ms.saturating_sub(250)),
+        IssueSnapshot::Retrying(_)
+    ));
+    assert_eq!(
+        state.issue_snapshot("S-999", retry.due_at_ms),
+        IssueSnapshot::NotFound
+    );
 }
 
 #[test]

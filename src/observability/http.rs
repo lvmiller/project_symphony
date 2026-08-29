@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, mpsc};
@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::config::{EffectiveConfig, GithubProjectOwnerType, GithubRepositoryConfig};
-use crate::domain::{RuntimeSnapshot, TokenTotals};
+use crate::domain::{RetrySnapshot, RunningSnapshot, RuntimeSnapshot, TokenTotals};
 use crate::error::{Result, SymphonyError};
 use crate::orchestrator::OrchestratorState;
 use crate::time::{now_utc, system_monotonic_ms};
@@ -84,12 +84,15 @@ pub struct AttemptDetail {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunningDetail {
     pub session_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
     pub state: String,
     pub started_at: DateTime<Utc>,
     pub last_event: String,
     pub last_message: String,
-    pub last_event_at: DateTime<Utc>,
+    pub last_event_at: Option<DateTime<Utc>>,
     pub tokens: TokenTotals,
 }
 
@@ -100,8 +103,7 @@ pub struct RetryDetail {
     pub issue_identifier: String,
     pub workspace_key: String,
     pub attempt: u32,
-    pub due_at: DateTime<Utc>,
-    pub due_at_ms: u64,
+    pub remaining_delay_ms: u64,
     pub error: String,
 }
 
@@ -152,13 +154,19 @@ pub struct StateRunningDetail {
     pub source_id: String,
     pub issue_id: String,
     pub issue_identifier: String,
+    pub workspace_key: String,
     pub state: String,
     pub session_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
+    pub retry_attempt: Option<u32>,
+    pub cancel_requested: bool,
     pub last_event: String,
     pub last_message: String,
     pub started_at: DateTime<Utc>,
-    pub last_event_at: DateTime<Utc>,
+    pub last_event_at: Option<DateTime<Utc>>,
     pub tokens: TokenTotals,
 }
 
@@ -235,9 +243,10 @@ impl SharedStatus {
 
     pub async fn publish(&self, state: &OrchestratorState, configs: &[EffectiveConfig]) {
         let generated_at = now_utc();
-        let snapshot = state.snapshot(generated_at);
+        let observed_monotonic_ms = system_monotonic_ms();
+        let snapshot = state.snapshot_at(generated_at, observed_monotonic_ms);
         let sources = source_summaries(configs);
-        let issues = issue_details(state, configs);
+        let issues = issue_details(&snapshot, configs);
         let mut document = self.inner.write().await;
         *document = StatusDocument {
             generated_at,
@@ -325,9 +334,15 @@ async fn state_api(State(state): State<AppState>) -> Json<StateResponse> {
                 source_id: issue.source_id.clone(),
                 issue_id: issue.issue_id.clone(),
                 issue_identifier: issue.issue_identifier.clone(),
+                workspace_key: issue.workspace.key.clone(),
                 state: running.state.clone(),
                 session_id: running.session_id.clone(),
+                thread_id: running.thread_id.clone(),
+                turn_id: running.turn_id.clone(),
+                codex_app_server_pid: running.codex_app_server_pid,
                 turn_count: running.turn_count,
+                retry_attempt: issue.attempts.current_retry_attempt,
+                cancel_requested: issue.status == "cancel_requested",
                 last_event: running.last_event.clone(),
                 last_message: running.last_message.clone(),
                 started_at: running.started_at,
@@ -344,8 +359,8 @@ async fn state_api(State(state): State<AppState>) -> Json<StateResponse> {
     Json(StateResponse {
         generated_at: document.generated_at,
         counts: StateResponseCounts {
-            running: document.state.running.len(),
-            retrying: document.state.retrying.len(),
+            running: document.state.counts.running,
+            retrying: document.state.counts.retrying,
             sources: document.sources.len(),
         },
         running,
@@ -465,118 +480,98 @@ fn source_summaries(configs: &[EffectiveConfig]) -> Vec<SourceSummary> {
         .collect()
 }
 
-fn issue_details(state: &OrchestratorState, configs: &[EffectiveConfig]) -> Vec<IssueDetail> {
-    let mut issues = Vec::with_capacity(state.running.len() + state.retry_attempts.len());
-    let observed_at = now_utc();
-    let observed_monotonic_ms = system_monotonic_ms();
-    for entry in state.running.values() {
-        let workspace = WorkspaceDetail {
-            path: workspace_path(configs, &entry.source_id, &entry.workspace_key),
-            key: entry.workspace_key.clone(),
-        };
-        let (running, recent_events) = match &entry.live_session {
-            Some(session) => {
-                let last_event_at = session.last_codex_timestamp.unwrap_or(entry.started_at);
-                let recent_events = session
-                    .last_codex_event
-                    .as_ref()
-                    .map(|event| RecentEvent {
-                        at: last_event_at,
-                        event: event.clone(),
-                        message: session.last_codex_message.clone(),
-                    })
-                    .into_iter()
-                    .collect();
-                (
-                    RunningDetail {
-                        session_id: Some(session.session_id.clone()),
-                        turn_count: session.turn_count,
-                        state: entry.issue.state.clone(),
-                        started_at: entry.started_at,
-                        last_event: session.last_codex_event.clone().unwrap_or_default(),
-                        last_message: session.last_codex_message.clone().unwrap_or_default(),
-                        last_event_at,
-                        tokens: session.codex_tokens.clone(),
-                    },
-                    recent_events,
-                )
-            }
-            None => (
-                RunningDetail {
-                    session_id: None,
-                    turn_count: 0,
-                    state: entry.issue.state.clone(),
-                    started_at: entry.started_at,
-                    last_event: String::new(),
-                    last_message: String::new(),
-                    last_event_at: entry.started_at,
-                    tokens: TokenTotals::default(),
-                },
-                Vec::new(),
-            ),
-        };
-        issues.push(IssueDetail {
-            source_id: entry.source_id.clone(),
-            issue_identifier: entry.identifier.clone(),
-            issue_id: entry.issue.id.clone(),
-            status: if entry.cancel_requested {
-                "cancel_requested".to_string()
-            } else {
-                "running".to_string()
-            },
-            workspace,
-            attempts: AttemptDetail {
-                restart_count: entry.retry_attempt.unwrap_or(0),
-                current_retry_attempt: entry.retry_attempt,
-            },
-            running: Some(running),
-            retry: None,
-            logs: LogsDetail::default(),
-            recent_events,
-            last_error: None,
-            tracked: serde_json::Value::Object(Default::default()),
-        });
+fn issue_details(snapshot: &RuntimeSnapshot, configs: &[EffectiveConfig]) -> Vec<IssueDetail> {
+    let mut issues = Vec::with_capacity(snapshot.counts.running + snapshot.counts.retrying);
+    for running in &snapshot.running {
+        issues.push(running_issue_detail(running, configs));
     }
-    for retry in state.retry_attempts.values() {
-        issues.push(IssueDetail {
-            source_id: retry.source_id.clone(),
-            issue_identifier: retry.identifier.clone(),
-            issue_id: retry.issue_id.clone(),
-            status: "retrying".to_string(),
-            workspace: WorkspaceDetail {
-                path: workspace_path(configs, &retry.source_id, &retry.workspace_key),
-                key: retry.workspace_key.clone(),
-            },
-            attempts: AttemptDetail {
-                restart_count: retry.attempt,
-                current_retry_attempt: Some(retry.attempt),
-            },
-            running: None,
-            retry: Some(retry_detail(retry, observed_at, observed_monotonic_ms)),
-            logs: LogsDetail::default(),
-            recent_events: Vec::new(),
-            last_error: retry.error.clone(),
-            tracked: serde_json::Value::Object(Default::default()),
-        });
+    for retry in &snapshot.retrying {
+        issues.push(retrying_issue_detail(retry, configs));
     }
     issues
 }
 
-fn retry_detail(
-    retry: &crate::domain::RetryEntry,
-    observed_at: DateTime<Utc>,
-    observed_monotonic_ms: u64,
-) -> RetryDetail {
-    let remaining_ms = retry.due_at_ms.saturating_sub(observed_monotonic_ms);
-    let duration = Duration::milliseconds(remaining_ms.min(i64::MAX as u64) as i64);
+fn running_issue_detail(running: &RunningSnapshot, configs: &[EffectiveConfig]) -> IssueDetail {
+    let recent_events = running
+        .last_event
+        .as_ref()
+        .zip(running.last_event_at)
+        .map(|(event, at)| RecentEvent {
+            at,
+            event: event.clone(),
+            message: running.last_message.clone(),
+        })
+        .into_iter()
+        .collect();
+    IssueDetail {
+        source_id: running.source_id.clone(),
+        issue_identifier: running.issue_identifier.clone(),
+        issue_id: running.issue_id.clone(),
+        status: if running.cancel_requested {
+            "cancel_requested".to_string()
+        } else {
+            "running".to_string()
+        },
+        workspace: WorkspaceDetail {
+            path: workspace_path(configs, &running.source_id, &running.workspace_key),
+            key: running.workspace_key.clone(),
+        },
+        attempts: AttemptDetail {
+            restart_count: running.retry_attempt.unwrap_or(0),
+            current_retry_attempt: running.retry_attempt,
+        },
+        running: Some(RunningDetail {
+            session_id: running.session_id.clone(),
+            thread_id: running.thread_id.clone(),
+            turn_id: running.turn_id.clone(),
+            codex_app_server_pid: running.codex_app_server_pid,
+            turn_count: running.turn_count,
+            state: running.state.clone(),
+            started_at: running.started_at,
+            last_event: running.last_event.clone().unwrap_or_default(),
+            last_message: running.last_message.clone().unwrap_or_default(),
+            last_event_at: running.last_event_at,
+            tokens: running.tokens.clone(),
+        }),
+        retry: None,
+        logs: LogsDetail::default(),
+        recent_events,
+        last_error: None,
+        tracked: serde_json::Value::Object(Default::default()),
+    }
+}
+
+fn retrying_issue_detail(retry: &RetrySnapshot, configs: &[EffectiveConfig]) -> IssueDetail {
+    IssueDetail {
+        source_id: retry.source_id.clone(),
+        issue_identifier: retry.issue_identifier.clone(),
+        issue_id: retry.issue_id.clone(),
+        status: "retrying".to_string(),
+        workspace: WorkspaceDetail {
+            path: workspace_path(configs, &retry.source_id, &retry.workspace_key),
+            key: retry.workspace_key.clone(),
+        },
+        attempts: AttemptDetail {
+            restart_count: retry.attempt,
+            current_retry_attempt: Some(retry.attempt),
+        },
+        running: None,
+        retry: Some(retry_detail(retry)),
+        logs: LogsDetail::default(),
+        recent_events: Vec::new(),
+        last_error: retry.error.clone(),
+        tracked: serde_json::Value::Object(Default::default()),
+    }
+}
+
+fn retry_detail(retry: &RetrySnapshot) -> RetryDetail {
     RetryDetail {
         source_id: retry.source_id.clone(),
         issue_id: retry.issue_id.clone(),
-        issue_identifier: retry.identifier.clone(),
+        issue_identifier: retry.issue_identifier.clone(),
         workspace_key: retry.workspace_key.clone(),
         attempt: retry.attempt,
-        due_at: observed_at + duration,
-        due_at_ms: retry.due_at_ms,
+        remaining_delay_ms: retry.remaining_delay_ms,
         error: retry.error.clone().unwrap_or_default(),
     }
 }

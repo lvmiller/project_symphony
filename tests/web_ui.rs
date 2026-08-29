@@ -14,7 +14,7 @@ use symphony::time::ms_from_now;
 use tokio::sync::mpsc;
 
 fn workflow() -> &'static str {
-    "---\ntracker:\n  kind: github\n  api_key: super-secret\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\n---\nPrompt\n"
+    "---\ntracker:\n  kind: github\n  api_key: super-secret\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nhooks:\n  after_create: echo hook-secret\n---\nprompt-secret\n"
 }
 
 fn write_workflow(dir: &Path) -> PathBuf {
@@ -143,6 +143,12 @@ async fn state_api_exposes_complete_baseline_schema_and_omits_secrets() {
     assert_eq!(json["running"][0]["issue_identifier"], "MT-649");
     assert_eq!(json["running"][0]["state"], "In Progress");
     assert_eq!(json["running"][0]["session_id"], "thread-1-turn-1");
+    assert_eq!(json["running"][0]["thread_id"], "thread-1");
+    assert_eq!(json["running"][0]["turn_id"], "turn-1");
+    assert_eq!(json["running"][0]["codex_app_server_pid"], 42);
+    assert_eq!(json["running"][0]["workspace_key"], "MT-649");
+    assert_eq!(json["running"][0]["retry_attempt"], 2);
+    assert_eq!(json["running"][0]["cancel_requested"], false);
     assert_eq!(json["running"][0]["turn_count"], 0);
     assert_eq!(json["running"][0]["last_event"], "notification");
     assert_eq!(json["running"][0]["last_message"], "Working on tests");
@@ -154,8 +160,7 @@ async fn state_api_exposes_complete_baseline_schema_and_omits_secrets() {
     );
     assert_eq!(json["retrying"][0]["issue_identifier"], "MT-650");
     assert_eq!(json["retrying"][0]["attempt"], 3);
-    assert!(json["retrying"][0]["due_at"].is_string());
-    assert!(json["retrying"][0]["due_at_ms"].is_u64());
+    assert!(json["retrying"][0]["remaining_delay_ms"].is_u64());
     assert_eq!(
         json["retrying"][0]["error"],
         "no available orchestrator slots"
@@ -168,14 +173,18 @@ async fn state_api_exposes_complete_baseline_schema_and_omits_secrets() {
         "live runtime must be added to completed runtime"
     );
     assert_eq!(json["rate_limits"], json!({"remaining": 12}));
-    assert!(!text.contains("super-secret"));
+    for excluded in ["super-secret", "prompt-secret", "hook-secret"] {
+        assert!(!text.contains(excluded));
+    }
     let source_text = reqwest::get(format!("{base}/api/v1/sources"))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
-    assert!(!source_text.contains("super-secret"));
+    for excluded in ["super-secret", "prompt-secret", "hook-secret"] {
+        assert!(!source_text.contains(excluded));
+    }
     server.task.abort();
 }
 
@@ -202,6 +211,9 @@ async fn issue_detail_exposes_complete_baseline_schema() {
         json!({"restart_count": 2, "current_retry_attempt": 2})
     );
     assert_eq!(detail["running"]["session_id"], "thread-1-turn-1");
+    assert_eq!(detail["running"]["thread_id"], "thread-1");
+    assert_eq!(detail["running"]["turn_id"], "turn-1");
+    assert_eq!(detail["running"]["codex_app_server_pid"], 42);
     assert_eq!(detail["running"]["state"], "In Progress");
     assert_eq!(detail["running"]["last_event"], "notification");
     assert_eq!(detail["running"]["last_message"], "Working on tests");
@@ -228,7 +240,7 @@ async fn issue_detail_exposes_complete_baseline_schema() {
     assert!(retry["running"].is_null());
     assert_eq!(retry["attempts"]["restart_count"], 3);
     assert_eq!(retry["retry"]["issue_identifier"], "MT-650");
-    assert!(retry["retry"]["due_at"].is_string());
+    assert!(retry["retry"]["remaining_delay_ms"].is_u64());
     assert_eq!(retry["retry"]["error"], "no available orchestrator slots");
     server.task.abort();
 }

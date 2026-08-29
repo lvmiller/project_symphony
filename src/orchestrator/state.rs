@@ -5,13 +5,13 @@ use serde_json::Value;
 
 use crate::config::{DEFAULT_SOURCE_ID, EffectiveConfig, normalize_state};
 use crate::domain::{
-    CodexEvent, Issue, LiveSession, RetryEntry, RunningSnapshot, RuntimeSnapshot, StateCounts,
-    TokenTotals, WorkerExitReason,
+    CodexEvent, Issue, IssueSnapshot, LiveSession, RetryEntry, RetrySnapshot, RunningSnapshot,
+    RuntimeSnapshot, RuntimeSnapshotCounts, StateCounts, TokenTotals, WorkerExitReason,
 };
 use crate::orchestrator::retry::{
     continuation_retry_due_at_ms, failure_retry_delay_ms, failure_retry_due_at_ms,
 };
-use crate::time::{ms_from_now, utc_elapsed_ms};
+use crate::time::{ms_from_now, system_monotonic_ms, utc_elapsed_ms};
 use crate::workspace::sanitize_workspace_key;
 
 #[derive(Clone, Debug)]
@@ -358,26 +358,20 @@ impl OrchestratorState {
     }
 
     pub fn snapshot(&self, now: DateTime<Utc>) -> RuntimeSnapshot {
+        self.snapshot_at(now, system_monotonic_ms())
+    }
+
+    pub fn snapshot_at(&self, now: DateTime<Utc>, observed_monotonic_ms: u64) -> RuntimeSnapshot {
         let running = self
             .running
             .values()
-            .map(|entry| RunningSnapshot {
-                source_id: entry.source_id.clone(),
-                issue_id: entry.issue.id.clone(),
-                issue_identifier: entry.identifier.clone(),
-                state: entry.issue.state.clone(),
-                session_id: entry
-                    .live_session
-                    .as_ref()
-                    .map(|session| session.session_id.clone()),
-                turn_count: entry
-                    .live_session
-                    .as_ref()
-                    .map(|session| session.turn_count)
-                    .unwrap_or(0),
-                started_at: entry.started_at,
-            })
-            .collect();
+            .map(Self::running_snapshot)
+            .collect::<Vec<_>>();
+        let retrying = self
+            .retry_attempts
+            .values()
+            .map(|retry| Self::retry_snapshot(retry, observed_monotonic_ms))
+            .collect::<Vec<_>>();
         let active_seconds = self
             .running
             .values()
@@ -389,11 +383,73 @@ impl OrchestratorState {
             })
             .sum::<f64>();
         RuntimeSnapshot {
+            counts: RuntimeSnapshotCounts {
+                running: running.len(),
+                retrying: retrying.len(),
+            },
             running,
-            retrying: self.retry_attempts.values().cloned().collect(),
+            retrying,
             codex_totals: self.codex_totals.clone(),
             seconds_running: self.ended_runtime_seconds + active_seconds,
             rate_limits: self.codex_rate_limits.clone(),
+        }
+    }
+
+    pub fn issue_snapshot(
+        &self,
+        issue_identifier: &str,
+        observed_monotonic_ms: u64,
+    ) -> IssueSnapshot {
+        if let Some(entry) = self
+            .running
+            .values()
+            .find(|entry| entry.identifier == issue_identifier)
+        {
+            return IssueSnapshot::Running(Self::running_snapshot(entry));
+        }
+        self.retry_attempts
+            .values()
+            .find(|retry| retry.identifier == issue_identifier)
+            .map(|retry| {
+                IssueSnapshot::Retrying(Self::retry_snapshot(retry, observed_monotonic_ms))
+            })
+            .unwrap_or(IssueSnapshot::NotFound)
+    }
+
+    fn running_snapshot(entry: &RunningEntry) -> RunningSnapshot {
+        let session = entry.live_session.as_ref();
+        RunningSnapshot {
+            source_id: entry.source_id.clone(),
+            issue_id: entry.issue.id.clone(),
+            issue_identifier: entry.identifier.clone(),
+            state: entry.issue.state.clone(),
+            workspace_key: entry.workspace_key.clone(),
+            retry_attempt: entry.retry_attempt,
+            cancel_requested: entry.cancel_requested,
+            session_id: session.map(|session| session.session_id.clone()),
+            thread_id: session.map(|session| session.thread_id.clone()),
+            turn_id: session.map(|session| session.turn_id.clone()),
+            codex_app_server_pid: session.and_then(|session| session.codex_app_server_pid),
+            turn_count: session.map(|session| session.turn_count).unwrap_or(0),
+            last_event: session.and_then(|session| session.last_codex_event.clone()),
+            last_message: session.and_then(|session| session.last_codex_message.clone()),
+            last_event_at: session.and_then(|session| session.last_codex_timestamp),
+            tokens: session
+                .map(|session| session.codex_tokens.clone())
+                .unwrap_or_default(),
+            started_at: entry.started_at,
+        }
+    }
+
+    fn retry_snapshot(retry: &RetryEntry, observed_monotonic_ms: u64) -> RetrySnapshot {
+        RetrySnapshot {
+            source_id: retry.source_id.clone(),
+            issue_id: retry.issue_id.clone(),
+            issue_identifier: retry.identifier.clone(),
+            workspace_key: retry.workspace_key.clone(),
+            attempt: retry.attempt,
+            error: retry.error.clone(),
+            remaining_delay_ms: retry.due_at_ms.saturating_sub(observed_monotonic_ms),
         }
     }
 
