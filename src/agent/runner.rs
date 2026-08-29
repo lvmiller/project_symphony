@@ -5,12 +5,12 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use crate::agent::codex::CodexClient;
-use crate::completion::GitHubCompletionClient;
+use crate::completion::DirectCommitCompletion;
 use crate::config::EffectiveConfig;
 use crate::domain::{CodexEvent, Issue, WorkerExitReason};
 use crate::error::Result;
 use crate::prompt::{PromptSourceContext, continuation_prompt, render_prompt_with_source};
-use crate::tracker::TrackerClient;
+use crate::tracker::{TrackerClient, TrackerWriter};
 use crate::workspace::WorkspaceManager;
 
 #[derive(Clone, Debug)]
@@ -37,6 +37,7 @@ pub struct SymphonyAgentRunner {
     config: EffectiveConfig,
     workspace: WorkspaceManager,
     tracker: Arc<dyn TrackerClient>,
+    writer: Option<Arc<dyn TrackerWriter>>,
     codex: Arc<dyn CodexClient>,
 }
 
@@ -45,12 +46,14 @@ impl SymphonyAgentRunner {
         config: EffectiveConfig,
         workspace: WorkspaceManager,
         tracker: Arc<dyn TrackerClient>,
+        writer: Option<Arc<dyn TrackerWriter>>,
         codex: Arc<dyn CodexClient>,
     ) -> Self {
         Self {
             config,
             workspace,
             tracker,
+            writer,
             codex,
         }
     }
@@ -83,7 +86,11 @@ impl SymphonyAgentRunner {
         };
 
         self.workspace
-            .after_run_best_effort_for_source(&self.config.source.id, &workspace.path)
+            .after_run_best_effort_for_source_issue(
+                &self.config.source.id,
+                &working_issue,
+                &workspace.path,
+            )
             .await;
         if reason.is_normal() {
             match self
@@ -116,7 +123,8 @@ impl SymphonyAgentRunner {
     }
 
     async fn mark_started_if_configured(&self, issue: &mut Issue) -> Result<()> {
-        let Some(completion) = GitHubCompletionClient::new(&self.config)? else {
+        let Some(completion) = DirectCommitCompletion::new(&self.config, self.writer.clone())?
+        else {
             return Ok(());
         };
         if let Some(started_state) = completion.mark_issue_started(issue).await? {
@@ -130,7 +138,8 @@ impl SymphonyAgentRunner {
         issue: &Issue,
         workspace_path: &std::path::Path,
     ) -> Result<bool> {
-        let Some(completion) = GitHubCompletionClient::new(&self.config)? else {
+        let Some(completion) = DirectCommitCompletion::new(&self.config, self.writer.clone())?
+        else {
             return Ok(false);
         };
         let refreshed = self
@@ -187,7 +196,7 @@ impl SymphonyAgentRunner {
             "worker_starting"
         );
         self.workspace
-            .before_run_for_source(&self.config.source.id, workspace_path)
+            .before_run_for_source_issue(&self.config.source.id, issue, workspace_path)
             .await?;
 
         let source = PromptSourceContext::from_config(&self.config);

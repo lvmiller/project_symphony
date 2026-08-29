@@ -18,7 +18,7 @@ use symphony::config::{
 };
 use symphony::domain::{CodexEvent, Issue, WorkerExitReason};
 use symphony::error::{Result, SymphonyError};
-use symphony::tracker::TrackerClient;
+use symphony::tracker::{TrackerClient, TrackerWriter};
 use symphony::workspace::WorkspaceManager;
 use tempfile::TempDir;
 
@@ -37,7 +37,13 @@ async fn runner_uses_initial_prompt_then_continuation_and_refreshes_after_succes
         issue_with_state("ISS-1", "active"),
         issue_with_state("ISS-1", "active"),
     ]));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker.clone(), codex.clone());
+    let runner = SymphonyAgentRunner::new(
+        config,
+        workspace,
+        tracker.clone(),
+        Some(tracker.clone()),
+        codex.clone(),
+    );
 
     let outcome = runner.run(issue, Some(3), Box::new(|_| {})).await.unwrap();
 
@@ -78,7 +84,13 @@ async fn runner_marks_terminal_refresh_on_normal_exit_and_runs_lifecycle_hooks()
     let workspace = WorkspaceManager::new(&config.workspace, hooks).unwrap();
     let codex = Arc::new(FakeCodex::default());
     let tracker = Arc::new(FakeTracker::new(vec![issue_with_state("ISS-2", "done")]));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker, codex.clone());
+    let runner = SymphonyAgentRunner::new(
+        config,
+        workspace,
+        tracker.clone(),
+        Some(tracker),
+        codex.clone(),
+    );
 
     let outcome = runner.run(issue, None, Box::new(|_| {})).await.unwrap();
 
@@ -118,7 +130,13 @@ async fn runner_treats_direct_completion_without_changes_as_normal_skip() {
         .unwrap();
     let codex = Arc::new(FakeCodex::default());
     let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker.clone(), codex.clone());
+    let runner = SymphonyAgentRunner::new(
+        config,
+        workspace,
+        tracker.clone(),
+        Some(tracker.clone()),
+        codex.clone(),
+    );
 
     let outcome = runner.run(issue, None, Box::new(|_| {})).await.unwrap();
 
@@ -170,7 +188,7 @@ async fn runner_removes_workspace_after_successful_direct_commit_completion() {
     init_workspace_repo(&prepared.path, &remote, "initial\n");
     let codex = Arc::new(FakeCodex::writing("README.md", "initial\nchanged\n"));
     let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker, codex);
+    let runner = SymphonyAgentRunner::new(config, workspace, tracker.clone(), Some(tracker), codex);
 
     let outcome = runner
         .run(issue.clone(), None, Box::new(|_| {}))
@@ -184,7 +202,10 @@ async fn runner_removes_workspace_after_successful_direct_commit_completion() {
         git_show(&remote, "refs/heads/main:README.md"),
         "initial\nchanged\n"
     );
-    assert_eq!(server.requests().len(), 2);
+    assert!(
+        server.requests().is_empty(),
+        "runner must use TrackerWriter, not a private GraphQL client"
+    );
 }
 
 #[tokio::test]
@@ -226,7 +247,7 @@ async fn runner_keeps_workspace_after_committed_completion_when_cleanup_policy_i
     init_workspace_repo(&prepared.path, &remote, "initial\n");
     let codex = Arc::new(FakeCodex::writing("README.md", "initial\nchanged\n"));
     let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker, codex);
+    let runner = SymphonyAgentRunner::new(config, workspace, tracker.clone(), Some(tracker), codex);
 
     let outcome = runner
         .run(issue.clone(), None, Box::new(|_| {}))
@@ -240,7 +261,10 @@ async fn runner_keeps_workspace_after_committed_completion_when_cleanup_policy_i
         git_show(&remote, "refs/heads/main:README.md"),
         "initial\nchanged\n"
     );
-    assert_eq!(server.requests().len(), 2);
+    assert!(
+        server.requests().is_empty(),
+        "runner must use TrackerWriter, not a private GraphQL client"
+    );
 }
 
 #[tokio::test]
@@ -258,7 +282,7 @@ async fn runner_converts_codex_failure_to_worker_outcome_and_runs_after_run() {
     let workspace = WorkspaceManager::new(&config.workspace, hooks).unwrap();
     let codex = Arc::new(FakeCodex::failing("boom"));
     let tracker = Arc::new(FakeTracker::new(Vec::new()));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker, codex);
+    let runner = SymphonyAgentRunner::new(config, workspace, tracker, None, codex);
 
     let outcome = runner.run(issue, None, Box::new(|_| {})).await.unwrap();
 
@@ -388,6 +412,13 @@ impl TrackerClient for FakeTracker {
     async fn fetch_issue_states_by_ids(&self, issue_ids: &[String]) -> Result<Vec<Issue>> {
         self.requested_ids.lock().unwrap().push(issue_ids.to_vec());
         Ok(self.states.lock().unwrap().pop().into_iter().collect())
+    }
+}
+
+#[async_trait]
+impl TrackerWriter for FakeTracker {
+    async fn move_issue_to_state(&self, _issue: &Issue, _target_state: &str) -> Result<()> {
+        Ok(())
     }
 }
 

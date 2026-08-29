@@ -1,93 +1,21 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use reqwest::StatusCode;
-use serde::Deserialize;
-use serde_json::{Value, json};
-use std::path::Path;
-use std::process::Stdio;
-use std::time::Duration;
+use base64::{
+    Engine as _,
+    engine::general_purpose::{
+        STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+    },
+};
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::{self, Stdio};
+use std::sync::{Arc, LazyLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use crate::config::{
-    DirectCommitCompletionConfig, EffectiveConfig, GithubConfig, GithubProjectOwnerType,
-};
+use crate::config::{DirectCommitCompletionConfig, EffectiveConfig};
 use crate::domain::Issue;
 use crate::error::{Result, SymphonyError};
-
-const PROJECT_STATUS_QUERY: &str = r#"
-query SymphonyCompletionProject(
-  $issueId: ID!
-  $projectOwnerLogin: String!
-  $projectNumber: Int!
-  $isOrganization: Boolean!
-  $isUser: Boolean!
-) {
-  organization(login: $projectOwnerLogin) @include(if: $isOrganization) {
-    projectV2(number: $projectNumber) {
-      id
-      fields(first: 100) {
-        nodes {
-          ... on ProjectV2SingleSelectField {
-            id
-            name
-            options { id name }
-          }
-        }
-      }
-    }
-  }
-  user(login: $projectOwnerLogin) @include(if: $isUser) {
-    projectV2(number: $projectNumber) {
-      id
-      fields(first: 100) {
-        nodes {
-          ... on ProjectV2SingleSelectField {
-            id
-            name
-            options { id name }
-          }
-        }
-      }
-    }
-  }
-  node(id: $issueId) {
-    ... on Issue {
-      projectItems(first: 100) {
-        nodes {
-          id
-          project {
-            id
-            number
-            owner {
-              __typename
-              ... on User { login }
-              ... on Organization { login }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"#;
-
-const UPDATE_PROJECT_STATUS_MUTATION: &str = r#"
-mutation SymphonyUpdateCompletionStatus(
-  $projectId: ID!
-  $itemId: ID!
-  $fieldId: ID!
-  $optionId: String!
-) {
-  updateProjectV2ItemFieldValue(input: {
-    projectId: $projectId,
-    itemId: $itemId,
-    fieldId: $fieldId,
-    value: { singleSelectOptionId: $optionId }
-  }) {
-    projectV2Item { id }
-  }
-}
-"#;
+use crate::tracker::TrackerWriter;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionPlan {
@@ -152,44 +80,36 @@ struct DryRunPlanInput {
     has_pending_local_commits: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct GitHubCompletionClient {
-    http: reqwest::Client,
-    graphql_endpoint: String,
-    token: String,
-    github: GithubConfig,
+pub struct DirectCommitCompletion {
     direct_commit: DirectCommitCompletionConfig,
+    token: String,
+    writer: Arc<dyn TrackerWriter>,
 }
 
-impl GitHubCompletionClient {
-    pub fn new(config: &EffectiveConfig) -> Result<Option<Self>> {
+impl DirectCommitCompletion {
+    pub fn new(
+        config: &EffectiveConfig,
+        writer: Option<Arc<dyn TrackerWriter>>,
+    ) -> Result<Option<Self>> {
         if !config.completion.direct_commit.enabled {
             return Ok(None);
         }
-        let github = config
-            .tracker
-            .github
-            .clone()
-            .ok_or(SymphonyError::MissingGithubConfig { field: "github" })?;
+        let writer = writer.ok_or_else(|| {
+            completion_error(
+                "completion_writer_unavailable",
+                "direct-commit completion requires a tracker writer",
+            )
+        })?;
         let token = config
             .tracker
             .api_key
             .clone()
+            .filter(|token| !token.is_empty())
             .ok_or(SymphonyError::MissingTrackerApiKey)?;
-        if token.is_empty() {
-            return Err(SymphonyError::MissingTrackerApiKey);
-        }
-        let http = reqwest::Client::builder()
-            .user_agent("symphony-rust-runtime")
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|err| completion_error("github_transport", err.to_string()))?;
         Ok(Some(Self {
-            http,
-            graphql_endpoint: config.tracker.endpoint.clone(),
-            token,
-            github,
             direct_commit: config.completion.direct_commit.clone(),
+            token,
+            writer,
         }))
     }
 
@@ -249,7 +169,7 @@ impl GitHubCompletionClient {
 
         let commit_sha = git_commit_sha(workspace).await?;
         git_push_base_branch(workspace, &self.direct_commit.base_branch, &self.token).await?;
-        if let Err(error) = self.move_issue_to_state(issue, &target_state).await {
+        if let Err(error) = self.writer.move_issue_to_state(issue, &target_state).await {
             let message = error.to_string();
             warn!(
                 issue_id = %issue.id,
@@ -368,7 +288,9 @@ impl GitHubCompletionClient {
         if issue.state.eq_ignore_ascii_case(started_state) {
             return Ok(None);
         }
-        self.move_issue_to_state(issue, started_state).await?;
+        self.writer
+            .move_issue_to_state(issue, started_state)
+            .await?;
         info!(
             issue_id = %issue.id,
             issue_identifier = %issue.identifier,
@@ -377,85 +299,6 @@ impl GitHubCompletionClient {
             "issue_marked_started"
         );
         Ok(Some(started_state.to_string()))
-    }
-
-    async fn move_issue_to_state(&self, issue: &Issue, target_state: &str) -> Result<()> {
-        let data = self
-            .graphql(
-                PROJECT_STATUS_QUERY,
-                json!({
-                    "issueId": issue.id,
-                    "projectOwnerLogin": self.github.project_owner_login,
-                    "projectNumber": self.github.project_number,
-                    "isOrganization": matches!(self.github.project_owner_type, GithubProjectOwnerType::Organization),
-                    "isUser": matches!(self.github.project_owner_type, GithubProjectOwnerType::User),
-                }),
-            )
-            .await?;
-        let owner = project_owner_data(&data, self.github.project_owner_type)?;
-        let project = owner
-            .get("projectV2")
-            .and_then(Value::as_object)
-            .ok_or_else(|| completion_error("github_malformed", "missing GitHub projectV2"))?;
-        let project_id = project
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| completion_error("github_malformed", "missing GitHub project id"))?;
-        let (field_id, option_id) = status_field_and_option(
-            project.get("fields"),
-            &self.github.status_field_name,
-            target_state,
-        )?;
-        let item_id = project_item_id(&data, project_id, &self.github)?;
-        self.graphql(
-            UPDATE_PROJECT_STATUS_MUTATION,
-            json!({
-                "projectId": project_id,
-                "itemId": item_id,
-                "fieldId": field_id,
-                "optionId": option_id,
-            }),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        let response = self
-            .http
-            .post(&self.graphql_endpoint)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .json(&json!({ "query": query, "variables": variables }))
-            .send()
-            .await
-            .map_err(|err| completion_error("github_transport", err.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|err| completion_error("github_transport", err.to_string()))?;
-        if status != StatusCode::OK {
-            return Err(completion_error(
-                "github_status",
-                format!("GitHub GraphQL HTTP status {}", status.as_u16()),
-            ));
-        }
-        let envelope: GraphqlEnvelope = serde_json::from_str(&body)
-            .map_err(|err| completion_error("github_malformed", err.to_string()))?;
-        if let Some(errors) = envelope.errors
-            && !errors.is_empty()
-        {
-            let message = errors
-                .iter()
-                .filter_map(|error| error.message.as_deref())
-                .next()
-                .unwrap_or("GitHub GraphQL error");
-            return Err(completion_error("github_graphql", message));
-        }
-        envelope
-            .data
-            .ok_or_else(|| completion_error("github_malformed", "missing GraphQL data"))
     }
 }
 
@@ -494,17 +337,6 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct GraphqlEnvelope {
-    data: Option<Value>,
-    errors: Option<Vec<GraphqlError>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphqlError {
-    message: Option<String>,
-}
-
 async fn git_worktree_changes(workspace: &Path) -> Result<Vec<String>> {
     let output = git_output(workspace, &["status", "--porcelain=v1"], None).await?;
     Ok(output.lines().map(str::to_owned).collect())
@@ -523,11 +355,13 @@ async fn git_status_has_unpushed_commits(workspace: &Path) -> Result<bool> {
 }
 
 async fn git_fetch_base_branch(workspace: &Path, base_branch: &str, token: &str) -> Result<()> {
-    let auth_header = github_git_authorization_header(token);
+    let remote_url = git_remote_url(workspace).await?;
+    let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
+    let authorization = GitAuthorization::new(token);
     git_output(
         workspace,
-        &["fetch", "origin", base_branch],
-        Some(auth_header.as_str()),
+        &["fetch", remote_url.as_str(), refspec.as_str()],
+        Some(&authorization),
     )
     .await
     .map(|_| ())
@@ -541,6 +375,12 @@ async fn git_has_unpushed_commits(workspace: &Path, base_branch: &str) -> Result
         .parse::<u64>()
         .map_err(|err| completion_error("git_output", err.to_string()))?;
     Ok(count > 0)
+}
+
+async fn git_remote_url(workspace: &Path) -> Result<String> {
+    git_output(workspace, &["remote", "get-url", "origin"], None)
+        .await
+        .map(|url| url.trim().to_string())
 }
 
 async fn git_rebase_required(workspace: &Path, base_branch: &str) -> Result<bool> {
@@ -560,7 +400,7 @@ async fn git_rebase_onto_base_branch(
     config: &DirectCommitCompletionConfig,
 ) -> Result<()> {
     let upstream = format!("origin/{base_branch}");
-    let error = match git_rebase(workspace, &upstream).await {
+    let error = match git_rebase(workspace, &upstream, config).await {
         Ok(_) => return Ok(()),
         Err(error) => error,
     };
@@ -582,17 +422,35 @@ async fn git_rebase_onto_base_branch(
     if git_has_changes(workspace).await? {
         git_commit_all(workspace, issue, config).await?;
     }
-    git_rebase_or_abort(workspace, &upstream).await
+    git_rebase_or_abort(workspace, &upstream, config).await
 }
 
-async fn git_rebase(workspace: &Path, upstream: &str) -> Result<()> {
-    git_output(workspace, &["rebase", upstream], None)
-        .await
-        .map(|_| ())
+async fn git_rebase(
+    workspace: &Path,
+    upstream: &str,
+    config: &DirectCommitCompletionConfig,
+) -> Result<()> {
+    git_output_with_environment(
+        workspace,
+        &["rebase", upstream],
+        None,
+        &[
+            ("GIT_AUTHOR_NAME", config.commit_author_name.as_str()),
+            ("GIT_AUTHOR_EMAIL", config.commit_author_email.as_str()),
+            ("GIT_COMMITTER_NAME", config.commit_author_name.as_str()),
+            ("GIT_COMMITTER_EMAIL", config.commit_author_email.as_str()),
+        ],
+    )
+    .await
+    .map(|_| ())
 }
 
-async fn git_rebase_or_abort(workspace: &Path, upstream: &str) -> Result<()> {
-    match git_rebase(workspace, upstream).await {
+async fn git_rebase_or_abort(
+    workspace: &Path,
+    upstream: &str,
+    config: &DirectCommitCompletionConfig,
+) -> Result<()> {
+    match git_rebase(workspace, upstream, config).await {
         Ok(_) => Ok(()),
         Err(error) => {
             let _ = git_output(workspace, &["rebase", "--abort"], None).await;
@@ -679,160 +537,159 @@ async fn git_commit_sha(workspace: &Path) -> Result<String> {
 }
 
 async fn git_push_base_branch(workspace: &Path, base_branch: &str, token: &str) -> Result<()> {
+    let remote_url = git_remote_url(workspace).await?;
     let refspec = format!("HEAD:refs/heads/{base_branch}");
-    let auth_header = github_git_authorization_header(token);
+    let authorization = GitAuthorization::new(token);
     git_output(
         workspace,
-        &["push", "origin", &refspec],
-        Some(auth_header.as_str()),
+        &["push", remote_url.as_str(), refspec.as_str()],
+        Some(&authorization),
     )
     .await
     .map(|_| ())
 }
 
-fn github_git_authorization_header(token: &str) -> String {
-    let mut credentials = String::with_capacity("x-access-token:".len() + token.len());
-    credentials.push_str("x-access-token:");
-    credentials.push_str(token);
-
-    let encoded = BASE64_STANDARD.encode(credentials);
-    let mut header = String::with_capacity("AUTHORIZATION: basic ".len() + encoded.len());
-    header.push_str("AUTHORIZATION: basic ");
-    header.push_str(&encoded);
-    header
+struct GitAuthorization {
+    header: String,
+    redactions: Vec<String>,
 }
-async fn git_output(workspace: &Path, args: &[&str], auth_header: Option<&str>) -> Result<String> {
+
+impl GitAuthorization {
+    fn new(token: &str) -> Self {
+        let credentials = format!("x-access-token:{token}");
+        let encoded = BASE64_STANDARD.encode(&credentials);
+        let header = format!("AUTHORIZATION: basic {encoded}");
+        let encoded_header = BASE64_STANDARD.encode(&header);
+        let url_safe_encoded = BASE64_URL_SAFE_NO_PAD.encode(&credentials);
+        let url_encoded_header = percent_encode(&header);
+        Self {
+            header: header.clone(),
+            redactions: vec![
+                token.to_string(),
+                credentials,
+                header,
+                encoded,
+                url_safe_encoded,
+                encoded_header,
+                url_encoded_header,
+            ],
+        }
+    }
+
+    fn redact(&self, message: impl AsRef<str>) -> String {
+        let mut redacted = message.as_ref().to_string();
+        for secret in &self.redactions {
+            if !secret.is_empty() {
+                redacted = redacted.replace(secret, "[REDACTED]");
+            }
+        }
+        redacted
+    }
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn trusted_empty_hooks_dir() -> Result<&'static Path> {
+    static HOOKS_DIR: LazyLock<std::result::Result<PathBuf, String>> = LazyLock::new(|| {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        for attempt in 0..64 {
+            let path = env::temp_dir().join(format!(
+                "symphony-empty-git-hooks-{}-{nonce}-{attempt}",
+                process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("could not create a trusted empty Git hooks directory".to_string())
+    });
+    HOOKS_DIR
+        .as_deref()
+        .map_err(|message| completion_error("git_hooks_path", message))
+}
+
+async fn git_output(
+    workspace: &Path,
+    args: &[&str],
+    authorization: Option<&GitAuthorization>,
+) -> Result<String> {
+    git_output_with_environment(workspace, args, authorization, &[]).await
+}
+
+async fn git_output_with_environment(
+    workspace: &Path,
+    args: &[&str],
+    authorization: Option<&GitAuthorization>,
+    environment: &[(&str, &str)],
+) -> Result<String> {
+    let hooks_dir = authorization
+        .map(|_| trusted_empty_hooks_dir())
+        .transpose()?;
     let mut command = Command::new("git");
     command
+        .env_clear()
         .args(args)
         .current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0");
-    if let Some(header) = auth_header {
-        command
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-            .env("GIT_CONFIG_VALUE_0", header);
+    command.envs(environment.iter().copied());
+    if let Some(path) = env::var_os("PATH") {
+        command.env("PATH", path);
     }
-    let output = command
-        .output()
-        .await
-        .map_err(|err| SymphonyError::io(Some(workspace.to_path_buf()), err))?;
+    #[cfg(windows)]
+    for key in ["SystemRoot", "SYSTEMROOT", "ComSpec", "COMSPEC"] {
+        if let Some(value) = env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    if let (Some(authorization), Some(hooks_dir)) = (authorization, hooks_dir) {
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", hooks_dir)
+            .env("GIT_CONFIG_KEY_1", "http.https://github.com/.extraheader")
+            .env("GIT_CONFIG_VALUE_1", &authorization.header);
+    }
+    let output = command.output().await.map_err(|error| {
+        let message = authorization.map_or_else(
+            || error.to_string(),
+            |authorization| authorization.redact(error.to_string()),
+        );
+        completion_error("git_spawn", message)
+    })?;
     if output.status.success() {
         return String::from_utf8(output.stdout)
-            .map_err(|err| completion_error("git_output", err.to_string()));
+            .map_err(|error| completion_error("git_output", error.to_string()));
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = match authorization {
+        Some(authorization) => authorization.redact(&stderr),
+        None => stderr.into_owned(),
+    };
     Err(completion_error(
         "git_failed",
         format!("git {} failed: {stderr}", args.join(" ")),
     ))
-}
-
-fn project_owner_data(
-    data: &Value,
-    owner_type: GithubProjectOwnerType,
-) -> Result<&serde_json::Map<String, Value>> {
-    match owner_type {
-        GithubProjectOwnerType::Organization => data.get("organization"),
-        GithubProjectOwnerType::User => data.get("user"),
-    }
-    .and_then(Value::as_object)
-    .ok_or_else(|| completion_error("github_malformed", "missing GitHub project owner"))
-}
-
-fn status_field_and_option(
-    fields: Option<&Value>,
-    status_field_name: &str,
-    target_state: &str,
-) -> Result<(String, String)> {
-    let nodes = fields
-        .and_then(|fields| fields.get("nodes"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| completion_error("github_malformed", "missing GitHub project fields"))?;
-    for field in nodes {
-        let Some(field_name) = field.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        if !field_name.eq_ignore_ascii_case(status_field_name) {
-            continue;
-        }
-        let field_id = field
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| completion_error("github_malformed", "missing Status field id"))?;
-        let options = field
-            .get("options")
-            .and_then(Value::as_array)
-            .ok_or_else(|| completion_error("github_malformed", "missing Status field options"))?;
-        for option in options {
-            let Some(option_name) = option.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            if option_name.eq_ignore_ascii_case(target_state) {
-                let option_id = option.get("id").and_then(Value::as_str).ok_or_else(|| {
-                    completion_error("github_malformed", "missing target Status option id")
-                })?;
-                return Ok((field_id.to_string(), option_id.to_string()));
-            }
-        }
-        return Err(completion_error(
-            "github_malformed",
-            format!("missing target status option {target_state}"),
-        ));
-    }
-    Err(completion_error(
-        "github_malformed",
-        format!("missing Status field {status_field_name}"),
-    ))
-}
-
-fn project_item_id(data: &Value, project_id: &str, github: &GithubConfig) -> Result<String> {
-    let nodes = data
-        .get("node")
-        .and_then(|node| node.get("projectItems"))
-        .and_then(|items| items.get("nodes"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| completion_error("github_malformed", "missing issue project items"))?;
-    for item in nodes {
-        let Some(project) = item.get("project") else {
-            continue;
-        };
-        let id_matches = project.get("id").and_then(Value::as_str) == Some(project_id);
-        let owner_matches = project_owner_matches(project, github);
-        let number_matches =
-            project.get("number").and_then(Value::as_i64) == Some(github.project_number);
-        if id_matches || (owner_matches && number_matches) {
-            return item
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| completion_error("github_malformed", "missing project item id"));
-        }
-    }
-    Err(completion_error(
-        "github_malformed",
-        "issue is not in the configured Project v2",
-    ))
-}
-
-fn project_owner_matches(project: &Value, github: &GithubConfig) -> bool {
-    let Some(owner) = project.get("owner") else {
-        return false;
-    };
-    let login_matches =
-        owner.get("login").and_then(Value::as_str) == Some(github.project_owner_login.as_str());
-    let type_matches = match github.project_owner_type {
-        GithubProjectOwnerType::Organization => {
-            owner.get("__typename").and_then(Value::as_str) == Some("Organization")
-        }
-        GithubProjectOwnerType::User => {
-            owner.get("__typename").and_then(Value::as_str) == Some("User")
-        }
-    };
-    login_matches && type_matches
 }
 
 fn parse_severity_prefix(title: &str) -> Option<Severity> {
@@ -880,13 +737,24 @@ fn completion_error(kind: &'static str, message: impl Into<String>) -> SymphonyE
 
 #[cfg(test)]
 mod tests {
-    use super::github_git_authorization_header;
+    use super::GitAuthorization;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
     #[test]
-    fn github_git_authorization_header_uses_x_access_token_basic_auth() {
-        assert_eq!(
-            github_git_authorization_header("token-123"),
-            "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46dG9rZW4tMTIz"
+    fn authorization_redaction_removes_raw_and_encoded_forms() {
+        let authorization = GitAuthorization::new("token-123");
+        let failure = format!(
+            "token-123 {} {} {}",
+            authorization.header,
+            BASE64_STANDARD.encode(&authorization.header),
+            super::percent_encode(&authorization.header),
         );
+
+        let redacted = authorization.redact(failure);
+
+        assert!(!redacted.contains("token-123"));
+        assert!(!redacted.contains(&authorization.header));
+        assert!(!redacted.contains("eC1hY2Nlc3MtdG9rZW46dG9rZW4tMTIz"));
+        assert!(!redacted.contains(&super::percent_encode(&authorization.header)));
     }
 }
