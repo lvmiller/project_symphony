@@ -69,6 +69,38 @@ async fn runner_uses_initial_prompt_then_continuation_and_refreshes_after_succes
 }
 
 #[tokio::test]
+async fn runner_cancels_when_post_turn_refresh_omits_issue() {
+    let temp = TempDir::new().unwrap();
+    let issue = issue("ISS-MISSING", "active");
+    let config = config(temp.path(), 2, "{{ issue.identifier }}");
+    let workspace = WorkspaceManager::new(&config.workspace, HooksConfig::default()).unwrap();
+    let codex = Arc::new(FakeCodex::default());
+    let tracker = Arc::new(FakeTracker::new(Vec::new()));
+    let runner = SymphonyAgentRunner::new(
+        config,
+        workspace,
+        tracker.clone(),
+        Some(tracker.clone()),
+        codex.clone(),
+    );
+
+    let outcome = runner.run(issue, None, Box::new(|_| {})).await.unwrap();
+
+    assert_eq!(outcome.reason, WorkerExitReason::CanceledByReconciliation);
+    assert_eq!(outcome.terminal_state, None);
+    assert_eq!(
+        codex.prompts().len(),
+        1,
+        "missing refresh stops continuation"
+    );
+    assert_eq!(codex.session_counts(), (1, 1));
+    assert_eq!(
+        tracker.requested_ids(),
+        vec![vec!["ISS-MISSING".to_string()]]
+    );
+}
+
+#[tokio::test]
 async fn runner_marks_terminal_refresh_on_normal_exit_and_runs_lifecycle_hooks() {
     let temp = TempDir::new().unwrap();
     let events = temp.path().join("events");

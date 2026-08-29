@@ -289,25 +289,31 @@ impl SymphonyAgentRunner {
                     .tracker
                     .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
                     .await?;
-                if let Some(current) = refreshed.iter().find(|current| current.id == issue.id) {
-                    if self.config.is_terminal_state(&current.state) {
-                        info!(
-                            issue_id = %issue.id,
-                            issue_identifier = %issue.identifier,
-                            state = %current.state,
-                            "worker_issue_terminal"
-                        );
-                        return Ok((WorkerExitReason::Normal, Some(current.state.clone())));
-                    }
-                    if !self.config.is_active_state(&current.state) {
-                        warn!(
-                            issue_id = %issue.id,
-                            issue_identifier = %issue.identifier,
-                            state = %current.state,
-                            "worker_issue_no_longer_active"
-                        );
-                        return Ok((WorkerExitReason::CanceledByReconciliation, None));
-                    }
+                let Some(current) = refreshed.iter().find(|current| current.id == issue.id) else {
+                    warn!(
+                        issue_id = %issue.id,
+                        issue_identifier = %issue.identifier,
+                        "worker_issue_missing_from_tracker"
+                    );
+                    return Ok((WorkerExitReason::CanceledByReconciliation, None));
+                };
+                if self.config.is_terminal_state(&current.state) {
+                    info!(
+                        issue_id = %issue.id,
+                        issue_identifier = %issue.identifier,
+                        state = %current.state,
+                        "worker_issue_terminal"
+                    );
+                    return Ok((WorkerExitReason::Normal, Some(current.state.clone())));
+                }
+                if !self.config.is_active_state(&current.state) {
+                    warn!(
+                        issue_id = %issue.id,
+                        issue_identifier = %issue.identifier,
+                        state = %current.state,
+                        "worker_issue_no_longer_active"
+                    );
+                    return Ok((WorkerExitReason::CanceledByReconciliation, None));
                 }
             }
 
