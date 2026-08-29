@@ -145,6 +145,13 @@ impl OrchestratorState {
             .collect()
     }
 
+    pub fn next_retry_due_at_ms(&self) -> Option<u64> {
+        self.retry_attempts
+            .values()
+            .map(|retry| retry.due_at_ms)
+            .min()
+    }
+
     pub fn apply_codex_event(&mut self, event: CodexEvent) {
         if let Some(entry) = self.running.get_mut(&event.issue_id) {
             if let (Some(thread_id), Some(turn_id)) =

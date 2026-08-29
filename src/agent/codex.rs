@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{Instant, timeout};
 
@@ -13,20 +13,28 @@ use crate::config::CodexConfig;
 use crate::domain::{CodexEvent, TokenTotals};
 use crate::error::{Result, SymphonyError};
 
+const MAX_JSONL_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct TurnOutcome {
     pub thread_id: String,
     pub turn_id: String,
+    pub session_id: String,
 }
 
 #[async_trait]
 pub trait CodexClient: Send + Sync {
-    async fn run_turn(
-        &self,
+    async fn start_session<'a>(
+        &'a self,
         workspace: &Path,
-        prompt: &str,
-        on_event: &mut (dyn FnMut(CodexEvent) + Send),
-    ) -> Result<TurnOutcome>;
+        on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
+    ) -> Result<Box<dyn CodexSession + 'a>>;
+}
+
+#[async_trait]
+pub trait CodexSession: Send {
+    async fn run_turn(&mut self, prompt: &str) -> Result<TurnOutcome>;
+    async fn shutdown(&mut self);
 }
 
 #[derive(Clone, Debug)]
@@ -42,30 +50,42 @@ impl CodexAppServerClient {
 
 #[async_trait]
 impl CodexClient for CodexAppServerClient {
-    async fn run_turn(
-        &self,
+    async fn start_session<'a>(
+        &'a self,
         workspace: &Path,
-        prompt: &str,
-        on_event: &mut (dyn FnMut(CodexEvent) + Send),
-    ) -> Result<TurnOutcome> {
+        on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
+    ) -> Result<Box<dyn CodexSession + 'a>> {
         let mut session = CodexJsonlSession::spawn(&self.config, workspace, on_event).await?;
-        let result = async {
+        let startup: Result<()> = async {
             session.initialize().await?;
             let thread_id = session.start_thread().await?;
-            let turn_id = session.start_turn(&thread_id, prompt).await?;
-            let session_id = compose_session_id(&thread_id, &turn_id);
-            session.thread_id = Some(thread_id.clone());
-            session.turn_id = Some(turn_id.clone());
-            session.session_id = Some(session_id);
-            session.emit("session_started", None, None, None);
-            session.emit("turn_started", None, None, None);
-            session.stream_until_turn_completed().await?;
-            Ok(TurnOutcome { thread_id, turn_id })
+            session.thread_id = Some(thread_id);
+            Ok(())
         }
         .await;
-        session.shutdown().await;
-        result
+        match startup {
+            Ok(()) => Ok(Box::new(session)),
+            Err(error) => {
+                session.emit("startup_failed", Some(error.to_string()), None, None);
+                Err(error)
+            }
+        }
     }
+}
+
+fn emit_startup_failed(on_event: &mut (dyn FnMut(CodexEvent) + Send), error: &SymphonyError) {
+    on_event(CodexEvent {
+        issue_id: String::new(),
+        event: "startup_failed".to_string(),
+        timestamp: Utc::now(),
+        session_id: None,
+        thread_id: None,
+        turn_id: None,
+        codex_app_server_pid: None,
+        message: Some(error.to_string()),
+        absolute_token_totals: None,
+        rate_limits: None,
+    });
 }
 
 struct CodexJsonlSession<'a> {
@@ -73,7 +93,7 @@ struct CodexJsonlSession<'a> {
     workspace: PathBuf,
     child: Child,
     stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
     next_request_id: i64,
     on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
     thread_id: Option<String>,
@@ -87,27 +107,59 @@ impl<'a> CodexJsonlSession<'a> {
         workspace: &Path,
         on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
     ) -> Result<Self> {
-        let mut child = Command::new("bash")
+        let bash_command = match bash_command_in_workspace(workspace, &config.command) {
+            Ok(command) => command,
+            Err(error) => {
+                emit_startup_failed(on_event, &error);
+                return Err(error);
+            }
+        };
+        let mut command = Command::new("bash");
+        command
             .arg("-lc")
-            .arg(&config.command)
-            .current_dir(workspace)
+            .arg(bash_command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|source| SymphonyError::io(None, source))?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            SymphonyError::codex("spawn_failed", "codex app-server stdin was not available")
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            SymphonyError::codex("spawn_failed", "codex app-server stdout was not available")
-        })?;
+            .kill_on_drop(true);
+        #[cfg(not(windows))]
+        command.current_dir(workspace);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(source) => {
+                let error = SymphonyError::io(None, source);
+                emit_startup_failed(on_event, &error);
+                return Err(error);
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let error = SymphonyError::codex(
+                    "spawn_failed",
+                    "codex app-server stdin was not available",
+                );
+                emit_startup_failed(on_event, &error);
+                return Err(error);
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let error = SymphonyError::codex(
+                    "spawn_failed",
+                    "codex app-server stdout was not available",
+                );
+                emit_startup_failed(on_event, &error);
+                return Err(error);
+            }
+        };
         Ok(Self {
             config,
             workspace: workspace.to_path_buf(),
             child,
             stdin,
-            stdout: BufReader::new(stdout).lines(),
+            stdout: BufReader::new(stdout),
             next_request_id: 1,
             on_event,
             thread_id: None,
@@ -135,7 +187,7 @@ impl<'a> CodexJsonlSession<'a> {
 
     async fn start_thread(&mut self) -> Result<String> {
         let mut params = json!({
-            "cwd": self.workspace_string(),
+            "cwd": self.workspace_string()?,
             "ephemeral": true
         });
         insert_configured(
@@ -159,7 +211,7 @@ impl<'a> CodexJsonlSession<'a> {
     async fn start_turn(&mut self, thread_id: &str, prompt: &str) -> Result<String> {
         let mut params = json!({
             "threadId": thread_id,
-            "cwd": self.workspace_string(),
+            "cwd": self.workspace_string()?,
             "input": [{ "type": "text", "text": prompt }]
         });
         insert_configured(
@@ -191,6 +243,13 @@ impl<'a> CodexJsonlSession<'a> {
             if let Some(id) = value.get("id").cloned() {
                 if value.get("method").and_then(Value::as_str).is_some() {
                     self.handle_server_request(id, &value).await?;
+                } else {
+                    self.emit(
+                        "other_message",
+                        Some("unexpected response".to_string()),
+                        None,
+                        None,
+                    );
                 }
                 continue;
             }
@@ -322,6 +381,12 @@ impl<'a> CodexJsonlSession<'a> {
                         )
                     });
                 }
+                self.emit(
+                    "other_message",
+                    Some(format!("response for unexpected request {message_id}")),
+                    None,
+                    None,
+                );
             } else if value.get("method").and_then(Value::as_str).is_some() {
                 self.handle_notification_before_turn(&value);
             } else {
@@ -340,10 +405,13 @@ impl<'a> CodexJsonlSession<'a> {
     }
 
     fn handle_notification_before_turn(&mut self, value: &Value) {
-        if value.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated") {
+        let method = value.get("method").and_then(Value::as_str);
+        if method == Some("account/rateLimits/updated") {
             self.handle_rate_limits(value);
-        } else if value.get("method").and_then(Value::as_str) == Some("thread/tokenUsage/updated") {
+        } else if method == Some("thread/tokenUsage/updated") {
             self.handle_token_usage(value);
+        } else if let Some(method) = method {
+            self.emit("notification", Some(method.to_string()), None, None);
         }
     }
 
@@ -353,22 +421,27 @@ impl<'a> CodexJsonlSession<'a> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         match method {
-            "item/commandExecution/requestApproval" => {
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                 self.send_response(id, json!({ "decision": "acceptForSession" }))
-                    .await
-            }
-            "item/fileChange/requestApproval" => {
-                self.send_response(id, json!({ "decision": "acceptForSession" }))
-                    .await
+                    .await?;
+                self.emit(
+                    "approval_auto_approved",
+                    Some(method.to_string()),
+                    None,
+                    None,
+                );
+                Ok(())
             }
             "item/tool/call" => {
                 self.send_response(id, json!({ "success": false, "contentItems": [] }))
-                    .await
+                    .await?;
+                self.emit("unsupported_tool_call", None, None, None);
+                Ok(())
             }
             "item/tool/requestUserInput" => {
                 self.send_response(id, json!({ "answers": {} })).await?;
                 self.emit(
-                    "turn_failed",
+                    "turn_input_required",
                     Some("codex requested user input".to_string()),
                     None,
                     None,
@@ -380,7 +453,9 @@ impl<'a> CodexJsonlSession<'a> {
             }
             _ => {
                 self.send_error(id, -32601, "unsupported server request")
-                    .await
+                    .await?;
+                self.emit("other_message", Some(method.to_string()), None, None);
+                Ok(())
             }
         }
     }
@@ -427,13 +502,13 @@ impl<'a> CodexJsonlSession<'a> {
 
     async fn read_message_with_timeout(&mut self, timeout_ms: u64) -> Result<Value> {
         let timeout_ms = timeout_ms.max(1);
-        match timeout(Duration::from_millis(timeout_ms), self.stdout.next_line()).await {
-            Ok(Ok(Some(line))) => self.parse_line(line),
+        match timeout(Duration::from_millis(timeout_ms), self.read_line()).await {
+            Ok(Ok(Some(line))) => self.parse_line(&line),
             Ok(Ok(None)) => Err(SymphonyError::codex(
                 "process_exit",
                 "codex app-server exited",
             )),
-            Ok(Err(source)) => Err(SymphonyError::io(None, source)),
+            Ok(Err(error)) => Err(error),
             Err(_) => Err(SymphonyError::codex(
                 "timeout",
                 "timed out waiting for codex response",
@@ -456,8 +531,8 @@ impl<'a> CodexJsonlSession<'a> {
             let remaining = deadline.saturating_duration_since(now);
             let read_timeout = Duration::from_millis(self.config.read_timeout_ms.max(1));
             let wait = remaining.min(read_timeout);
-            match timeout(wait, self.stdout.next_line()).await {
-                Ok(Ok(Some(line))) => return self.parse_line(line),
+            match timeout(wait, self.read_line()).await {
+                Ok(Ok(Some(line))) => return self.parse_line(&line),
                 Ok(Ok(None)) => {
                     self.emit(
                         "turn_failed",
@@ -470,7 +545,7 @@ impl<'a> CodexJsonlSession<'a> {
                         "codex app-server exited",
                     ));
                 }
-                Ok(Err(source)) => return Err(SymphonyError::io(None, source)),
+                Ok(Err(error)) => return Err(error),
                 Err(_) if Instant::now() >= deadline => {
                     self.emit(
                         "turn_failed",
@@ -485,8 +560,60 @@ impl<'a> CodexJsonlSession<'a> {
         }
     }
 
-    fn parse_line(&mut self, line: String) -> Result<Value> {
-        match serde_json::from_str::<Value>(&line) {
+    async fn read_line(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        loop {
+            let mut consumed = 0;
+            let mut complete = false;
+            let mut too_large = false;
+            {
+                let buffer = self
+                    .stdout
+                    .fill_buf()
+                    .await
+                    .map_err(|source| SymphonyError::io(None, source))?;
+                if buffer.is_empty() {
+                    return if line.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(line))
+                    };
+                }
+                let payload_len = buffer
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .unwrap_or(buffer.len());
+                if line.len() + payload_len > MAX_JSONL_MESSAGE_BYTES {
+                    too_large = true;
+                } else {
+                    line.extend_from_slice(&buffer[..payload_len]);
+                    complete = payload_len < buffer.len();
+                    consumed = payload_len + usize::from(complete);
+                }
+            }
+            if too_large {
+                self.emit(
+                    "malformed",
+                    Some(format!(
+                        "jsonl message exceeded {MAX_JSONL_MESSAGE_BYTES} byte limit"
+                    )),
+                    None,
+                    None,
+                );
+                return Err(SymphonyError::codex(
+                    "protocol_error",
+                    format!("jsonl message exceeded {MAX_JSONL_MESSAGE_BYTES} byte limit"),
+                ));
+            }
+            self.stdout.consume(consumed);
+            if complete {
+                return Ok(Some(line));
+            }
+        }
+    }
+
+    fn parse_line(&mut self, line: &[u8]) -> Result<Value> {
+        match serde_json::from_slice::<Value>(line) {
             Ok(value) if value.is_object() => Ok(value),
             Ok(_) => {
                 self.emit(
@@ -509,7 +636,6 @@ impl<'a> CodexJsonlSession<'a> {
             }
         }
     }
-
     fn emit(
         &mut self,
         event: &str,
@@ -531,8 +657,8 @@ impl<'a> CodexJsonlSession<'a> {
         });
     }
 
-    fn workspace_string(&self) -> String {
-        self.workspace.to_string_lossy().into_owned()
+    fn workspace_string(&self) -> Result<String> {
+        bash_path(&self.workspace)
     }
 
     async fn shutdown(&mut self) {
@@ -544,6 +670,80 @@ impl<'a> CodexJsonlSession<'a> {
             }
         }
     }
+}
+
+#[async_trait]
+impl CodexSession for CodexJsonlSession<'_> {
+    async fn run_turn(&mut self, prompt: &str) -> Result<TurnOutcome> {
+        let thread_id = self.thread_id.clone().ok_or_else(|| {
+            SymphonyError::codex("protocol_error", "session started without a thread id")
+        })?;
+        let turn_id = self.start_turn(&thread_id, prompt).await?;
+        let session_id = compose_session_id(&thread_id, &turn_id);
+        self.turn_id = Some(turn_id.clone());
+        self.session_id = Some(session_id.clone());
+        self.emit("session_started", None, None, None);
+        self.emit("turn_started", None, None, None);
+        self.stream_until_turn_completed().await?;
+        Ok(TurnOutcome {
+            thread_id,
+            turn_id,
+            session_id,
+        })
+    }
+
+    async fn shutdown(&mut self) {
+        CodexJsonlSession::shutdown(self).await;
+    }
+}
+
+fn bash_command_in_workspace(workspace: &Path, command: &str) -> Result<String> {
+    #[cfg(windows)]
+    {
+        Ok(format!(
+            "cd -- {} || exit $?; {command}",
+            shell_quote(&bash_path(workspace)?)
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = workspace;
+        Ok(command.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn bash_path(path: &Path) -> Result<String> {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let path = path.strip_prefix("//?/").unwrap_or(&path);
+    if path.starts_with("UNC/") {
+        return Err(SymphonyError::codex(
+            "unsupported_workspace_path",
+            "WSL Codex workspaces must use a local drive, not a UNC path",
+        ));
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/' {
+        return Ok(format!(
+            "/mnt/{}/{}",
+            char::from(bytes[0]).to_ascii_lowercase(),
+            &path[3..]
+        ));
+    }
+    Err(SymphonyError::codex(
+        "unsupported_workspace_path",
+        format!("WSL Codex workspace path is not a local Windows drive: {path}"),
+    ))
+}
+
+#[cfg(not(windows))]
+fn bash_path(path: &Path) -> Result<String> {
+    Ok(path.to_string_lossy().into_owned())
 }
 
 fn insert_configured(params: &mut Value, key: &'static str, value: Option<&Value>) {

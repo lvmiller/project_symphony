@@ -1,10 +1,10 @@
-use std::path::Path;
-use std::process::Stdio;
-
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::info;
 
@@ -137,6 +137,7 @@ impl GitHubCompletionClient {
         }
         let http = reqwest::Client::builder()
             .user_agent("symphony-rust-runtime")
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|err| completion_error("github_transport", err.to_string()))?;
         Ok(Some(Self {

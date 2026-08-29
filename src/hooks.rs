@@ -55,8 +55,8 @@ pub async fn run_hook_with_source(
         .arg(script)
         .current_dir(workspace)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .envs(
             source_id
                 .into_iter()

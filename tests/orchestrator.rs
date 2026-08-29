@@ -615,3 +615,16 @@ fn snapshot_contains_running_retry_token_rate_limit_and_elapsed_fields() {
     assert_eq!(snapshot.rate_limits, Some(json!({"reset": 123})));
     assert_eq!(snapshot.seconds_running, 4.5);
 }
+
+#[test]
+fn next_retry_deadline_is_the_earliest_pending_retry() {
+    let mut state = OrchestratorState::default();
+    let first = issue("first", "S-001", "In Progress");
+    let second = issue("second", "S-002", "In Progress");
+    state.schedule_retry_now(&first, 1, None);
+    state.schedule_retry_now(&second, 1, None);
+    state.retry_attempts.get_mut(&first.id).unwrap().due_at_ms = 2_000;
+    state.retry_attempts.get_mut(&second.id).unwrap().due_at_ms = 1_000;
+
+    assert_eq!(state.next_retry_due_at_ms(), Some(1_000));
+}

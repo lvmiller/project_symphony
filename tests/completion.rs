@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -433,6 +434,22 @@ async fn mark_issue_started_skips_already_started_issue() {
 }
 
 #[tokio::test]
+async fn completion_requests_timeout_after_thirty_seconds() {
+    let server = DelayedServer::new(Duration::from_secs(35));
+    let config = config(format!("{}/graphql", server.url()));
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+    let issue = issue("[Medium] Fix allocator");
+
+    let err = tokio::time::timeout(Duration::from_secs(31), client.mark_issue_started(&issue))
+        .await
+        .expect("completion request must be bounded to 30 seconds")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("github_transport"));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn missing_title_severity_does_not_commit_or_move_status() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote.git");
@@ -679,6 +696,37 @@ impl TestServer {
                 request_log.lock().unwrap().push(request);
                 write_http_response(&mut stream, response);
             }
+        });
+        Self { url, requests }
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+struct DelayedServer {
+    url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl DelayedServer {
+    fn new(delay: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            request_log
+                .lock()
+                .unwrap()
+                .push(read_http_request(&mut stream));
+            thread::sleep(delay);
         });
         Self { url, requests }
     }

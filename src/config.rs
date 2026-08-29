@@ -10,8 +10,6 @@
 //!   successful direct-commit completion unless `workspace.cleanup.after_success: never` is set.
 //!   Checkout/sync/bootstrap is owned by configured hooks.
 //! - Logging sink: structured logs are emitted to stderr.
-//! - GitHub endpoint policy: workflow-supplied `tracker.endpoint` values are ignored for
-//!   `tracker.kind: github`; this implementation always uses the public GitHub GraphQL endpoint.
 //! - Existing non-directory workspace path policy: fail safely; never replace user data.
 //! - User-input-required policy: the Codex client fails the run rather than waiting indefinitely.
 //! - Container runtime: the published image uses an init/reaper, executes hooks and Codex inside the
@@ -30,6 +28,7 @@ use serde_yaml::{Mapping, Value};
 use crate::domain::WorkflowDefinition;
 use crate::error::{Result, SymphonyError};
 use crate::workflow::{load_workflow, select_workflow_path};
+use crate::workspace::sanitize_workspace_key;
 
 pub const DEFAULT_GITHUB_ENDPOINT: &str = "https://api.github.com/graphql";
 pub const DEFAULT_PROMPT: &str = "You are working on an issue from GitHub.";
@@ -528,20 +527,38 @@ fn conflicting_server_bind() -> SymphonyError {
 }
 
 fn validate_unique_source_ids(reloaders: &[ConfigReloader]) -> Result<()> {
-    let mut seen = BTreeMap::new();
+    let mut source_ids = BTreeMap::new();
+    let mut source_segments = BTreeMap::new();
     for reloader in reloaders {
         let source_id = reloader.source_id();
-        if let Some(previous_path) = seen.insert(
-            source_id.to_string(),
-            reloader.current().workflow_path.clone(),
-        ) {
+        let workflow_path = &reloader.current().workflow_path;
+        if let Some(previous_path) = source_ids.insert(source_id.to_string(), workflow_path.clone())
+        {
             return Err(SymphonyError::config(
                 "duplicate_source_id",
                 format!(
                     "source.id must be unique id={} first={} second={}",
                     source_id,
                     previous_path.display(),
-                    reloader.current().workflow_path.display()
+                    workflow_path.display()
+                ),
+            ));
+        }
+
+        let segment = sanitize_workspace_key(source_id);
+        if let Some((previous_source_id, previous_path)) = source_segments.insert(
+            segment.clone(),
+            (source_id.to_string(), workflow_path.clone()),
+        ) {
+            return Err(SymphonyError::config(
+                "colliding_source_workspace_key",
+                format!(
+                    "source.id values must produce unique workspace source segments segment={} first_id={} first={} second_id={} second={}",
+                    segment,
+                    previous_source_id,
+                    previous_path.display(),
+                    source_id,
+                    workflow_path.display()
                 ),
             ));
         }
@@ -573,11 +590,13 @@ fn parse_tracker(config: &Mapping) -> Result<TrackerConfig> {
     let kind = get_string(tracker, "kind")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let endpoint = if kind == "github" {
-        DEFAULT_GITHUB_ENDPOINT.to_string()
-    } else {
-        get_string(tracker, "endpoint").unwrap_or_default()
-    };
+    let endpoint = get_string(tracker, "endpoint").unwrap_or_else(|| {
+        if kind == "github" {
+            DEFAULT_GITHUB_ENDPOINT.to_string()
+        } else {
+            String::new()
+        }
+    });
     let raw_api_key = get_string(tracker, "api_key")
         .or_else(|| get_string(tracker, "token"))
         .or_else(|| (kind == "github").then(|| "$GITHUB_TOKEN".to_string()));
@@ -772,37 +791,43 @@ fn parse_workspace_cleanup(workspace: Option<&Mapping>) -> Result<WorkspaceClean
 
 fn parse_hooks(config: &Mapping) -> Result<HooksConfig> {
     let hooks = get_map(config, "hooks");
-    let timeout_ms = get_i64(hooks, "timeout_ms").unwrap_or(60_000);
-    if timeout_ms <= 0 {
-        return Err(SymphonyError::config(
-            "invalid_hooks_timeout_ms",
-            "hooks.timeout_ms must be positive",
-        ));
-    }
+    let timeout_ms = positive_u64_or_default(
+        hooks,
+        "timeout_ms",
+        60_000,
+        "invalid_hooks_timeout_ms",
+        "hooks.timeout_ms",
+    )?;
     Ok(HooksConfig {
         after_create: get_string(hooks, "after_create"),
         before_run: get_string(hooks, "before_run"),
         after_run: get_string(hooks, "after_run"),
         before_remove: get_string(hooks, "before_remove"),
-        timeout_ms: timeout_ms as u64,
+        timeout_ms,
     })
 }
 
 fn parse_agent(config: &Mapping) -> Result<AgentConfig> {
     let agent = get_map(config, "agent");
     let max_concurrent_agents = get_i64(agent, "max_concurrent_agents").unwrap_or(10);
-    let max_turns = get_i64(agent, "max_turns").unwrap_or(20);
+    let max_turns = positive_u64_or_default(
+        agent,
+        "max_turns",
+        20,
+        "invalid_max_turns",
+        "agent.max_turns",
+    )?;
+    let max_turns = u32::try_from(max_turns).map_err(|_| {
+        SymphonyError::config(
+            "invalid_max_turns",
+            "agent.max_turns must be a positive 32-bit integer",
+        )
+    })?;
     let max_retry_backoff_ms = get_i64(agent, "max_retry_backoff_ms").unwrap_or(300_000);
     if max_concurrent_agents <= 0 {
         return Err(SymphonyError::config(
             "invalid_max_concurrent_agents",
             "agent.max_concurrent_agents must be positive",
-        ));
-    }
-    if max_turns <= 0 {
-        return Err(SymphonyError::config(
-            "invalid_max_turns",
-            "agent.max_turns must be positive",
         ));
     }
     if max_retry_backoff_ms <= 0 {
@@ -813,7 +838,7 @@ fn parse_agent(config: &Mapping) -> Result<AgentConfig> {
     }
     Ok(AgentConfig {
         max_concurrent_agents: max_concurrent_agents as usize,
-        max_turns: max_turns as u32,
+        max_turns,
         max_retry_backoff_ms: max_retry_backoff_ms as u64,
         max_concurrent_agents_by_state: get_positive_usize_map(
             agent,
@@ -1070,6 +1095,26 @@ fn get_i64(mapping: Option<&Mapping>, name: &str) -> Option<i64> {
         Value::String(s) => s.parse::<i64>().ok(),
         _ => None,
     })
+}
+
+fn positive_u64_or_default(
+    mapping: Option<&Mapping>,
+    name: &str,
+    default: u64,
+    code: &'static str,
+    field: &'static str,
+) -> Result<u64> {
+    let Some(value) = get_value(mapping, name) else {
+        return Ok(default);
+    };
+    let value = match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+    .filter(|value| *value > 0)
+    .ok_or_else(|| SymphonyError::config(code, format!("{field} must be a positive integer")))?;
+    Ok(value)
 }
 
 fn get_bool(mapping: Option<&Mapping>, name: &str) -> Option<bool> {

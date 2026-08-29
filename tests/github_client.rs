@@ -1,10 +1,10 @@
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::thread;
-
-use serde_json::{Value, json};
+use std::time::Duration;
 use symphony::config::{
     GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, TrackerConfig,
 };
@@ -236,6 +236,19 @@ async fn fetches_issue_states_by_node_ids_from_project_items() {
             .unwrap()
             .contains("SymphonyIssueStates")
     );
+    assert!(
+        body["query"]
+            .as_str()
+            .unwrap()
+            .contains("project {\n            number")
+    );
+    assert!(
+        body["query"]
+            .as_str()
+            .unwrap()
+            .contains("... on Organization { login }")
+    );
+    assert!(body["query"].as_str().unwrap().contains("$ids: [ID!]!"));
     assert_eq!(body["variables"]["ids"], json!(["I_123", "I_missing"]));
 }
 
@@ -325,6 +338,7 @@ async fn state_refresh_pages_issue_project_items_and_nested_field_values() {
             "pageInfo": {"hasNextPage": true, "endCursor": "project-item-cursor-1"},
             "nodes": [{
                 "id": "ITEM_first",
+                "project": configured_project(),
                 "fieldValues": {
                     "pageInfo": {"hasNextPage": false, "endCursor": null},
                     "nodes": []
@@ -345,6 +359,7 @@ async fn state_refresh_pages_issue_project_items_and_nested_field_values() {
             None,
             vec![json!({
                 "id": "ITEM_second",
+                "project": configured_project(),
                 "fieldValues": {
                     "pageInfo": {"hasNextPage": true, "endCursor": "field-cursor-1"},
                     "nodes": []
@@ -392,6 +407,130 @@ async fn state_refresh_pages_issue_project_items_and_nested_field_values() {
     let field_body: Value = serde_json::from_str(request_body(&requests[3])).unwrap();
     assert_eq!(field_body["variables"]["id"], "ITEM_second");
     assert_eq!(field_body["variables"]["after"], "field-cursor-1");
+}
+
+#[tokio::test]
+async fn state_refresh_uses_only_the_configured_project_status() {
+    let mut issue = issue_node("I_multiple_projects", 55, &["Bug"]);
+    issue.as_object_mut().unwrap().insert(
+        "projectItems".to_string(),
+        json!({"nodes": [
+            issue_project_item(
+                "ITEM_unrelated",
+                project("Organization", "other-org", 7),
+                vec![single_select("Status", "Done")],
+            ),
+            issue_project_item(
+                "ITEM_configured",
+                configured_project(),
+                vec![single_select("Status", "Todo")],
+            )
+        ]}),
+    );
+    let server = TestServer::new(vec![ok(json!({"data": {"nodes": [issue]}}))]);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    let issues = client
+        .fetch_issue_states_by_ids(&["I_multiple_projects".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].state, "Todo");
+}
+
+#[tokio::test]
+async fn state_refresh_matches_user_owned_configured_project() {
+    let mut issue = issue_node("I_user_project", 56, &["Bug"]);
+    issue.as_object_mut().unwrap().insert(
+        "projectItems".to_string(),
+        json!({"nodes": [
+            issue_project_item(
+                "ITEM_org",
+                configured_project(),
+                vec![single_select("Status", "Done")],
+            ),
+            issue_project_item(
+                "ITEM_user",
+                project("User", "octo-user", 7),
+                vec![single_select("Status", "Review")],
+            )
+        ]}),
+    );
+    let server = TestServer::new(vec![ok(json!({"data": {"nodes": [issue]}}))]);
+    let client = client_for_owner_type(
+        server.url(),
+        vec!["Todo"],
+        BTreeMap::new(),
+        GithubProjectOwnerType::User,
+    );
+
+    let issues = client
+        .fetch_issue_states_by_ids(&["I_user_project".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].state, "Review");
+}
+
+#[tokio::test]
+async fn state_refresh_rejects_missing_configured_project_membership_or_status() {
+    let mut not_a_member = issue_node("I_not_a_member", 57, &["Bug"]);
+    not_a_member.as_object_mut().unwrap().insert(
+        "projectItems".to_string(),
+        json!({"nodes": [issue_project_item(
+            "ITEM_other",
+            project("Organization", "other-org", 7),
+            vec![single_select("Status", "Todo")],
+        )]}),
+    );
+    let server = TestServer::new(vec![ok(json!({
+        "data": {"nodes": [not_a_member]}
+    }))]);
+    let not_member_client = client(server.url(), vec!["Todo"], BTreeMap::new());
+    let err = not_member_client
+        .fetch_issue_states_by_ids(&["I_not_a_member".to_string()])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("issue is not a member of the configured GitHub project")
+    );
+
+    let mut no_status = issue_node("I_missing_status", 58, &["Bug"]);
+    no_status.as_object_mut().unwrap().insert(
+        "projectItems".to_string(),
+        json!({"nodes": [issue_project_item(
+            "ITEM_no_status",
+            configured_project(),
+            vec![text_field("Priority", "1")],
+        )]}),
+    );
+    let server = TestServer::new(vec![ok(json!({"data": {"nodes": [no_status]}}))]);
+    let missing_status_client = client(server.url(), vec!["Todo"], BTreeMap::new());
+    let err = missing_status_client
+        .fetch_issue_states_by_ids(&["I_missing_status".to_string()])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("configured GitHub project item missing Status value")
+    );
+}
+
+#[tokio::test]
+async fn tracker_requests_timeout_after_thirty_seconds() {
+    let server = DelayedServer::new(Duration::from_secs(35));
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    let err = tokio::time::timeout(Duration::from_secs(31), client.fetch_candidate_issues())
+        .await
+        .expect("tracker request must be bounded to 30 seconds")
+        .unwrap_err();
+
+    assert_tracker_kind(err, "github_transport");
+    assert_eq!(server.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -591,11 +730,33 @@ fn issue_node_with_project_item(id: &str, number: i64, status: &str) -> Value {
     let mut node = issue_node(id, number, &["Bug"]);
     node.as_object_mut().unwrap().insert(
         "projectItems".to_string(),
-        json!({"nodes": [{"id": format!("ITEM_{id}"), "fieldValues": {"nodes": [single_select("Status", status)]}}]}),
+        json!({"nodes": [{
+            "id": format!("ITEM_{id}"),
+            "project": configured_project(),
+            "fieldValues": {"nodes": [single_select("Status", status)]}
+        }]}),
     );
     node
 }
 
+fn configured_project() -> Value {
+    project("Organization", "octo-org", 7)
+}
+
+fn project(owner_type: &str, owner_login: &str, number: i64) -> Value {
+    json!({
+        "number": number,
+        "owner": {"__typename": owner_type, "login": owner_login}
+    })
+}
+
+fn issue_project_item(id: &str, project: Value, fields: Vec<Value>) -> Value {
+    json!({
+        "id": id,
+        "project": project,
+        "fieldValues": {"nodes": fields}
+    })
+}
 fn issue_node(id: &str, number: i64, labels: &[&str]) -> Value {
     json!({
         "__typename": "Issue",
@@ -710,6 +871,37 @@ impl TestServer {
                 request_log.lock().unwrap().push(request);
                 write_http_response(&mut stream, response);
             }
+        });
+        Self { url, requests }
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+struct DelayedServer {
+    url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl DelayedServer {
+    fn new(delay: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            request_log
+                .lock()
+                .unwrap()
+                .push(read_http_request(&mut stream));
+            thread::sleep(delay);
         });
         Self { url, requests }
     }

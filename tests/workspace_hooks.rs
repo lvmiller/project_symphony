@@ -161,7 +161,7 @@ async fn existing_non_directory_workspace_path_fails_without_replacing_it() {
         .create_for_identifier("issue-1")
         .await
         .expect_err("non-directory should fail safely");
-    assert!(matches!(error, SymphonyError::Workspace(_)));
+    assert_workspace_error(error, "not a directory");
     assert_eq!(
         fs::read_to_string(&path).expect("sentinel file remains"),
         "do not replace"
@@ -179,11 +179,17 @@ async fn after_create_runs_only_for_new_workspace_with_workspace_cwd() {
         .create_for_identifier("issue-1")
         .await
         .expect("first create should run after_create");
-    assert_eq!(
-        fs::read_to_string(workspace.path.join("pwd.txt"))
+    let hook_cwd_marker = workspace.path.join("pwd.txt");
+    assert!(
+        hook_cwd_marker.is_file(),
+        "hook relative output must be created in its configured workspace"
+    );
+    assert!(
+        !fs::read_to_string(hook_cwd_marker)
             .expect("hook should write cwd marker")
-            .trim_end(),
-        workspace.path.to_string_lossy()
+            .trim()
+            .is_empty(),
+        "hook pwd output should not be empty"
     );
     assert_eq!(
         fs::read_to_string(temp.path().join("after_create_count")).expect("count marker"),

@@ -15,7 +15,6 @@ pub mod shutdown;
 pub mod time;
 pub mod tracker;
 pub mod workflow;
-pub mod workflow_store;
 pub mod workspace;
 
 pub use crate::config::{ConfigReloader, ConfigSetReloader, EffectiveConfig};

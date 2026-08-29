@@ -182,58 +182,68 @@ impl SymphonyAgentRunner {
             &source,
         )?;
         let max_turns = self.config.agent.max_turns;
+        let mut session = self.codex.start_session(workspace_path, on_event).await?;
+        let result = async {
+            for turn_index in 0..max_turns {
+                let turn_number = turn_index + 1;
+                let prompt: Cow<'_, str> = if turn_index == 0 {
+                    Cow::Borrowed(first_prompt.as_str())
+                } else {
+                    Cow::Owned(continuation_prompt(attempt, turn_number, max_turns))
+                };
 
-        for turn_index in 0..max_turns {
-            let turn_number = turn_index + 1;
-            let prompt: Cow<'_, str> = if turn_index == 0 {
-                Cow::Borrowed(first_prompt.as_str())
-            } else {
-                Cow::Owned(continuation_prompt(attempt, turn_number, max_turns))
-            };
+                info!(
+                    source_id = %self.config.source.id,
+                    issue_id = %issue.id,
+                    issue_identifier = %issue.identifier,
+                    turn = turn_number,
+                    max_turns,
+                    "worker_turn_starting"
+                );
+                let turn = session.run_turn(prompt.as_ref()).await?;
+                info!(
+                    source_id = %self.config.source.id,
+                    issue_id = %issue.id,
+                    issue_identifier = %issue.identifier,
+                    session_id = %turn.session_id,
+                    thread_id = %turn.thread_id,
+                    turn_id = %turn.turn_id,
+                    turn = turn_number,
+                    max_turns,
+                    "worker_turn_completed"
+                );
 
-            info!(
-                source_id = %self.config.source.id,
-                issue_id = %issue.id,
-                turn = turn_number,
-                max_turns,
-                "worker_turn_starting"
-            );
-            self.codex
-                .run_turn(workspace_path, prompt.as_ref(), on_event)
-                .await?;
-            info!(
-                source_id = %self.config.source.id,
-                issue_id = %issue.id,
-                turn = turn_number,
-                max_turns,
-                "worker_turn_completed"
-            );
-
-            let refreshed = self
-                .tracker
-                .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
-                .await?;
-            if let Some(current) = refreshed.iter().find(|current| current.id == issue.id) {
-                if self.config.is_terminal_state(&current.state) {
-                    info!(
-                        issue_id = %issue.id,
-                        state = %current.state,
-                        "worker_issue_terminal"
-                    );
-                    return Ok(WorkerExitReason::Normal);
-                }
-                if !self.config.is_active_state(&current.state) {
-                    warn!(
-                        issue_id = %issue.id,
-                        state = %current.state,
-                        "worker_issue_no_longer_active"
-                    );
-                    return Ok(WorkerExitReason::CanceledByReconciliation);
+                let refreshed = self
+                    .tracker
+                    .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
+                    .await?;
+                if let Some(current) = refreshed.iter().find(|current| current.id == issue.id) {
+                    if self.config.is_terminal_state(&current.state) {
+                        info!(
+                            issue_id = %issue.id,
+                            issue_identifier = %issue.identifier,
+                            state = %current.state,
+                            "worker_issue_terminal"
+                        );
+                        return Ok(WorkerExitReason::Normal);
+                    }
+                    if !self.config.is_active_state(&current.state) {
+                        warn!(
+                            issue_id = %issue.id,
+                            issue_identifier = %issue.identifier,
+                            state = %current.state,
+                            "worker_issue_no_longer_active"
+                        );
+                        return Ok(WorkerExitReason::CanceledByReconciliation);
+                    }
                 }
             }
-        }
 
-        Ok(WorkerExitReason::Normal)
+            Ok(WorkerExitReason::Normal)
+        }
+        .await;
+        session.shutdown().await;
+        result
     }
 }
 
@@ -246,11 +256,17 @@ impl AgentRunner for SymphonyAgentRunner {
         mut on_event: Box<dyn FnMut(CodexEvent) + Send>,
     ) -> Result<WorkerOutcome> {
         let issue_id = issue.id.clone();
+        let issue_identifier = issue.identifier.clone();
         let reason = self.run_inner(&issue, attempt, &mut *on_event).await;
         if reason.is_normal() {
-            info!(issue_id = %issue_id, "worker_completed");
+            info!(issue_id = %issue_id, issue_identifier = %issue_identifier, "worker_completed");
         } else {
-            warn!(issue_id = %issue_id, reason = ?reason, "worker_failed");
+            warn!(
+                issue_id = %issue_id,
+                issue_identifier = %issue_identifier,
+                reason = ?reason,
+                "worker_failed"
+            );
         }
         Ok(WorkerOutcome { issue_id, reason })
     }

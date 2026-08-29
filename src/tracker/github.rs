@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -91,6 +92,14 @@ query SymphonyIssueStates($ids: [ID!]!) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id
+          project {
+            number
+            owner {
+              __typename
+              ... on User { login }
+              ... on Organization { login }
+            }
+          }
           fieldValues(first: 50) {
             pageInfo { hasNextPage endCursor }
             nodes {
@@ -149,6 +158,14 @@ query SymphonyIssueProjectItems($id: ID!, $after: String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id
+          project {
+            number
+            owner {
+              __typename
+              ... on User { login }
+              ... on Organization { login }
+            }
+          }
           fieldValues(first: 50) {
             pageInfo { hasNextPage endCursor }
             nodes {
@@ -194,6 +211,7 @@ impl GitHubTrackerClient {
         github.validate()?;
         let http = reqwest::Client::builder()
             .user_agent("symphony-rust-runtime")
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|err| tracker_error("github_transport", err.to_string()))?;
         Ok(Self {
@@ -448,6 +466,7 @@ impl GitHubTrackerClient {
     async fn complete_issue_state_node(&self, issue: &mut Value) -> Result<()> {
         self.append_issue_labels(issue).await?;
         self.append_issue_project_items(issue).await?;
+        self.retain_configured_project_items(issue)?;
         self.append_issue_project_item_field_values(issue).await
     }
 
@@ -509,6 +528,28 @@ impl GitHubTrackerClient {
             "github_pagination",
             "GitHub issue project item pagination exceeded safety limit",
         ))
+    }
+
+    fn retain_configured_project_items(&self, issue: &mut Value) -> Result<()> {
+        let project_items = issue
+            .get_mut("projectItems")
+            .and_then(|project_items| project_items.get_mut("nodes"))
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| tracker_error("github_malformed", "missing issue projectItems"))?;
+        let mut configured_items = Vec::new();
+        for project_item in std::mem::take(project_items) {
+            if project_item_matches_configured_project(&self.github, &project_item)? {
+                configured_items.push(project_item);
+            }
+        }
+        if configured_items.is_empty() {
+            return Err(tracker_error(
+                "github_malformed",
+                "issue is not a member of the configured GitHub project",
+            ));
+        }
+        *project_items = configured_items;
+        Ok(())
     }
 
     async fn append_issue_project_item_field_values(&self, issue: &mut Value) -> Result<()> {
@@ -630,8 +671,13 @@ impl TrackerClient for GitHubTrackerClient {
                     }
                 }
             }
-            let state = field_value_by_name(&values, &self.github.status_field_name)
-                .ok_or_else(|| tracker_error("github_malformed", "missing project Status value"))?;
+            let state =
+                field_value_by_name(&values, &self.github.status_field_name).ok_or_else(|| {
+                    tracker_error(
+                        "github_malformed",
+                        "configured GitHub project item missing Status value",
+                    )
+                })?;
             issues.push(normalize_issue(&self.github, issue_node, &values, state)?);
         }
         Ok(issues)
@@ -669,6 +715,8 @@ struct ProjectItem {
     id: String,
     #[serde(default)]
     content: Option<Value>,
+    #[serde(default)]
+    project: Option<Value>,
     field_values: FieldValueConnection,
 }
 
@@ -741,6 +789,38 @@ fn issue_matches_configured_repository(github: &GithubConfig, content: &IssueNod
         &content.repository.owner.login,
         &content.repository.name,
     )
+}
+
+fn project_item_matches_configured_project(github: &GithubConfig, item: &Value) -> Result<bool> {
+    let project = item
+        .get("project")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            tracker_error("github_malformed", "missing project item project identity")
+        })?;
+    let number = project
+        .get("number")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| tracker_error("github_malformed", "missing project item project number"))?;
+    let owner = project
+        .get("owner")
+        .and_then(Value::as_object)
+        .ok_or_else(|| tracker_error("github_malformed", "missing project item project owner"))?;
+    let owner_type = owner
+        .get("__typename")
+        .and_then(Value::as_str)
+        .ok_or_else(|| tracker_error("github_malformed", "missing project item owner type"))?;
+    let owner_login = owner
+        .get("login")
+        .and_then(Value::as_str)
+        .ok_or_else(|| tracker_error("github_malformed", "missing project item owner login"))?;
+    let configured_owner_type = match github.project_owner_type {
+        GithubProjectOwnerType::Organization => "Organization",
+        GithubProjectOwnerType::User => "User",
+    };
+    Ok(number == github.project_number
+        && owner_type == configured_owner_type
+        && owner_login == github.project_owner_login)
 }
 
 fn normalize_issue(

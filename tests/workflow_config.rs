@@ -195,6 +195,73 @@ fn duplicate_source_ids_are_rejected_for_config_sets() {
 }
 
 #[test]
+fn source_ids_with_colliding_workspace_segments_are_rejected() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first.md");
+    let second = temp.path().join("second.md");
+    std::fs::write(
+        &first,
+        valid_workflow(None).replacen("tracker:", "source:\n  id: api/service\ntracker:", 1),
+    )
+    .unwrap();
+    std::fs::write(
+        &second,
+        valid_workflow(None).replacen("tracker:", "source:\n  id: api?service\ntracker:", 1),
+    )
+    .unwrap();
+
+    let error = match ConfigSetReloader::new(vec![first, second]) {
+        Ok(_) => panic!("expected colliding workspace source segment error"),
+        Err(error) => error,
+    };
+    match error {
+        SymphonyError::ConfigValidation { code, .. } => {
+            assert_eq!(code, "colliding_source_workspace_key");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn provided_invalid_hooks_timeout_and_agent_max_turns_never_default() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+
+    for (section, code) in [
+        ("hooks:\n  timeout_ms: true\n", "invalid_hooks_timeout_ms"),
+        ("hooks:\n  timeout_ms: [1]\n", "invalid_hooks_timeout_ms"),
+        ("hooks:\n  timeout_ms: 1.5\n", "invalid_hooks_timeout_ms"),
+        (
+            "hooks:\n  timeout_ms: \"1.5\"\n",
+            "invalid_hooks_timeout_ms",
+        ),
+        (
+            "hooks:\n  timeout_ms: \"18446744073709551616\"\n",
+            "invalid_hooks_timeout_ms",
+        ),
+        ("hooks:\n  timeout_ms: 0\n", "invalid_hooks_timeout_ms"),
+        ("agent:\n  max_turns: 1.5\n", "invalid_max_turns"),
+        ("hooks:\n  timeout_ms: -1\n", "invalid_hooks_timeout_ms"),
+        ("agent:\n  max_turns: true\n", "invalid_max_turns"),
+        ("agent:\n  max_turns: [1]\n", "invalid_max_turns"),
+        ("agent:\n  max_turns: \"1.5\"\n", "invalid_max_turns"),
+        ("agent:\n  max_turns: \"4294967296\"\n", "invalid_max_turns"),
+        ("agent:\n  max_turns: 0\n", "invalid_max_turns"),
+        ("agent:\n  max_turns: -1\n", "invalid_max_turns"),
+    ] {
+        let workflow = format!(
+            "---\n{section}{}",
+            valid_workflow(None).strip_prefix("---\n").unwrap()
+        );
+        let path = write_workflow(temp.path(), &workflow);
+        assert_config_code(path, code);
+    }
+}
+
+#[test]
 fn repository_and_repositories_are_mutually_exclusive() {
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
@@ -213,17 +280,20 @@ fn repository_and_repositories_are_mutually_exclusive() {
 }
 
 #[test]
-fn github_workflow_endpoint_is_not_taken_from_front_matter() {
+fn github_workflow_endpoint_is_taken_from_front_matter() {
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
     let temp = tempfile::tempdir().unwrap();
-    let workflow = "---\ntracker:\n  kind: github\n  endpoint: http://attacker.example/graphql\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_type: organization\n    owner_login: octo\n    number: 7\n---\nPrompt\n";
-    let path = write_workflow(temp.path(), workflow);
+    let endpoint = "https://github.example/api/graphql";
+    let workflow = format!(
+        "---\ntracker:\n  kind: github\n  endpoint: {endpoint}\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_type: organization\n    owner_login: octo\n    number: 7\n---\nPrompt\n"
+    );
+    let path = write_workflow(temp.path(), &workflow);
 
     let config = load_from_path(path);
     config.validate_dispatch().unwrap();
 
-    assert_eq!(config.tracker.endpoint, DEFAULT_GITHUB_ENDPOINT);
+    assert_eq!(config.tracker.endpoint, endpoint);
 }
 
 #[test]
@@ -241,18 +311,21 @@ fn path_environment_and_home_expansion_are_applied_only_for_workspace_root() {
     let env_config = load_from_path(env_path);
     assert_eq!(env_config.workspace.root, env_root);
 
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("HOME must be set");
-    let home_dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let previous_home = env::var_os("HOME");
+    unsafe { env::set_var("HOME", home.path()) };
     let home_path = write_workflow(
-        home_dir.path(),
+        home.path(),
         &valid_workflow(Some("~/symphony-unit-workspaces")),
     );
     let home_config = load_from_path(home_path);
+    match previous_home {
+        Some(previous_home) => unsafe { env::set_var("HOME", previous_home) },
+        None => unsafe { env::remove_var("HOME") },
+    }
     assert_eq!(
         home_config.workspace.root,
-        home.join("symphony-unit-workspaces")
+        home.path().join("symphony-unit-workspaces")
     );
 }
 

@@ -1,10 +1,12 @@
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -14,17 +16,79 @@ use crate::config::{ConfigReloader, ConfigSetReloader, EffectiveConfig};
 use crate::domain::{CodexEvent, Issue, WorkerExitReason};
 use crate::error::Result;
 use crate::observability::http::{SharedStatus, spawn_http_server};
-use crate::orchestrator::state::source_issue_key;
+use crate::orchestrator::state::{ReconcileDecision, source_issue_key};
 use crate::orchestrator::{OrchestratorState, is_dispatch_eligible_for_source};
 use crate::time::{ms_from_now, now_utc, system_monotonic_ms};
 use crate::tracker::TrackerClient;
 use crate::tracker::github::GitHubTrackerClient;
 use crate::workspace::WorkspaceManager;
 
+struct WorkerEvent {
+    issue_key: String,
+    generation: u64,
+    event: CodexEvent,
+}
+
+struct WorkerResult {
+    issue_key: String,
+    generation: u64,
+    outcome: WorkerOutcome,
+}
+
+#[derive(Clone)]
+struct WorkerChannels {
+    event_tx: mpsc::UnboundedSender<WorkerEvent>,
+    outcome_tx: mpsc::UnboundedSender<WorkerResult>,
+}
+
+struct WorkerTask {
+    generation: u64,
+    handle: JoinHandle<()>,
+}
+
 struct SourceRun {
     config: EffectiveConfig,
     tracker: Arc<GitHubTrackerClient>,
     candidates: Vec<Issue>,
+}
+
+#[derive(Default)]
+struct WorkerRegistry {
+    next_generation: u64,
+    tasks: BTreeMap<String, WorkerTask>,
+}
+
+impl WorkerRegistry {
+    fn allocate_generation(&mut self) -> u64 {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("worker dispatch generation exhausted");
+        self.next_generation
+    }
+
+    fn contains(&self, issue_key: &str) -> bool {
+        self.tasks.contains_key(issue_key)
+    }
+
+    fn matches(&self, issue_key: &str, generation: u64) -> bool {
+        self.tasks
+            .get(issue_key)
+            .is_some_and(|task| task.generation == generation)
+    }
+
+    fn insert(&mut self, issue_key: String, generation: u64, handle: JoinHandle<()>) {
+        assert!(
+            self.tasks
+                .insert(issue_key, WorkerTask { generation, handle })
+                .is_none(),
+            "worker task already registered"
+        );
+    }
+}
+
+fn worker_dispatch_permitted(workers: &WorkerRegistry, issue_key: &str) -> bool {
+    !workers.contains(issue_key)
 }
 
 pub async fn run_service_until_shutdown(
@@ -44,8 +108,13 @@ pub async fn run_multi_source_service_until_shutdown(
     shutdown: impl std::future::Future<Output = ()>,
     server_bind: Option<SocketAddr>,
 ) -> Result<()> {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<CodexEvent>();
-    let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel::<WorkerOutcome>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WorkerEvent>();
+    let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel::<WorkerResult>();
+    let channels = WorkerChannels {
+        event_tx,
+        outcome_tx,
+    };
+    let mut workers = WorkerRegistry::default();
     let mut state = OrchestratorState::default();
     let initial_configs = reloaders.current_cloned();
     let shared_status = SharedStatus::new(&initial_configs);
@@ -74,9 +143,6 @@ pub async fn run_multi_source_service_until_shutdown(
     tokio::pin!(shutdown);
 
     let result = loop {
-        let configs = reloaders.current_cloned();
-        drain_events(&mut state, &mut event_rx);
-        drain_outcomes(&mut state, &configs, &mut outcome_rx);
         for (source_id, result) in reloaders.reload_if_changed() {
             if let Err(error) = result {
                 warn!(source_id = %source_id, error = %error, "workflow_reload_failed keeping_last_good=true");
@@ -84,35 +150,63 @@ pub async fn run_multi_source_service_until_shutdown(
         }
         tick(
             &mut state,
+            &mut workers,
             reloaders.current_cloned(),
-            event_tx.clone(),
-            outcome_tx.clone(),
+            channels.clone(),
         )
         .await;
         shared_status
             .publish(&state, &reloaders.current_cloned())
             .await;
 
-        let delay = Duration::from_millis(reloaders.poll_interval_ms());
+        let poll_delay = Duration::from_millis(reloaders.poll_interval_ms());
+        let retry_delay = next_retry_delay(&state);
         tokio::select! {
             _ = &mut shutdown => {
                 info!("shutdown_requested");
                 break Ok(());
             }
-            _ = sleep(delay) => {}
+            event = event_rx.recv() => {
+                if let Some(event) = event {
+                    apply_worker_event(&mut state, &workers, event);
+                    shared_status
+                        .publish(&state, &reloaders.current_cloned())
+                        .await;
+                }
+            }
+            outcome = outcome_rx.recv() => {
+                if let Some(outcome) = outcome {
+                    apply_worker_outcome(
+                        &mut state,
+                        &reloaders.current_cloned(),
+                        &mut workers,
+                        outcome,
+                    )
+                    .await;
+                }
+            }
             refresh = refresh_rx.recv() => {
                 if refresh.is_some() {
                     while refresh_rx.try_recv().is_ok() {}
                     refresh_pending.store(false, AtomicOrdering::Release);
-                    continue;
                 }
             }
+            _ = sleep(poll_delay) => {}
+            _ = sleep(retry_delay) => {}
         }
     };
+    shutdown_workers(&mut workers).await;
     if let Some(server) = http_server {
         server.task.abort();
     }
     result
+}
+
+fn next_retry_delay(state: &OrchestratorState) -> Duration {
+    state
+        .next_retry_due_at_ms()
+        .map(|due_at_ms| Duration::from_millis(due_at_ms.saturating_sub(system_monotonic_ms())))
+        .unwrap_or(Duration::from_secs(24 * 60 * 60))
 }
 
 async fn startup_terminal_cleanup(config: &EffectiveConfig) {
@@ -152,17 +246,13 @@ async fn startup_terminal_cleanup(config: &EffectiveConfig) {
 
 async fn tick(
     state: &mut OrchestratorState,
+    workers: &mut WorkerRegistry,
     configs: Vec<EffectiveConfig>,
-    event_tx: mpsc::UnboundedSender<CodexEvent>,
-    outcome_tx: mpsc::UnboundedSender<WorkerOutcome>,
+    channels: WorkerChannels,
 ) {
     let mut runs = Vec::new();
     for config in configs {
-        reconcile_stalled(state, &config);
-        if let Err(error) = config.validate_dispatch() {
-            warn!(source_id = %config.source.id, error = %error, "dispatch_validation_failed");
-            continue;
-        }
+        reconcile_stalled(state, workers, &config).await;
         let tracker = match GitHubTrackerClient::new(&config) {
             Ok(tracker) => Arc::new(tracker),
             Err(error) => {
@@ -170,7 +260,11 @@ async fn tick(
                 continue;
             }
         };
-        reconcile_tracker_states(state, &config, tracker.as_ref()).await;
+        reconcile_tracker_states(state, workers, &config, tracker.as_ref()).await;
+        if let Err(error) = config.validate_dispatch() {
+            warn!(source_id = %config.source.id, error = %error, "dispatch_validation_failed");
+            continue;
+        }
         let candidates = match tracker.fetch_candidate_issues().await {
             Ok(issues) => issues,
             Err(error) => {
@@ -217,12 +311,12 @@ async fn tick(
         }
         dispatch_issue(
             state,
+            workers,
             run.config.clone(),
             run.tracker.clone(),
             issue,
             None,
-            event_tx.clone(),
-            outcome_tx.clone(),
+            channels.clone(),
         )
         .await;
     }
@@ -230,12 +324,12 @@ async fn tick(
     for run in runs {
         dispatch_due_retries(
             state,
+            workers,
             run.config,
             run.tracker,
             run.candidates,
             global_agent_limit,
-            event_tx.clone(),
-            outcome_tx.clone(),
+            channels.clone(),
         )
         .await;
     }
@@ -271,10 +365,16 @@ fn compare_created_at(left: &Issue, right: &Issue) -> Ordering {
     }
 }
 
-fn reconcile_stalled(state: &mut OrchestratorState, config: &EffectiveConfig) {
+async fn reconcile_stalled(
+    state: &mut OrchestratorState,
+    workers: &mut WorkerRegistry,
+    config: &EffectiveConfig,
+) {
     let now = now_utc();
     let now_ms = system_monotonic_ms();
     for issue_id in state.stalled_issue_ids_for_source(&config.source.id, config, now) {
+        let issue_key = source_issue_key(&config.source.id, &issue_id);
+        abort_worker(workers, &issue_key).await;
         state.worker_exit_for_source(
             &config.source.id,
             &issue_id,
@@ -288,6 +388,7 @@ fn reconcile_stalled(state: &mut OrchestratorState, config: &EffectiveConfig) {
 
 async fn reconcile_tracker_states(
     state: &mut OrchestratorState,
+    workers: &mut WorkerRegistry,
     config: &EffectiveConfig,
     tracker: &dyn TrackerClient,
 ) {
@@ -303,23 +404,33 @@ async fn reconcile_tracker_states(
         }
     };
     let workspace = WorkspaceManager::new(&config.workspace, config.hooks.clone()).ok();
-    for issue in refreshed {
-        if config.is_terminal_state(&issue.state) {
-            state.release_for_source(&config.source.id, &issue.id);
-            if let Some(workspace) = &workspace
-                && let Err(error) = workspace
-                    .remove_for_source_issue(&config.source.id, &issue)
-                    .await
-            {
-                warn!(source_id = %config.source.id, issue_id = %issue.id, issue_identifier = %issue.identifier, error = %error, "terminal_cleanup_failed");
+    for issue_id in ids {
+        let latest = refreshed.iter().find(|issue| issue.id == issue_id).cloned();
+        let decision = state.reconcile_running_issue_for_source(
+            &config.source.id,
+            &issue_id,
+            latest.as_ref(),
+            config,
+        );
+        let issue_key = source_issue_key(&config.source.id, &issue_id);
+        match decision {
+            ReconcileDecision::CancelTerminal => {
+                let issue = latest.expect("terminal reconciliation requires a tracker issue");
+                abort_worker(workers, &issue_key).await;
+                state.release_for_source(&config.source.id, &issue_id);
+                if let Some(workspace) = &workspace
+                    && let Err(error) = workspace
+                        .remove_for_source_issue(&config.source.id, &issue)
+                        .await
+                {
+                    warn!(source_id = %config.source.id, issue_id = %issue.id, issue_identifier = %issue.identifier, error = %error, "terminal_cleanup_failed");
+                }
             }
-        } else if config.is_active_state(&issue.state) {
-            if let Some(entry) = state.running_entry_mut_for_source(&config.source.id, &issue.id) {
-                entry.identifier = issue.identifier.clone();
-                entry.issue = issue;
+            ReconcileDecision::CancelNonActive | ReconcileDecision::MissingFromTracker => {
+                abort_worker(workers, &issue_key).await;
+                state.release_for_source(&config.source.id, &issue_id);
             }
-        } else {
-            state.release_for_source(&config.source.id, &issue.id);
+            ReconcileDecision::NoRunningEntry | ReconcileDecision::RefreshedActive => {}
         }
     }
 }
@@ -343,16 +454,19 @@ fn reschedule_due_retries_after_fetch_error(
 
 async fn dispatch_due_retries(
     state: &mut OrchestratorState,
+    workers: &mut WorkerRegistry,
     config: EffectiveConfig,
     tracker: Arc<GitHubTrackerClient>,
     candidates: Vec<Issue>,
     global_agent_limit: usize,
-    event_tx: mpsc::UnboundedSender<CodexEvent>,
-    outcome_tx: mpsc::UnboundedSender<WorkerOutcome>,
+    channels: WorkerChannels,
 ) {
     let now = system_monotonic_ms();
     let due_keys = state.due_retry_keys_for_source(&config.source.id, now);
     for issue_key in due_keys {
+        if !worker_dispatch_permitted(workers, &issue_key) {
+            continue;
+        }
         let Some(mut retry) = state.retry_attempts.remove(&issue_key) else {
             continue;
         };
@@ -377,12 +491,12 @@ async fn dispatch_due_retries(
         if is_dispatch_eligible_for_source(&config.source.id, &issue, state, &config) {
             dispatch_issue(
                 state,
+                workers,
                 config.clone(),
                 tracker.clone(),
                 issue,
                 Some(retry.attempt),
-                event_tx.clone(),
-                outcome_tx.clone(),
+                channels.clone(),
             )
             .await;
         } else {
@@ -399,16 +513,20 @@ async fn dispatch_due_retries(
 
 async fn dispatch_issue(
     state: &mut OrchestratorState,
+    workers: &mut WorkerRegistry,
     config: EffectiveConfig,
     tracker: Arc<GitHubTrackerClient>,
     issue: Issue,
     attempt: Option<u32>,
-    event_tx: mpsc::UnboundedSender<CodexEvent>,
-    outcome_tx: mpsc::UnboundedSender<WorkerOutcome>,
+    channels: WorkerChannels,
 ) {
     let started_at = now_utc();
     let source_id = config.source.id.clone();
     let issue_key = source_issue_key(&source_id, &issue.id);
+    if !worker_dispatch_permitted(workers, &issue_key) {
+        warn!(issue_key = %issue_key, "worker_dispatch_blocked_existing_task");
+        return;
+    }
     state.claim_running_for_source(&source_id, issue.clone(), attempt, started_at);
     let workspace = match WorkspaceManager::new(&config.workspace, config.hooks.clone()) {
         Ok(workspace) => workspace,
@@ -424,12 +542,14 @@ async fn dispatch_issue(
             return;
         }
     };
+    let generation = workers.allocate_generation();
     let codex = Arc::new(CodexAppServerClient::new(config.codex.clone()));
     let runner = SymphonyAgentRunner::new(config, workspace, tracker, codex);
-    tokio::spawn(async move {
-        let event_issue_key = issue_key.clone();
-        let outcome_issue_key = issue_key;
-        let callback_tx = event_tx.clone();
+    let worker_issue_key = issue_key.clone();
+    let handle = tokio::spawn(async move {
+        let event_issue_key = worker_issue_key.clone();
+        let outcome_issue_key = worker_issue_key;
+        let callback_tx = channels.event_tx.clone();
         let raw_issue_id = issue.id.clone();
         let mut outcome = runner
             .run(
@@ -437,7 +557,11 @@ async fn dispatch_issue(
                 attempt,
                 Box::new(move |mut event| {
                     event.issue_id = event_issue_key.clone();
-                    let _ = callback_tx.send(event);
+                    let _ = callback_tx.send(WorkerEvent {
+                        issue_key: event_issue_key.clone(),
+                        generation,
+                        event,
+                    });
                 }),
             )
             .await
@@ -445,36 +569,241 @@ async fn dispatch_issue(
                 issue_id: raw_issue_id,
                 reason: WorkerExitReason::Failed(error.to_string()),
             });
-        outcome.issue_id = outcome_issue_key;
-        let _ = outcome_tx.send(outcome);
+        outcome.issue_id = outcome_issue_key.clone();
+        let _ = channels.outcome_tx.send(WorkerResult {
+            issue_key: outcome_issue_key,
+            generation,
+            outcome,
+        });
     });
+    workers.insert(issue_key, generation, handle);
 }
 
-fn drain_events(state: &mut OrchestratorState, rx: &mut mpsc::UnboundedReceiver<CodexEvent>) {
-    while let Ok(event) = rx.try_recv() {
-        state.apply_codex_event(event);
+fn apply_worker_event(state: &mut OrchestratorState, workers: &WorkerRegistry, event: WorkerEvent) {
+    if workers.matches(&event.issue_key, event.generation) {
+        state.apply_codex_event(event.event);
+    } else {
+        warn!(issue_key = %event.issue_key, generation = event.generation, "stale_worker_event_ignored");
     }
 }
 
-fn drain_outcomes(
+async fn apply_worker_outcome(
     state: &mut OrchestratorState,
     configs: &[EffectiveConfig],
-    rx: &mut mpsc::UnboundedReceiver<WorkerOutcome>,
+    workers: &mut WorkerRegistry,
+    outcome: WorkerResult,
 ) {
-    let now = now_utc();
-    let now_ms = system_monotonic_ms();
-    while let Ok(outcome) = rx.try_recv() {
-        let source_id = state
-            .running
-            .get(&outcome.issue_id)
-            .map(|entry| entry.source_id.clone());
-        let Some(config) = source_id
-            .as_deref()
-            .and_then(|source_id| configs.iter().find(|config| config.source.id == source_id))
-        else {
-            warn!(issue_key = %outcome.issue_id, "worker_outcome_without_running_entry");
-            continue;
-        };
-        state.worker_exit_by_key(&outcome.issue_id, outcome.reason, config, now_ms, now);
+    let config = state
+        .running
+        .get(&outcome.issue_key)
+        .and_then(|entry| {
+            configs
+                .iter()
+                .find(|config| config.source.id == entry.source_id)
+        })
+        .cloned();
+    if !await_worker(workers, &outcome.issue_key, outcome.generation).await {
+        warn!(issue_key = %outcome.issue_key, generation = outcome.generation, "stale_worker_outcome_ignored");
+        return;
+    }
+    let Some(config) = config else {
+        warn!(issue_key = %outcome.issue_key, "worker_outcome_without_running_entry");
+        return;
+    };
+    state.worker_exit_by_key(
+        &outcome.issue_key,
+        outcome.outcome.reason,
+        &config,
+        system_monotonic_ms(),
+        now_utc(),
+    );
+}
+
+async fn abort_worker(workers: &mut WorkerRegistry, issue_key: &str) {
+    let Some(task) = workers.tasks.remove(issue_key) else {
+        return;
+    };
+    task.handle.abort();
+    let _ = task.handle.await;
+}
+
+async fn await_worker(workers: &mut WorkerRegistry, issue_key: &str, generation: u64) -> bool {
+    if !workers.matches(issue_key, generation) {
+        return false;
+    }
+    let task = workers
+        .tasks
+        .remove(issue_key)
+        .expect("current worker task disappeared");
+    let _ = task.handle.await;
+    true
+}
+
+async fn shutdown_workers(workers: &mut WorkerRegistry) {
+    let tasks = std::mem::take(&mut workers.tasks);
+    for task in tasks.values() {
+        task.handle.abort();
+    }
+    for (_, task) in tasks {
+        let _ = task.handle.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+
+    use super::{
+        WorkerEvent, WorkerRegistry, abort_worker, apply_worker_event, await_worker,
+        next_retry_delay, shutdown_workers, worker_dispatch_permitted,
+    };
+    use crate::domain::{CodexEvent, Issue};
+    use crate::orchestrator::OrchestratorState;
+    use crate::time::{now_utc, system_monotonic_ms};
+
+    struct TerminationProbe(Arc<AtomicBool>);
+
+    impl Drop for TerminationProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn issue(id: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            identifier: format!("S-{id}"),
+            title: "Lifecycle test".to_string(),
+            description: None,
+            priority: None,
+            state: "In Progress".to_string(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn pending_worker(probe: Arc<AtomicBool>) -> (JoinHandle<()>, oneshot::Receiver<()>) {
+        let (started_tx, started_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _probe = TerminationProbe(probe);
+            let _ = started_tx.send(());
+            pending::<()>().await;
+        });
+        (handle, started_rx)
+    }
+
+    fn event(issue_key: &str) -> CodexEvent {
+        CodexEvent {
+            issue_id: issue_key.to_string(),
+            event: "turn_started".to_string(),
+            timestamp: now_utc(),
+            session_id: Some("session".to_string()),
+            thread_id: Some("thread".to_string()),
+            turn_id: Some("turn".to_string()),
+            codex_app_server_pid: None,
+            message: None,
+            absolute_token_totals: None,
+            rate_limits: Some(serde_json::json!({"limit": 1})),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_termination_completes_before_state_release() {
+        let mut state = OrchestratorState::default();
+        let issue = issue("one");
+        state.claim_running(issue.clone(), None, now_utc());
+        let probe = Arc::new(AtomicBool::new(false));
+        let mut workers = WorkerRegistry::default();
+        let (handle, started) = pending_worker(probe.clone());
+        workers.insert(issue.id.clone(), 1, handle);
+        started.await.unwrap();
+
+        abort_worker(&mut workers, &issue.id).await;
+        assert!(probe.load(Ordering::Acquire));
+        state.release(&issue.id);
+        assert!(!state.running.contains_key(&issue.id));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_events_and_outcomes_leave_successor_owned() {
+        let mut state = OrchestratorState::default();
+        let issue = issue("one");
+        state.claim_running(issue.clone(), None, now_utc());
+        let probe = Arc::new(AtomicBool::new(false));
+        let mut workers = WorkerRegistry::default();
+        let (handle, started) = pending_worker(probe.clone());
+        workers.insert(issue.id.clone(), 2, handle);
+        started.await.unwrap();
+
+        apply_worker_event(
+            &mut state,
+            &workers,
+            WorkerEvent {
+                issue_key: issue.id.clone(),
+                generation: 1,
+                event: event(&issue.id),
+            },
+        );
+        assert!(state.codex_rate_limits.is_none());
+        assert!(!await_worker(&mut workers, &issue.id, 1).await);
+        assert!(workers.matches(&issue.id, 2));
+        assert!(state.running.contains_key(&issue.id));
+
+        abort_worker(&mut workers, &issue.id).await;
+        assert!(probe.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn retry_dispatch_is_blocked_until_current_worker_terminates() {
+        let probe = Arc::new(AtomicBool::new(false));
+        let mut workers = WorkerRegistry::default();
+        let (handle, started) = pending_worker(probe.clone());
+        workers.insert("issue".to_string(), 1, handle);
+        started.await.unwrap();
+        assert!(!worker_dispatch_permitted(&workers, "issue"));
+        abort_worker(&mut workers, "issue").await;
+        assert!(probe.load(Ordering::Acquire));
+        assert!(worker_dispatch_permitted(&workers, "issue"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_awaits_every_owned_worker() {
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let mut workers = WorkerRegistry::default();
+        let (first_handle, first_started) = pending_worker(first.clone());
+        let (second_handle, second_started) = pending_worker(second.clone());
+        workers.insert("one".to_string(), 1, first_handle);
+        workers.insert("two".to_string(), 2, second_handle);
+        first_started.await.unwrap();
+        second_started.await.unwrap();
+
+        shutdown_workers(&mut workers).await;
+
+        assert!(workers.tasks.is_empty());
+        assert!(first.load(Ordering::Acquire));
+        assert!(second.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn retry_timer_wakes_before_the_independent_poll_deadline() {
+        let mut state = OrchestratorState::default();
+        let issue = issue("one");
+        state.schedule_retry_now(&issue, 1, None);
+        let due_at_ms = system_monotonic_ms().saturating_add(1_000);
+        state.retry_attempts.get_mut(&issue.id).unwrap().due_at_ms = due_at_ms;
+
+        assert_eq!(state.next_retry_due_at_ms(), Some(due_at_ms));
+        assert!(next_retry_delay(&state) < Duration::from_secs(5));
     }
 }

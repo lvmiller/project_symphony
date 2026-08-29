@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use symphony::agent::codex::{CodexClient, TurnOutcome};
+use symphony::agent::codex::{CodexClient, CodexSession, TurnOutcome};
 use symphony::agent::runner::{AgentRunner, SymphonyAgentRunner};
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
@@ -50,6 +50,11 @@ async fn runner_uses_initial_prompt_then_continuation_and_refreshes_after_succes
     assert!(prompts[1].contains("Continue working on the same issue"));
     assert!(prompts[1].contains("attempt=3"));
     assert!(!prompts[1].contains("unique original issue body"));
+    assert_eq!(
+        codex.session_counts(),
+        (1, 1),
+        "all continuation turns share one worker session"
+    );
     assert_eq!(
         tracker.requested_ids(),
         vec![vec!["ISS-1".to_string()], vec!["ISS-1".to_string()]]
@@ -263,6 +268,8 @@ async fn runner_converts_codex_failure_to_worker_outcome_and_runs_after_run() {
 #[derive(Default)]
 struct FakeCodex {
     prompts: Mutex<Vec<String>>,
+    session_starts: Mutex<u32>,
+    session_shutdowns: Mutex<u32>,
     failure: Option<&'static str>,
     write_file: Option<(String, String)>,
 }
@@ -271,6 +278,8 @@ impl FakeCodex {
     fn failing(message: &'static str) -> Self {
         Self {
             prompts: Mutex::new(Vec::new()),
+            session_starts: Mutex::new(0),
+            session_shutdowns: Mutex::new(0),
             failure: Some(message),
             write_file: None,
         }
@@ -279,30 +288,53 @@ impl FakeCodex {
     fn writing(path: impl Into<String>, contents: impl Into<String>) -> Self {
         Self {
             prompts: Mutex::new(Vec::new()),
+            session_starts: Mutex::new(0),
+            session_shutdowns: Mutex::new(0),
             failure: None,
             write_file: Some((path.into(), contents.into())),
         }
     }
-
     fn prompts(&self) -> Vec<String> {
         self.prompts.lock().unwrap().clone()
+    }
+
+    fn session_counts(&self) -> (u32, u32) {
+        (
+            *self.session_starts.lock().unwrap(),
+            *self.session_shutdowns.lock().unwrap(),
+        )
     }
 }
 
 #[async_trait]
 impl CodexClient for FakeCodex {
-    async fn run_turn(
-        &self,
+    async fn start_session<'a>(
+        &'a self,
         workspace: &Path,
-        prompt: &str,
-        _on_event: &mut (dyn FnMut(CodexEvent) + Send),
-    ) -> Result<TurnOutcome> {
-        self.prompts.lock().unwrap().push(prompt.to_string());
-        if let Some(message) = self.failure {
+        _on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
+    ) -> Result<Box<dyn CodexSession + 'a>> {
+        *self.session_starts.lock().unwrap() += 1;
+        Ok(Box::new(FakeCodexSession {
+            codex: self,
+            workspace: workspace.to_path_buf(),
+        }))
+    }
+}
+
+struct FakeCodexSession<'a> {
+    codex: &'a FakeCodex,
+    workspace: std::path::PathBuf,
+}
+
+#[async_trait]
+impl CodexSession for FakeCodexSession<'_> {
+    async fn run_turn(&mut self, prompt: &str) -> Result<TurnOutcome> {
+        self.codex.prompts.lock().unwrap().push(prompt.to_string());
+        if let Some(message) = self.codex.failure {
             return Err(SymphonyError::codex("fake", message));
         }
-        if let Some((path, contents)) = &self.write_file {
-            let file_path = workspace.join(path);
+        if let Some((path, contents)) = &self.codex.write_file {
+            let file_path = self.workspace.join(path);
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
@@ -311,7 +343,12 @@ impl CodexClient for FakeCodex {
         Ok(TurnOutcome {
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
+            session_id: "thread-turn".to_string(),
         })
+    }
+
+    async fn shutdown(&mut self) {
+        *self.codex.session_shutdowns.lock().unwrap() += 1;
     }
 }
 

@@ -11,6 +11,7 @@ x-symphony-common: &symphony-common
     - type: bind
       source: ./WORKFLOW.md
       target: /app/WORKFLOW.md
+      read_only: true
       bind:
         create_host_path: false
     - type: bind
@@ -33,6 +34,7 @@ services:
       - type: bind
         source: ./WORKFLOW.md
         target: /app/WORKFLOW.md
+        read_only: true
         bind:
           create_host_path: false
       - type: bind
