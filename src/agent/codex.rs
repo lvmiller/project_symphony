@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -14,6 +15,103 @@ use crate::domain::{CodexEvent, TokenTotals};
 use crate::error::{Result, SymphonyError};
 
 const MAX_JSONL_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+const METHOD_INITIALIZE: &str = "initialize";
+const METHOD_INITIALIZED: &str = "initialized";
+const METHOD_THREAD_START: &str = "thread/start";
+const METHOD_TURN_START: &str = "turn/start";
+const METHOD_TURN_COMPLETED: &str = "turn/completed";
+const METHOD_TOKEN_USAGE_UPDATED: &str = "thread/tokenUsage/updated";
+const METHOD_RATE_LIMITS_UPDATED: &str = "account/rateLimits/updated";
+const METHOD_COMMAND_APPROVAL: &str = "item/commandExecution/requestApproval";
+const METHOD_FILE_APPROVAL: &str = "item/fileChange/requestApproval";
+const METHOD_TOOL_CALL: &str = "item/tool/call";
+const METHOD_USER_INPUT: &str = "item/tool/requestUserInput";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InitializeParams {
+    client_info: ClientInfo,
+    capabilities: Value,
+}
+
+#[derive(Serialize)]
+struct ClientInfo {
+    name: &'static str,
+    version: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadStartParams {
+    cwd: String,
+    ephemeral: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_policy: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnStartParams<'a> {
+    thread_id: &'a str,
+    cwd: String,
+    input: [TextInput<'a>; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_policy: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_policy: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct TextInput<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InitializeResult {
+    codex_home: String,
+    auth_mode: String,
+}
+
+#[derive(Deserialize)]
+struct ThreadStartResult {
+    thread: ProtocolIdentity,
+}
+
+#[derive(Deserialize)]
+struct TurnStartResult {
+    turn: TurnIdentity,
+}
+
+#[derive(Deserialize)]
+struct ProtocolIdentity {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct TurnIdentity {
+    id: String,
+    status: String,
+}
+
+#[derive(Clone, Debug)]
+enum ServerRequestId {
+    Number(i64),
+    String(String),
+}
+
+impl ServerRequestId {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Number(id) => json!(id),
+            Self::String(id) => json!(id),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TurnOutcome {
@@ -140,6 +238,8 @@ impl<'a> CodexJsonlSession<'a> {
                     "spawn_failed",
                     "codex app-server stdin was not available",
                 );
+                let _ = child.kill().await;
+                let _ = child.wait().await;
                 emit_startup_failed(on_event, &error);
                 return Err(error);
             }
@@ -151,6 +251,8 @@ impl<'a> CodexJsonlSession<'a> {
                     "spawn_failed",
                     "codex app-server stdout was not available",
                 );
+                let _ = child.kill().await;
+                let _ = child.wait().await;
                 emit_startup_failed(on_event, &error);
                 return Err(error);
             }
@@ -171,121 +273,109 @@ impl<'a> CodexJsonlSession<'a> {
 
     async fn initialize(&mut self) -> Result<()> {
         let id = self
-            .send_request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "symphony",
-                        "version": env!("CARGO_PKG_VERSION")
+            .send_typed_request(
+                METHOD_INITIALIZE,
+                InitializeParams {
+                    client_info: ClientInfo {
+                        name: "symphony",
+                        version: env!("CARGO_PKG_VERSION"),
                     },
-                    "capabilities": null
-                }),
+                    capabilities: Value::Null,
+                },
             )
             .await?;
-        self.wait_for_response(id, "initialize").await?;
-        self.send_notification("initialized", Value::Null).await
+        let response = self.wait_for_response(id, METHOD_INITIALIZE).await?;
+        parse_initialize_response(&response)?;
+        self.send_notification(METHOD_INITIALIZED, Value::Null)
+            .await
     }
 
     async fn start_thread(&mut self) -> Result<String> {
-        let mut params = json!({
-            "cwd": self.workspace_string()?,
-            "ephemeral": true
-        });
-        insert_configured(
-            &mut params,
-            "approvalPolicy",
-            self.config.approval_policy.as_ref(),
-        );
-        insert_configured(&mut params, "sandbox", self.config.thread_sandbox.as_ref());
-        let id = self.send_request("thread/start", params).await?;
-        let response = self.wait_for_response(id, "thread/start").await?;
-        response
-            .get("thread")
-            .and_then(|thread| thread.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                SymphonyError::codex("protocol_error", "thread/start response missing thread.id")
-            })
+        let id = self
+            .send_typed_request(
+                METHOD_THREAD_START,
+                ThreadStartParams {
+                    cwd: self.workspace_string()?,
+                    ephemeral: true,
+                    approval_policy: self.config.approval_policy.clone(),
+                    sandbox: self.config.thread_sandbox.clone(),
+                },
+            )
+            .await?;
+        let response = self.wait_for_response(id, METHOD_THREAD_START).await?;
+        let result: ThreadStartResult = parse_protocol_result(METHOD_THREAD_START, &response)?;
+        nonempty_protocol_id(METHOD_THREAD_START, "thread.id", result.thread.id)
     }
 
     async fn start_turn(&mut self, thread_id: &str, prompt: &str) -> Result<String> {
-        let mut params = json!({
-            "threadId": thread_id,
-            "cwd": self.workspace_string()?,
-            "input": [{ "type": "text", "text": prompt }]
-        });
-        insert_configured(
-            &mut params,
-            "approvalPolicy",
-            self.config.approval_policy.as_ref(),
-        );
-        insert_configured(
-            &mut params,
-            "sandboxPolicy",
-            self.config.turn_sandbox_policy.as_ref(),
-        );
-        let id = self.send_request("turn/start", params).await?;
-        let response = self.wait_for_response(id, "turn/start").await?;
-        response
-            .get("turn")
-            .and_then(|turn| turn.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                SymphonyError::codex("protocol_error", "turn/start response missing turn.id")
-            })
+        let id = self
+            .send_typed_request(
+                METHOD_TURN_START,
+                TurnStartParams {
+                    thread_id,
+                    cwd: self.workspace_string()?,
+                    input: [TextInput {
+                        kind: "text",
+                        text: prompt,
+                    }],
+                    approval_policy: self.config.approval_policy.clone(),
+                    sandbox_policy: self.config.turn_sandbox_policy.clone(),
+                },
+            )
+            .await?;
+        let response = self.wait_for_response(id, METHOD_TURN_START).await?;
+        let result: TurnStartResult = parse_protocol_result(METHOD_TURN_START, &response)?;
+        if result.turn.status != "inProgress" {
+            return Err(protocol_error(format!(
+                "turn/start response has unsupported turn status {}",
+                result.turn.status
+            )));
+        }
+        nonempty_protocol_id(METHOD_TURN_START, "turn.id", result.turn.id)
     }
 
     async fn stream_until_turn_completed(&mut self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_millis(self.config.turn_timeout_ms.max(1));
         loop {
             let value = self.read_message_before(deadline).await?;
-            if let Some(id) = value.get("id").cloned() {
-                if value.get("method").and_then(Value::as_str).is_some() {
-                    self.handle_server_request(id, &value).await?;
-                } else {
-                    self.emit(
-                        "other_message",
-                        Some("unexpected response".to_string()),
-                        None,
-                        None,
-                    );
+            match message_method(&value)? {
+                Some(method) if value.get("id").is_some() => {
+                    let id = parse_server_request_id(value.get("id"))?;
+                    self.handle_server_request(id, method, &value).await?;
                 }
-                continue;
-            }
-            let Some(method) = value.get("method").and_then(Value::as_str) else {
-                self.emit(
-                    "malformed",
-                    Some("message missing method".to_string()),
-                    None,
-                    None,
-                );
-                return Err(SymphonyError::codex(
-                    "protocol_error",
-                    "message missing method",
-                ));
-            };
-            match method {
-                "turn/completed" => return self.handle_turn_completed(&value),
-                "thread/tokenUsage/updated" => self.handle_token_usage(&value),
-                "account/rateLimits/updated" => self.handle_rate_limits(&value),
-                _ => self.emit("notification", Some(method.to_string()), None, None),
+                Some(method) if is_server_request_method(method) => {
+                    return Err(protocol_error(format!(
+                        "server request {method} missing id"
+                    )));
+                }
+                Some(METHOD_TURN_COMPLETED) => return self.handle_turn_completed(&value),
+                Some(METHOD_TOKEN_USAGE_UPDATED) => self.handle_token_usage(&value)?,
+                Some(METHOD_RATE_LIMITS_UPDATED) => self.handle_rate_limits(&value)?,
+                Some(notification) => {
+                    self.emit("notification", Some(notification.to_string()), None, None);
+                }
+                None if value.get("id").is_some() => {
+                    return Err(protocol_error(
+                        "response without a method during active turn",
+                    ));
+                }
+                None => return Err(protocol_error("message missing id or method")),
             }
         }
     }
 
     fn handle_turn_completed(&mut self, value: &Value) -> Result<()> {
-        let turn = value
-            .get("params")
-            .and_then(|params| params.get("turn"))
-            .ok_or_else(|| {
-                SymphonyError::codex("protocol_error", "turn/completed missing params.turn")
-            })?;
-        let status = turn
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
+        let params = required_object(value, "params")?;
+        let turn = required_object_in_map(params, "turn")?;
+        let turn_id = required_string(turn, "id")?;
+        let status = required_string(turn, "status")?;
+        if let Some(active_turn_id) = self.turn_id.as_deref()
+            && active_turn_id != turn_id
+        {
+            return Err(protocol_error(format!(
+                "turn/completed id {turn_id} does not match active turn {active_turn_id}"
+            )));
+        }
         match status {
             "completed" => {
                 self.emit("turn_completed", None, None, None);
@@ -307,99 +397,75 @@ impl<'a> CodexJsonlSession<'a> {
                     None,
                     None,
                 );
-                Err(SymphonyError::codex(
-                    "protocol_error",
-                    format!("unsupported turn status {other}"),
-                ))
+                Err(protocol_error(format!("unsupported turn status {other}")))
             }
         }
     }
 
-    fn handle_token_usage(&mut self, value: &Value) {
-        let total = value
-            .get("params")
-            .and_then(|params| params.get("tokenUsage"))
-            .and_then(|usage| usage.get("total"));
-        if let Some(total) = total {
-            let totals = TokenTotals {
-                input_tokens: total
-                    .get("inputTokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-                output_tokens: total
-                    .get("outputTokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-                total_tokens: total
-                    .get("totalTokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-            };
-            self.emit("token_totals", None, Some(totals), None);
-        } else {
-            self.emit(
-                "notification",
-                Some("thread/tokenUsage/updated".to_string()),
-                None,
-                None,
-            );
-        }
+    fn handle_token_usage(&mut self, value: &Value) -> Result<()> {
+        let params = required_object(value, "params")?;
+        let usage = required_object_in_map(params, "tokenUsage")?;
+        let total = required_object_in_map(usage, "total")?;
+        let totals = TokenTotals {
+            input_tokens: required_nonnegative_i64(total, "inputTokens")?,
+            output_tokens: required_nonnegative_i64(total, "outputTokens")?,
+            total_tokens: required_nonnegative_i64(total, "totalTokens")?,
+        };
+        self.emit("token_totals", None, Some(totals), None);
+        Ok(())
     }
 
-    fn handle_rate_limits(&mut self, value: &Value) {
-        let rate_limits = value
-            .get("params")
-            .and_then(|params| params.get("rateLimits"))
-            .cloned();
-        self.emit("rate_limits", None, None, rate_limits);
+    fn handle_rate_limits(&mut self, value: &Value) -> Result<()> {
+        let params = required_object(value, "params")?;
+        let rate_limits = required_object_in_map(params, "rateLimits")?;
+        self.emit(
+            "rate_limits",
+            None,
+            None,
+            Some(Value::Object(rate_limits.clone())),
+        );
+        Ok(())
     }
 
     async fn wait_for_response(&mut self, id: i64, method: &str) -> Result<Value> {
         let deadline = Instant::now() + self.response_timeout();
         loop {
             let value = self.read_response_before(deadline, method, id).await?;
-            if let Some(message_id) = request_id_as_i64(value.get("id")) {
-                if value.get("method").and_then(Value::as_str).is_some() {
-                    self.handle_server_request(
-                        value.get("id").cloned().unwrap_or(Value::Null),
-                        &value,
-                    )
-                    .await?;
-                    continue;
+            match message_method(&value)? {
+                Some(server_method) if value.get("id").is_some() => {
+                    let request_id = parse_server_request_id(value.get("id"))?;
+                    self.handle_server_request(request_id, server_method, &value)
+                        .await?;
                 }
-                if message_id == id {
-                    if let Some(error) = value.get("error") {
-                        return Err(SymphonyError::codex(
-                            "protocol_error",
-                            format!("codex returned error for request {id}: {error}"),
-                        ));
+                Some(method) if is_server_request_method(method) => {
+                    return Err(protocol_error(format!(
+                        "server request {method} missing id"
+                    )));
+                }
+                Some(METHOD_RATE_LIMITS_UPDATED) => self.handle_rate_limits(&value)?,
+                Some(METHOD_TOKEN_USAGE_UPDATED) => self.handle_token_usage(&value)?,
+                Some(notification) => {
+                    self.emit("notification", Some(notification.to_string()), None, None);
+                }
+                None => {
+                    let message_id = parse_client_response_id(value.get("id"))?;
+                    if message_id == id {
+                        if let Some(error) = value.get("error") {
+                            return Err(protocol_error(format!(
+                                "codex returned error for request {id}: {error}"
+                            )));
+                        }
+                        return value.get("result").cloned().ok_or_else(|| {
+                            protocol_error(format!("response {id} missing result"))
+                        });
                     }
-                    return value.get("result").cloned().ok_or_else(|| {
-                        SymphonyError::codex(
-                            "protocol_error",
-                            format!("response {id} missing result"),
-                        )
-                    });
+                    self.emit(
+                        "other_message",
+                        Some(format!("response for unexpected request {message_id}")),
+                        None,
+                        None,
+                    );
                 }
-                self.emit(
-                    "other_message",
-                    Some(format!("response for unexpected request {message_id}")),
-                    None,
-                    None,
-                );
-            } else if value.get("method").and_then(Value::as_str).is_some() {
-                self.handle_notification_before_turn(&value);
-            } else {
-                self.emit(
-                    "malformed",
-                    Some("message missing id or method".to_string()),
-                    None,
-                    None,
-                );
-                return Err(SymphonyError::codex(
-                    "protocol_error",
-                    "message missing id or method",
-                ));
             }
         }
     }
@@ -444,25 +510,16 @@ impl<'a> CodexJsonlSession<'a> {
         }
     }
 
-    fn handle_notification_before_turn(&mut self, value: &Value) {
-        let method = value.get("method").and_then(Value::as_str);
-        if method == Some("account/rateLimits/updated") {
-            self.handle_rate_limits(value);
-        } else if method == Some("thread/tokenUsage/updated") {
-            self.handle_token_usage(value);
-        } else if let Some(method) = method {
-            self.emit("notification", Some(method.to_string()), None, None);
-        }
-    }
-
-    async fn handle_server_request(&mut self, id: Value, value: &Value) -> Result<()> {
-        let method = value
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+    async fn handle_server_request(
+        &mut self,
+        id: ServerRequestId,
+        method: &str,
+        value: &Value,
+    ) -> Result<()> {
         match method {
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                self.send_response(id, json!({ "decision": "acceptForSession" }))
+            METHOD_COMMAND_APPROVAL | METHOD_FILE_APPROVAL => {
+                validate_request_fields(value, &["itemId", "threadId", "turnId"])?;
+                self.send_response(id.into_value(), json!({ "decision": "acceptForSession" }))
                     .await?;
                 self.emit(
                     "approval_auto_approved",
@@ -472,14 +529,31 @@ impl<'a> CodexJsonlSession<'a> {
                 );
                 Ok(())
             }
-            "item/tool/call" => {
-                self.send_response(id, json!({ "success": false, "contentItems": [] }))
-                    .await?;
+            METHOD_TOOL_CALL => {
+                let params =
+                    validate_request_fields(value, &["threadId", "turnId", "tool", "callId"])?;
+                if !params.get("arguments").is_some_and(Value::is_object) {
+                    return Err(protocol_error(
+                        "item/tool/call request missing object arguments",
+                    ));
+                }
+                self.send_response(
+                    id.into_value(),
+                    json!({ "success": false, "contentItems": [] }),
+                )
+                .await?;
                 self.emit("unsupported_tool_call", None, None, None);
                 Ok(())
             }
-            "item/tool/requestUserInput" => {
-                self.send_response(id, json!({ "answers": {} })).await?;
+            METHOD_USER_INPUT => {
+                let params = validate_request_fields(value, &["itemId", "threadId", "turnId"])?;
+                if !params.get("questions").is_some_and(Value::is_array) {
+                    return Err(protocol_error(
+                        "item/tool/requestUserInput request missing array questions",
+                    ));
+                }
+                self.send_response(id.into_value(), json!({ "answers": {} }))
+                    .await?;
                 self.emit(
                     "turn_input_required",
                     Some("codex requested user input".to_string()),
@@ -492,7 +566,7 @@ impl<'a> CodexJsonlSession<'a> {
                 ))
             }
             _ => {
-                self.send_error(id, -32601, "unsupported server request")
+                self.send_error(id.into_value(), -32601, "unsupported server request")
                     .await?;
                 self.emit("other_message", Some(method.to_string()), None, None);
                 Ok(())
@@ -500,11 +574,19 @@ impl<'a> CodexJsonlSession<'a> {
         }
     }
 
-    async fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
+    async fn send_typed_request<T: Serialize>(
+        &mut self,
+        method: &'static str,
+        params: T,
+    ) -> Result<i64> {
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.write_json(&json!({ "id": id, "method": method, "params": params }))
-            .await?;
+        self.write_json(&json!({
+            "id": id,
+            "method": method,
+            "params": serde_json::to_value(params)?
+        }))
+        .await?;
         Ok(id)
     }
 
@@ -687,11 +769,12 @@ impl<'a> CodexJsonlSession<'a> {
 
     async fn shutdown(&mut self) {
         let _ = self.stdin.shutdown().await;
-        match timeout(Duration::from_millis(200), self.child.wait()).await {
-            Ok(_) => {}
-            Err(_) => {
-                let _ = self.child.kill().await;
-            }
+        if timeout(Duration::from_millis(200), self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.kill().await;
+            let _ = self.child.wait().await;
         }
     }
 }
@@ -699,21 +782,29 @@ impl<'a> CodexJsonlSession<'a> {
 #[async_trait]
 impl CodexSession for CodexJsonlSession<'_> {
     async fn run_turn(&mut self, prompt: &str) -> Result<TurnOutcome> {
-        let thread_id = self.thread_id.clone().ok_or_else(|| {
-            SymphonyError::codex("protocol_error", "session started without a thread id")
-        })?;
-        let turn_id = self.start_turn(&thread_id, prompt).await?;
-        let session_id = compose_session_id(&thread_id, &turn_id);
-        self.turn_id = Some(turn_id.clone());
-        self.session_id = Some(session_id.clone());
-        self.emit("session_started", None, None, None);
-        self.emit("turn_started", None, None, None);
-        self.stream_until_turn_completed().await?;
-        Ok(TurnOutcome {
-            thread_id,
-            turn_id,
-            session_id,
-        })
+        let result = async {
+            let thread_id = self
+                .thread_id
+                .clone()
+                .ok_or_else(|| protocol_error("session started without a thread id"))?;
+            let turn_id = self.start_turn(&thread_id, prompt).await?;
+            let session_id = compose_session_id(&thread_id, &turn_id);
+            self.turn_id = Some(turn_id.clone());
+            self.session_id = Some(session_id.clone());
+            self.emit("session_started", None, None, None);
+            self.emit("turn_started", None, None, None);
+            self.stream_until_turn_completed().await?;
+            Ok(TurnOutcome {
+                thread_id,
+                turn_id,
+                session_id,
+            })
+        }
+        .await;
+        if is_protocol_error(&result) {
+            self.shutdown().await;
+        }
+        result
     }
 
     async fn shutdown(&mut self) {
@@ -770,18 +861,136 @@ fn bash_path(path: &Path) -> Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-fn insert_configured(params: &mut Value, key: &'static str, value: Option<&Value>) {
-    if let (Some(object), Some(value)) = (params.as_object_mut(), value) {
-        object.insert(key.to_string(), value.clone());
+fn protocol_error(message: impl Into<String>) -> SymphonyError {
+    SymphonyError::codex("protocol_error", message)
+}
+
+fn is_protocol_error<T>(result: &Result<T>) -> bool {
+    matches!(
+        result,
+        Err(SymphonyError::Codex {
+            kind: "protocol_error",
+            ..
+        })
+    )
+}
+
+fn message_method(value: &Value) -> Result<Option<&str>> {
+    match value.get("method") {
+        None => Ok(None),
+        Some(Value::String(method)) if !method.is_empty() => Ok(Some(method)),
+        Some(_) => Err(protocol_error("message method must be a non-empty string")),
     }
 }
 
-fn request_id_as_i64(value: Option<&Value>) -> Option<i64> {
-    match value? {
-        Value::Number(number) => number.as_i64(),
-        Value::String(text) => text.parse().ok(),
-        _ => None,
+fn is_server_request_method(method: &str) -> bool {
+    matches!(
+        method,
+        METHOD_COMMAND_APPROVAL | METHOD_FILE_APPROVAL | METHOD_TOOL_CALL | METHOD_USER_INPUT
+    )
+}
+
+fn parse_server_request_id(value: Option<&Value>) -> Result<ServerRequestId> {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .map(ServerRequestId::Number)
+            .ok_or_else(|| protocol_error("server request id must be an integer")),
+        Some(Value::String(id)) if !id.is_empty() => Ok(ServerRequestId::String(id.clone())),
+        Some(Value::String(_)) => Err(protocol_error("server request id must not be empty")),
+        Some(_) => Err(protocol_error(
+            "server request id must be an integer or non-empty string",
+        )),
+        None => Err(protocol_error("server request missing id")),
     }
+}
+
+fn parse_client_response_id(value: Option<&Value>) -> Result<i64> {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .ok_or_else(|| protocol_error("response id must be an integer")),
+        Some(Value::String(id)) => id
+            .parse::<i64>()
+            .map_err(|_| protocol_error("response string id must be an integer")),
+        Some(_) => Err(protocol_error(
+            "response id must be an integer or string-encoded integer",
+        )),
+        None => Err(protocol_error("response missing id")),
+    }
+}
+
+fn parse_initialize_response(value: &Value) -> Result<()> {
+    let result: InitializeResult = parse_protocol_result(METHOD_INITIALIZE, value)?;
+    nonempty_protocol_id(METHOD_INITIALIZE, "codexHome", result.codex_home)?;
+    nonempty_protocol_id(METHOD_INITIALIZE, "authMode", result.auth_mode)?;
+    Ok(())
+}
+
+fn parse_protocol_result<T: DeserializeOwned>(method: &str, value: &Value) -> Result<T> {
+    if !value.is_object() {
+        return Err(protocol_error(format!(
+            "{method} response result must be an object"
+        )));
+    }
+    serde_json::from_value(value.clone()).map_err(|error| {
+        protocol_error(format!("{method} response has incompatible shape: {error}"))
+    })
+}
+
+fn nonempty_protocol_id(method: &str, field: &str, value: String) -> Result<String> {
+    if value.is_empty() {
+        Err(protocol_error(format!("{method} response missing {field}")))
+    } else {
+        Ok(value)
+    }
+}
+
+fn required_object<'a>(
+    value: &'a Value,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
+    value
+        .get(field)
+        .and_then(Value::as_object)
+        .ok_or_else(|| protocol_error(format!("message missing object {field}")))
+}
+
+fn required_object_in_map<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
+    value
+        .get(field)
+        .and_then(Value::as_object)
+        .ok_or_else(|| protocol_error(format!("message missing object {field}")))
+}
+
+fn required_string<'a>(value: &'a serde_json::Map<String, Value>, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| protocol_error(format!("message missing non-empty string {field}")))
+}
+
+fn required_nonnegative_i64(value: &serde_json::Map<String, Value>, field: &str) -> Result<i64> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .filter(|number| *number >= 0)
+        .ok_or_else(|| protocol_error(format!("message missing non-negative integer {field}")))
+}
+
+fn validate_request_fields<'a>(
+    value: &'a Value,
+    fields: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>> {
+    let params = required_object(value, "params")?;
+    for field in fields {
+        required_string(params, field)?;
+    }
+    Ok(params)
 }
 
 fn response_timeout_error(method: &str, id: i64) -> SymphonyError {
@@ -791,7 +1000,7 @@ fn response_timeout_error(method: &str, id: i64) -> SymphonyError {
     )
 }
 
-fn turn_error_message(turn: &Value) -> Option<String> {
+fn turn_error_message(turn: &serde_json::Map<String, Value>) -> Option<String> {
     turn.get("error")
         .and_then(|error| {
             error

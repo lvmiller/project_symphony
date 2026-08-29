@@ -1,0 +1,70 @@
+{
+  "protocol": "codex-app-server-v2",
+  "refresh": "Update only this scrubbed fixture from the targeted v2 app-server schema or captured protocol samples; tests do not require a Codex binary.",
+  "startup": {
+    "initialize_request": {
+      "method": "initialize",
+      "params": {
+        "clientInfo": { "name": "symphony", "version": "<package-version>" },
+        "capabilities": null
+      }
+    },
+    "initialize_result": { "codexHome": "/workspace", "authMode": "none" },
+    "initialized_notification": { "method": "initialized" },
+    "thread_start_result": {
+      "thread": { "id": "thread-1" },
+      "approvalPolicy": "never",
+      "approvalsReviewer": "auto",
+      "cwd": "/workspace",
+      "model": "fake",
+      "modelProvider": "fake",
+      "sandbox": { "type": "dangerFullAccess" }
+    }
+  },
+  "turn": {
+    "turn_start_result": { "turn": { "id": "turn-1", "status": "inProgress", "items": [] } },
+    "completed_notification": {
+      "method": "turn/completed",
+      "params": { "threadId": "thread-1", "turn": { "id": "turn-1", "status": "completed", "items": [] } }
+    },
+    "token_usage_notification": {
+      "method": "thread/tokenUsage/updated",
+      "params": {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "tokenUsage": {
+          "total": { "inputTokens": 10, "outputTokens": 20, "totalTokens": 30, "cachedInputTokens": 0, "reasoningOutputTokens": 0 }
+        }
+      }
+    },
+    "rate_limits_notification": {
+      "method": "account/rateLimits/updated",
+      "params": { "rateLimits": { "limitId": "codex", "primary": { "usedPercent": 42 } } }
+    }
+  },
+  "server_requests": {
+    "command_approval": {
+      "id": "cmd-1",
+      "method": "item/commandExecution/requestApproval",
+      "params": { "itemId": "item-1", "threadId": "thread-1", "turnId": "turn-1" }
+    },
+    "file_approval": {
+      "id": "file-1",
+      "method": "item/fileChange/requestApproval",
+      "params": { "itemId": "item-2", "threadId": "thread-1", "turnId": "turn-1" }
+    },
+    "tool_call": {
+      "id": "tool-1",
+      "method": "item/tool/call",
+      "params": { "threadId": "thread-1", "turnId": "turn-1", "tool": "unknown", "callId": "call-1", "arguments": {} }
+    },
+    "user_input": {
+      "id": "input-1",
+      "method": "item/tool/requestUserInput",
+      "params": { "itemId": "item-3", "threadId": "thread-1", "turnId": "turn-1", "questions": [] }
+    },
+    "approval_result": { "decision": "acceptForSession" },
+    "tool_result": { "success": false, "contentItems": [] },
+    "user_input_result": { "answers": {} }
+  }
+}

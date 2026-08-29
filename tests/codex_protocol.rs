@@ -10,6 +10,8 @@ use symphony::domain::CodexEvent;
 use tempfile::TempDir;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
+const COMPATIBILITY_FIXTURE: &str = include_str!("fixtures/codex-app-server-v2/compatibility.json");
+
 const FAKE_CODEX: &str = r#"#!/usr/bin/env python3
 import json
 import os
@@ -18,6 +20,14 @@ import time
 
 scenario = sys.argv[1]
 log_path = os.environ["FAKE_CODEX_LOG"]
+with open(os.environ["FAKE_CODEX_FIXTURE"], encoding="utf-8") as handle:
+    fixture = json.load(handle)
+
+def fresh_fixture(*keys):
+    value = fixture
+    for key in keys:
+        value = value[key]
+    return json.loads(json.dumps(value))
 
 def log(value):
     with open(log_path, "a", encoding="utf-8") as handle:
@@ -45,18 +55,32 @@ if scenario == "startup_unrelated_messages":
     log({"startup_request_received": True})
     request_id = 1000
     while True:
-        send({"id": request_id, "method": "item/tool/call", "params": {"tool": "unknown"}})
+        send({"id": request_id, "method": "item/tool/call", "params": {"threadId": "thread-1", "turnId": "turn-1", "tool": "unknown", "callId": "call-1", "arguments": {}}})
         response = recv()
         if response is None:
             break
         log({"unrelated_response": response})
         request_id += 1
     raise SystemExit(0)
-send({"id": init["id"], "result": {"codexHome": os.getcwd(), "authMode": "none"}})
+if scenario == "startup_missing_id":
+    send({"result": fresh_fixture("startup", "initialize_result")})
+    time.sleep(30)
+if scenario == "startup_missing_field":
+    result = fresh_fixture("startup", "initialize_result")
+    del result["authMode"]
+    send({"id": init["id"], "result": result})
+    time.sleep(30)
+if scenario == "startup_bad_id":
+    send({"id": {}, "result": fresh_fixture("startup", "initialize_result")})
+    time.sleep(30)
+send({"id": str(init["id"]) if scenario == "string_response_ids" else init["id"], "result": fresh_fixture("startup", "initialize_result")})
 initialized = recv()
 thread = recv()
 log({"thread_params": thread.get("params")})
-send({"id": thread["id"], "result": {"thread": {"id": "thread-1"}, "approvalPolicy": "never", "approvalsReviewer": "auto", "cwd": os.getcwd(), "model": "fake", "modelProvider": "fake", "sandbox": {"type": "dangerFullAccess"}}})
+if scenario == "thread_missing_id":
+    send({"id": thread["id"], "result": {"thread": {}}})
+    time.sleep(30)
+send({"id": str(thread["id"]) if scenario == "string_response_ids" else thread["id"], "result": fresh_fixture("startup", "thread_start_result")})
 
 turn_number = 0
 while True:
@@ -66,29 +90,54 @@ while True:
     turn_number += 1
     turn_id = f"turn-{turn_number}"
     log({"turn_params": turn.get("params"), "turn_started": turn_id})
-    send({"id": turn["id"], "result": {"turn": {"id": turn_id, "status": "inProgress", "items": []}}})
+    start_result = fresh_fixture("turn", "turn_start_result")
+    start_result["turn"]["id"] = turn_id
+    send({"id": str(turn["id"]) if scenario == "string_response_ids" else turn["id"], "result": start_result})
 
-    if scenario == "complete":
-        send({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":turn_id,"tokenUsage":{"last":{"inputTokens":1,"outputTokens":2,"totalTokens":3,"cachedInputTokens":0,"reasoningOutputTokens":0},"total":{"inputTokens":10,"outputTokens":20,"totalTokens":30,"cachedInputTokens":0,"reasoningOutputTokens":0}}}})
-        send({"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42}}}})
+    if scenario in ("complete", "string_response_ids"):
+        token_usage = fresh_fixture("turn", "token_usage_notification")
+        token_usage["params"]["turnId"] = turn_id
+        send(token_usage)
+        send(fresh_fixture("turn", "rate_limits_notification"))
         send({"method":"notice","params":{"message":"hello"}})
-        send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":turn_id,"status":"completed","items":[]}}})
+        completed = fresh_fixture("turn", "completed_notification")
+        completed["params"]["turn"]["id"] = turn_id
+        send(completed)
     elif scenario == "timeout":
         time.sleep(2)
     elif scenario == "approval":
-        send({"id":"cmd-1","method":"item/commandExecution/requestApproval","params":{"itemId":"item-1","threadId":"thread-1","turnId":turn_id}})
+        command_approval = fresh_fixture("server_requests", "command_approval")
+        command_approval["id"] = 7
+        command_approval["params"]["turnId"] = turn_id
+        send(command_approval)
         log({"approval_response": recv()})
-        send({"id":"file-1","method":"item/fileChange/requestApproval","params":{"itemId":"item-2","threadId":"thread-1","turnId":turn_id}})
+        file_approval = fresh_fixture("server_requests", "file_approval")
+        file_approval["params"]["turnId"] = turn_id
+        send(file_approval)
         log({"file_response": recv()})
-        send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":turn_id,"status":"completed","items":[]}}})
+        completed = fresh_fixture("turn", "completed_notification")
+        completed["params"]["turn"]["id"] = turn_id
+        send(completed)
     elif scenario == "dynamic":
-        send({"id":"tool-1","method":"item/tool/call","params":{"threadId":"thread-1","turnId":turn_id,"tool":"unknown","callId":"call-1","arguments":{}}})
+        tool_call = fresh_fixture("server_requests", "tool_call")
+        tool_call["params"]["turnId"] = turn_id
+        send(tool_call)
         log({"tool_response": recv()})
-        send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":turn_id,"status":"completed","items":[]}}})
+        completed = fresh_fixture("turn", "completed_notification")
+        completed["params"]["turn"]["id"] = turn_id
+        send(completed)
     elif scenario == "user_input":
-        send({"id":"input-1","method":"item/tool/requestUserInput","params":{"itemId":"item-3","threadId":"thread-1","turnId":turn_id,"questions":[]}})
+        user_input = fresh_fixture("server_requests", "user_input")
+        user_input["params"]["turnId"] = turn_id
+        send(user_input)
         log({"input_response": recv()})
         break
+    elif scenario == "unknown_request":
+        send({"id": "unknown-1", "method": "item/unknown", "params": {}})
+        log({"unknown_response": recv()})
+        completed = fresh_fixture("turn", "completed_notification")
+        completed["params"]["turn"]["id"] = turn_id
+        send(completed)
     elif scenario == "failed":
         send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":turn_id,"status":"failed","items":[],"error":{"message":"boom"}}}})
     elif scenario == "malformed":
@@ -100,6 +149,26 @@ while True:
         sys.stdout.flush()
         break
     elif scenario == "hang":
+        time.sleep(30)
+    elif scenario == "bad_status":
+        completed = fresh_fixture("turn", "completed_notification")
+        completed["params"]["turn"]["id"] = turn_id
+        completed["params"]["turn"]["status"] = "queued"
+        send(completed)
+        time.sleep(30)
+    elif scenario == "bad_usage":
+        token_usage = fresh_fixture("turn", "token_usage_notification")
+        token_usage["params"]["tokenUsage"]["total"]["inputTokens"] = "ten"
+        send(token_usage)
+        time.sleep(30)
+    elif scenario == "bad_rate_limits":
+        send({"method": "account/rateLimits/updated", "params": {"rateLimits": []}})
+        time.sleep(30)
+    elif scenario == "missing_request_id":
+        send({"method": "item/tool/call", "params": {"threadId": "thread-1", "turnId": turn_id, "tool": "unknown", "callId": "call-1", "arguments": {}}})
+        time.sleep(30)
+    elif scenario == "bad_approval":
+        send({"id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {"threadId": "thread-1", "turnId": turn_id}})
         time.sleep(30)
     else:
         raise SystemExit(f"unknown scenario: {scenario}")
@@ -117,10 +186,13 @@ fn harness(scenario: &str) -> Harness {
     let workspace = tempfile::tempdir().expect("workspace");
     let script_path = temp.path().join("fake_codex.py");
     fs::write(&script_path, FAKE_CODEX).expect("write fake script");
+    let fixture_path = temp.path().join("compatibility.json");
+    fs::write(&fixture_path, COMPATIBILITY_FIXTURE).expect("copy compatibility fixture");
     let log_path = temp.path().join("fake.log");
     let command = format!(
-        "export FAKE_CODEX_LOG={}; exec python3 {} {}",
+        "export FAKE_CODEX_LOG={} FAKE_CODEX_FIXTURE={}; exec python3 {} {}",
         shell_quote_path(&log_path),
+        shell_quote_path(&fixture_path),
         shell_quote_path(&script_path),
         shell_quote(scenario)
     );
@@ -202,12 +274,31 @@ fn log_entries(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+async fn assert_child_reaped(harness: &Harness) {
+    let pid = log_entries(&harness.log_path)
+        .iter()
+        .find_map(|entry| entry.get("pid").and_then(Value::as_u64))
+        .expect("fake app-server pid");
+    for _ in 0..100 {
+        if !process_is_alive(pid) {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("app-server process {pid} remained alive after protocol failure");
+}
+
+fn compatibility_fixture() -> Value {
+    serde_json::from_str(COMPATIBILITY_FIXTURE).expect("valid scrubbed Codex v2 fixture")
+}
+
 #[tokio::test]
 async fn sends_schema_shaped_startup_messages_and_streams_completion() {
     let (harness, result) = run_scenario("complete").await;
     let events = result.expect("run completes");
     let log = log_entries(&harness.log_path);
-
+    let fixture = compatibility_fixture();
+    assert_eq!(fixture["protocol"], "codex-app-server-v2");
     let workspace_path = fs::canonicalize(harness.workspace.path()).expect("canonical workspace");
     let bash_workspace_path = bash_path(&workspace_path);
     assert_eq!(log[0]["cwd"], bash_workspace_path.as_str());
@@ -215,8 +306,19 @@ async fn sends_schema_shaped_startup_messages_and_streams_completion() {
         .iter()
         .filter_map(|entry| entry.get("received"))
         .collect();
-    assert_eq!(received[0]["method"], "initialize");
-    assert_eq!(received[1]["method"], "initialized");
+    assert_eq!(
+        received[0]["method"],
+        fixture["startup"]["initialize_request"]["method"]
+    );
+    assert_eq!(
+        received[0]["params"]["clientInfo"]["name"],
+        fixture["startup"]["initialize_request"]["params"]["clientInfo"]["name"]
+    );
+    assert_eq!(
+        received[0]["params"]["capabilities"],
+        fixture["startup"]["initialize_request"]["params"]["capabilities"]
+    );
+    assert_eq!(received[1], &fixture["startup"]["initialized_notification"]);
     assert_eq!(received[2]["method"], "thread/start");
     assert_eq!(received[3]["method"], "turn/start");
     assert_eq!(received[2]["params"]["cwd"], bash_workspace_path.as_str());
@@ -345,9 +447,16 @@ async fn times_out_when_turn_does_not_complete() {
 }
 
 #[tokio::test]
+async fn accepts_string_encoded_client_response_ids() {
+    let (_harness, result) = run_scenario("string_response_ids").await;
+    result.expect("string-encoded response ids remain compatible");
+}
+
+#[tokio::test]
 async fn auto_approves_command_and_file_requests_for_session() {
     let (harness, result) = run_scenario("approval").await;
     let events = result.expect("run completes");
+    let fixture = compatibility_fixture();
     let log = log_entries(&harness.log_path);
     let command = log
         .iter()
@@ -357,8 +466,19 @@ async fn auto_approves_command_and_file_requests_for_session() {
         .iter()
         .find_map(|entry| entry.get("file_response"))
         .expect("file response");
-    assert_eq!(command["result"]["decision"], "acceptForSession");
-    assert_eq!(file["result"]["decision"], "acceptForSession");
+    assert_eq!(command["id"], 7);
+    assert_eq!(
+        file["id"],
+        fixture["server_requests"]["file_approval"]["id"]
+    );
+    assert_eq!(
+        command["result"],
+        fixture["server_requests"]["approval_result"]
+    );
+    assert_eq!(
+        file["result"],
+        fixture["server_requests"]["approval_result"]
+    );
     assert_eq!(
         events
             .iter()
@@ -372,6 +492,7 @@ async fn auto_approves_command_and_file_requests_for_session() {
 async fn unsupported_dynamic_tool_calls_return_unsuccessful_response() {
     let (harness, result) = run_scenario("dynamic").await;
     let events = result.expect("run completes");
+    let fixture = compatibility_fixture();
     let log = log_entries(&harness.log_path);
     let response = log
         .iter()
@@ -379,13 +500,26 @@ async fn unsupported_dynamic_tool_calls_return_unsuccessful_response() {
         .expect("tool response");
     assert_eq!(
         response["result"],
-        json!({ "success": false, "contentItems": [] })
+        fixture["server_requests"]["tool_result"]
     );
     assert!(
         events
             .iter()
             .any(|event| event.event == "unsupported_tool_call")
     );
+}
+
+#[tokio::test]
+async fn unknown_server_requests_receive_a_method_not_found_response() {
+    let (harness, result) = run_scenario("unknown_request").await;
+    result.expect("unknown request does not fail the turn");
+    let log = log_entries(&harness.log_path);
+    let response = log
+        .iter()
+        .find_map(|entry| entry.get("unknown_response"))
+        .expect("unknown request response");
+    assert_eq!(response["id"], "unknown-1");
+    assert_eq!(response["error"]["code"], -32601);
 }
 
 #[tokio::test]
@@ -411,10 +545,15 @@ async fn user_input_required_fails_without_stalling() {
     drop(session);
 
     assert!(error.contains("user_input_required"), "{error}");
-    assert!(
-        log_entries(&harness.log_path)
-            .iter()
-            .any(|entry| entry.get("input_response").is_some())
+    let fixture = compatibility_fixture();
+    let log = log_entries(&harness.log_path);
+    let input_response = log
+        .iter()
+        .find_map(|entry| entry.get("input_response"))
+        .expect("user input response");
+    assert_eq!(
+        input_response["result"],
+        fixture["server_requests"]["user_input_result"]
     );
     assert!(
         events
@@ -423,6 +562,61 @@ async fn user_input_required_fails_without_stalling() {
             .iter()
             .any(|event| event.event == "turn_input_required")
     );
+}
+
+#[tokio::test]
+async fn protocol_drift_errors_are_typed_and_reap_the_child() {
+    for scenario in [
+        "bad_status",
+        "bad_usage",
+        "bad_rate_limits",
+        "missing_request_id",
+        "bad_approval",
+    ] {
+        let harness = harness(scenario);
+        let client = CodexAppServerClient::new(config(harness.command.clone()));
+        let workspace_path =
+            fs::canonicalize(harness.workspace.path()).expect("canonical workspace");
+        let mut on_event = |_| {};
+        let mut session = client
+            .start_session(&workspace_path, &mut on_event)
+            .await
+            .expect("session starts");
+        let error = session
+            .run_turn("scrubbed protocol test")
+            .await
+            .expect_err("protocol drift must fail")
+            .to_string();
+        assert!(error.contains("protocol_error"), "{scenario}: {error}");
+        assert_child_reaped(&harness).await;
+        session.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_startup_responses_are_typed_and_reap_the_child() {
+    for scenario in [
+        "startup_missing_id",
+        "startup_missing_field",
+        "startup_bad_id",
+        "thread_missing_id",
+    ] {
+        let harness = harness(scenario);
+        let client = CodexAppServerClient::new(config(harness.command.clone()));
+        let mut on_event = |_| {};
+        let error = match client
+            .start_session(harness.workspace.path(), &mut on_event)
+            .await
+        {
+            Ok(mut session) => {
+                session.shutdown().await;
+                panic!("malformed startup response must fail");
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("protocol_error"), "{scenario}: {error}");
+        assert_child_reaped(&harness).await;
+    }
 }
 
 #[tokio::test]
