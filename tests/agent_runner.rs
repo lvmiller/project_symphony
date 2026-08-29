@@ -557,6 +557,7 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
         codex: CodexConfig {
             command: "codex app-server".to_string(),
             approval_policy: None,
+            trusted_danger_full_access: false,
             thread_sandbox: None,
             turn_sandbox_policy: None,
             turn_timeout_ms: 1_000,

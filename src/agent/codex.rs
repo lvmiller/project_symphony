@@ -264,9 +264,21 @@ impl<'a> CodexJsonlSession<'a> {
         workspace: &Path,
         on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
     ) -> Result<Self> {
+        let workspace = if target.is_local() {
+            match std::fs::canonicalize(workspace) {
+                Ok(workspace) => workspace,
+                Err(source) => {
+                    let error = SymphonyError::io(Some(workspace.to_path_buf()), source);
+                    emit_startup_failed(on_event, &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            workspace.to_path_buf()
+        };
         let mut command = match target {
             ExecutionTarget::Local => {
-                let bash_command = match bash_command_in_workspace(workspace, &config.command) {
+                let bash_command = match bash_command_in_workspace(&workspace, &config.command) {
                     Ok(command) => command,
                     Err(error) => {
                         emit_startup_failed(on_event, &error);
@@ -278,7 +290,7 @@ impl<'a> CodexJsonlSession<'a> {
                 command
             }
             ExecutionTarget::Ssh { host } => {
-                let script = match remote_codex_command(workspace, &config.command) {
+                let script = match remote_codex_command(&workspace, &config.command) {
                     Ok(script) => script,
                     Err(error) => {
                         emit_startup_failed(on_event, &error);
@@ -297,7 +309,7 @@ impl<'a> CodexJsonlSession<'a> {
             .kill_on_drop(true);
         #[cfg(not(windows))]
         if target.is_local() {
-            command.current_dir(workspace);
+            command.current_dir(&workspace);
         }
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -337,7 +349,7 @@ impl<'a> CodexJsonlSession<'a> {
             config,
             github_graphql,
             target: target.clone(),
-            workspace: workspace.to_path_buf(),
+            workspace,
             child,
             stdin,
             stdout: BufReader::new(stdout),
@@ -394,18 +406,20 @@ impl<'a> CodexJsonlSession<'a> {
     }
 
     async fn start_turn(&mut self, thread_id: &str, prompt: &str) -> Result<String> {
+        let cwd = self.workspace_string()?;
+        let sandbox_policy = self.config.turn_sandbox_policy_for_workspace(cwd.clone());
         let id = self
             .send_typed_request(
                 METHOD_TURN_START,
                 TurnStartParams {
                     thread_id,
-                    cwd: self.workspace_string()?,
+                    cwd,
                     input: [TextInput {
                         kind: "text",
                         text: prompt,
                     }],
                     approval_policy: self.config.approval_policy.clone(),
-                    sandbox_policy: self.config.turn_sandbox_policy.clone(),
+                    sandbox_policy: Some(sandbox_policy),
                 },
             )
             .await?;

@@ -85,9 +85,14 @@ agent:
 codex:
   command: codex app-server
   approval_policy: never
-  thread_sandbox: danger-full-access
-  turn_sandbox_policy:
-    type: dangerFullAccess
+  # Issue text is untrusted. The restrictive default is active unless a trusted
+  # operator explicitly opts in to full access below.
+  trusted_danger_full_access: false
+  thread_sandbox: workspace-write
+  # Omit turn_sandbox_policy to materialize workspaceWrite with only the active
+  # canonical workspace writable; network and temporary-directory roots are denied.
+  # Full access needs trusted_danger_full_access: true plus deliberately selected
+  # danger-full-access/dangerFullAccess settings in this operator-controlled file.
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
   stall_timeout_ms: 300000

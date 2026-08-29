@@ -304,25 +304,48 @@ fn config(command: String) -> CodexConfig {
     CodexConfig {
         command,
         approval_policy: Some(json!("never")),
-        thread_sandbox: Some(json!("danger-full-access")),
-        turn_sandbox_policy: Some(json!({ "type": "dangerFullAccess" })),
+        trusted_danger_full_access: false,
+        thread_sandbox: Some(json!("workspace-write")),
+        turn_sandbox_policy: None,
         turn_timeout_ms: 5_000,
         read_timeout_ms: 5_000,
         stall_timeout_ms: 0,
     }
 }
 
+fn full_access_config(command: String) -> CodexConfig {
+    CodexConfig {
+        thread_sandbox: Some(json!("danger-full-access")),
+        turn_sandbox_policy: Some(json!({ "type": "dangerFullAccess" })),
+        trusted_danger_full_access: true,
+        ..config(command)
+    }
+}
+
 async fn run_scenario(scenario: &str) -> (Harness, symphony::Result<Vec<CodexEvent>>) {
-    run_scenario_with_github_graphql(scenario, None).await
+    run_scenario_with_config(scenario, config, None).await
 }
 
 async fn run_scenario_with_github_graphql(
     scenario: &str,
     github_graphql: Option<GitHubGraphqlExecutor>,
 ) -> (Harness, symphony::Result<Vec<CodexEvent>>) {
+    run_scenario_with_config(scenario, config, github_graphql).await
+}
+
+async fn run_scenario_with_config<F>(
+    scenario: &str,
+    config_factory: F,
+    github_graphql: Option<GitHubGraphqlExecutor>,
+) -> (Harness, symphony::Result<Vec<CodexEvent>>)
+where
+    F: FnOnce(String) -> CodexConfig,
+{
     let harness = harness(scenario);
-    let client =
-        CodexAppServerClient::with_github_graphql(config(harness.command.clone()), github_graphql);
+    let client = CodexAppServerClient::with_github_graphql(
+        config_factory(harness.command.clone()),
+        github_graphql,
+    );
     let workspace_path = fs::canonicalize(harness.workspace.path()).expect("canonical workspace");
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&events);
@@ -505,11 +528,17 @@ async fn sends_schema_shaped_startup_messages_and_streams_completion() {
     assert_eq!(received[3]["method"], "turn/start");
     assert_eq!(received[2]["params"]["cwd"], bash_workspace_path.as_str());
     assert_eq!(received[2]["params"]["approvalPolicy"], "never");
-    assert_eq!(received[2]["params"]["sandbox"], "danger-full-access");
+    assert_eq!(received[2]["params"]["sandbox"], "workspace-write");
     assert_eq!(received[3]["params"]["cwd"], bash_workspace_path.as_str());
     assert_eq!(
         received[3]["params"]["sandboxPolicy"],
-        json!({"type":"dangerFullAccess"})
+        json!({
+            "type":"workspaceWrite",
+            "writableRoots":[bash_workspace_path],
+            "networkAccess":false,
+            "excludeTmpdirEnvVar":true,
+            "excludeSlashTmp":true
+        })
     );
     assert_eq!(
         received[3]["params"]["input"],
@@ -542,6 +571,23 @@ async fn sends_schema_shaped_startup_messages_and_streams_completion() {
         event.event == "notification"
             && event.message.as_deref() == Some("Codex notification: notice")
     }));
+}
+
+#[tokio::test]
+async fn sends_full_access_only_when_explicitly_trusted() {
+    let (harness, result) = run_scenario_with_config("complete", full_access_config, None).await;
+    result.expect("trusted full-access run completes");
+    let log = log_entries(&harness.log_path);
+    let received: Vec<&Value> = log
+        .iter()
+        .filter_map(|entry| entry.get("received"))
+        .collect();
+
+    assert_eq!(received[2]["params"]["sandbox"], "danger-full-access");
+    assert_eq!(
+        received[3]["params"]["sandboxPolicy"],
+        json!({"type":"dangerFullAccess"})
+    );
 }
 
 #[tokio::test]

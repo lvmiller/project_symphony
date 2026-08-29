@@ -89,6 +89,7 @@ fn config(
         codex: CodexConfig {
             command: "codex".to_string(),
             approval_policy: None,
+            trusted_danger_full_access: false,
             thread_sandbox: None,
             turn_sandbox_policy: None,
             turn_timeout_ms: 60_000,

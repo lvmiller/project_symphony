@@ -112,6 +112,24 @@ fn github_defaults_and_default_token_indirection_are_applied() {
     assert_eq!(config.codex.turn_timeout_ms, 3_600_000);
     assert_eq!(config.codex.read_timeout_ms, 5_000);
     assert_eq!(config.codex.stall_timeout_ms, 300_000);
+    assert!(!config.codex.trusted_danger_full_access);
+    assert_eq!(
+        config.codex.thread_sandbox,
+        Some(serde_json::json!("workspace-write"))
+    );
+    assert_eq!(config.codex.turn_sandbox_policy, None);
+    assert_eq!(
+        config
+            .codex
+            .turn_sandbox_policy_for_workspace("/absolute/workspace".to_string()),
+        serde_json::json!({
+            "type": "workspaceWrite",
+            "writableRoots": ["/absolute/workspace"],
+            "networkAccess": false,
+            "excludeTmpdirEnvVar": true,
+            "excludeSlashTmp": true,
+        })
+    );
     assert!(config.workspace.root.ends_with("symphony_workspaces"));
     assert_eq!(
         config.workspace.cleanup.after_success,
@@ -127,6 +145,76 @@ fn github_defaults_and_default_token_indirection_are_applied() {
     );
     assert_eq!(config.completion.direct_commit.auto_approved_state, "Done");
     assert_eq!(config.completion.direct_commit.started_state, None);
+}
+
+#[test]
+fn codex_full_access_requires_trusted_operator_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            "thread_sandbox: danger-full-access\n",
+            "codex.thread_sandbox: danger-full-access requires codex.trusted_danger_full_access: true",
+        ),
+        (
+            "turn_sandbox_policy:\n    type: dangerFullAccess\n",
+            "codex.turn_sandbox_policy.type: dangerFullAccess requires codex.trusted_danger_full_access: true",
+        ),
+    ];
+
+    for (codex_config, expected_message) in cases {
+        let path = write_workflow(
+            temp.path(),
+            &format!("---\ncodex:\n  {codex_config}---\nPrompt\n"),
+        );
+        let diagnostics = workflow_diagnostics(Some(path.clone())).unwrap();
+        assert_eq!(diagnostics.parse.status, ConfigDiagnosticStatus::Failed);
+        assert_eq!(
+            diagnostics.parse.error_class.as_deref(),
+            Some("untrusted_danger_full_access")
+        );
+        match EffectiveConfig::load(Some(path)).unwrap_err() {
+            SymphonyError::ConfigValidation { code, message } => {
+                assert_eq!(code, "untrusted_danger_full_access");
+                assert_eq!(message, expected_message);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    let opted_in = write_workflow(
+        temp.path(),
+        "---\ncodex:\n  trusted_danger_full_access: true\n  thread_sandbox: danger-full-access\n  turn_sandbox_policy:\n    type: dangerFullAccess\n---\nPrompt\n",
+    );
+    let config = load_from_path(opted_in);
+    assert!(config.codex.trusted_danger_full_access);
+    assert_eq!(
+        config.codex.thread_sandbox,
+        Some(serde_json::json!("danger-full-access"))
+    );
+    assert_eq!(
+        config.codex.turn_sandbox_policy,
+        Some(serde_json::json!({ "type": "dangerFullAccess" }))
+    );
+    let configured_policy = write_workflow(
+        temp.path(),
+        "---\ncodex:\n  thread_sandbox: read-only\n  turn_sandbox_policy:\n    type: workspaceWrite\n    writableRoots:\n      - /operator-selected-root\n    networkAccess: true\n    operatorExtension: preserve-me\n---\nPrompt\n",
+    );
+    let config = load_from_path(configured_policy);
+    assert_eq!(
+        config.codex.thread_sandbox,
+        Some(serde_json::json!("read-only"))
+    );
+    assert_eq!(
+        config
+            .codex
+            .turn_sandbox_policy_for_workspace("/ignored-by-configured-policy".to_string()),
+        serde_json::json!({
+            "type": "workspaceWrite",
+            "writableRoots": ["/operator-selected-root"],
+            "networkAccess": true,
+            "operatorExtension": "preserve-me",
+        })
+    );
 }
 
 #[test]
@@ -814,6 +902,24 @@ fn raw_workflow_schema_is_static_extensible_and_documents_defaults() {
     assert_eq!(
         schema["properties"]["agent"]["properties"]["max_turns"]["default"],
         20
+    );
+    assert_eq!(
+        schema["properties"]["codex"]["properties"]["trusted_danger_full_access"]["default"],
+        false
+    );
+    assert_eq!(
+        schema["properties"]["codex"]["properties"]["thread_sandbox"]["default"],
+        "workspace-write"
+    );
+    assert_eq!(
+        schema["properties"]["codex"]["properties"]["turn_sandbox_policy"]["default"],
+        serde_json::json!({
+            "type": "workspaceWrite",
+            "writableRoots": [],
+            "networkAccess": false,
+            "excludeTmpdirEnvVar": true,
+            "excludeSlashTmp": true,
+        })
     );
     assert_eq!(
         schema["properties"]["completion"]["properties"]["direct_commit"]["properties"]["dry_run"]

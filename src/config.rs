@@ -3,9 +3,9 @@
 //! Implementation-defined choices documented here:
 //! - Tracker adapter: this Rust implementation supports `tracker.kind: github` and maps GitHub
 //!   Projects v2 Status values onto Symphony issue states. Repository-only issues are not dispatched.
-//! - Approval/sandbox posture: Codex `approvalPolicy = "never"`, thread sandbox
-//!   `danger-full-access`, and turn sandbox policy `{type: "dangerFullAccess"}` are pass-through
-//!   values. Regardless of them, Symphony declines every command or file-change approval request.
+//! - Approval/sandbox posture: Codex `approvalPolicy = "never"` and the default sandbox confines
+//!   issue-driven work to its active workspace without network or temporary-directory access.
+//!   Full access requires the explicit trusted-local `codex.trusted_danger_full_access` opt-in.
 //! - Workspace population: Symphony creates/reuses per-issue directories and removes them after a
 //!   successful direct-commit completion unless `workspace.cleanup.after_success: never` is set.
 //!   Checkout/sync/bootstrap is owned by configured hooks.
@@ -434,8 +434,9 @@ pub fn raw_workflow_json_schema() -> serde_json::Value {
                 "properties": {
                     "command": { "type": "string", "minLength": 1, "default": "codex app-server" },
                     "approval_policy": { "description": "Pass-through Codex approval policy.", "default": "never" },
-                    "thread_sandbox": { "description": "Pass-through Codex thread sandbox.", "default": "danger-full-access" },
-                    "turn_sandbox_policy": { "description": "Pass-through Codex turn sandbox policy.", "default": { "type": "dangerFullAccess" } },
+                    "trusted_danger_full_access": { "type": "boolean", "default": false, "description": "Required before codex.thread_sandbox: danger-full-access or codex.turn_sandbox_policy.type: dangerFullAccess may be used. Set only in trusted operator-controlled workflow configuration." },
+                    "thread_sandbox": { "description": "Pass-through Codex thread sandbox.", "default": "workspace-write" },
+                    "turn_sandbox_policy": { "description": "Pass-through Codex turn sandbox policy. When omitted, Symphony materializes this restrictive default with writableRoots set to the active canonical workspace immediately before turn/start.", "default": { "type": "workspaceWrite", "writableRoots": [], "networkAccess": false, "excludeTmpdirEnvVar": true, "excludeSlashTmp": true } },
                     "turn_timeout_ms": { "type": "integer", "minimum": 1, "default": 3600000 },
                     "read_timeout_ms": { "type": "integer", "minimum": 1, "default": 5000 },
                     "stall_timeout_ms": { "type": "integer", "default": 300000 }
@@ -868,11 +869,29 @@ pub struct AgentConfig {
 pub struct CodexConfig {
     pub command: String,
     pub approval_policy: Option<serde_json::Value>,
+    #[serde(default)]
+    pub trusted_danger_full_access: bool,
     pub thread_sandbox: Option<serde_json::Value>,
     pub turn_sandbox_policy: Option<serde_json::Value>,
     pub turn_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub stall_timeout_ms: i64,
+}
+
+impl CodexConfig {
+    /// Returns the configured policy unchanged, or materializes the restrictive per-workspace
+    /// default immediately before it is sent to the Codex app-server.
+    pub fn turn_sandbox_policy_for_workspace(&self, workspace: String) -> serde_json::Value {
+        self.turn_sandbox_policy.clone().unwrap_or_else(|| {
+            serde_json::json!({
+                "type": "workspaceWrite",
+                "writableRoots": [workspace],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true,
+            })
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1637,14 +1656,37 @@ fn parse_codex(config: &Mapping) -> Result<CodexConfig> {
             "codex.read_timeout_ms must be positive",
         ));
     }
+    let trusted_danger_full_access = get_bool(codex, "trusted_danger_full_access").unwrap_or(false);
+    let thread_sandbox = get_json_value(codex, "thread_sandbox")
+        .or_else(|| Some(serde_json::json!("workspace-write")));
+    let turn_sandbox_policy = get_json_value(codex, "turn_sandbox_policy");
+    if !trusted_danger_full_access
+        && thread_sandbox.as_ref().and_then(serde_json::Value::as_str) == Some("danger-full-access")
+    {
+        return Err(SymphonyError::config(
+            "untrusted_danger_full_access",
+            "codex.thread_sandbox: danger-full-access requires codex.trusted_danger_full_access: true",
+        ));
+    }
+    if !trusted_danger_full_access
+        && turn_sandbox_policy
+            .as_ref()
+            .and_then(|policy| policy.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dangerFullAccess")
+    {
+        return Err(SymphonyError::config(
+            "untrusted_danger_full_access",
+            "codex.turn_sandbox_policy.type: dangerFullAccess requires codex.trusted_danger_full_access: true",
+        ));
+    }
     Ok(CodexConfig {
         command,
         approval_policy: get_json_value(codex, "approval_policy")
             .or_else(|| Some(serde_json::json!("never"))),
-        thread_sandbox: get_json_value(codex, "thread_sandbox")
-            .or_else(|| Some(serde_json::json!("danger-full-access"))),
-        turn_sandbox_policy: get_json_value(codex, "turn_sandbox_policy")
-            .or_else(|| Some(serde_json::json!({ "type": "dangerFullAccess" }))),
+        trusted_danger_full_access,
+        thread_sandbox,
+        turn_sandbox_policy,
         turn_timeout_ms: turn_timeout_ms as u64,
         read_timeout_ms: read_timeout_ms as u64,
         stall_timeout_ms,
