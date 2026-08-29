@@ -10,7 +10,7 @@ use symphony::config::{
 };
 use symphony::domain::Issue;
 use symphony::error::SymphonyError;
-use symphony::tracker::github::GitHubTrackerClient;
+use symphony::tracker::github::{GitHubGraphqlExecutor, GitHubTrackerClient};
 use symphony::tracker::{TrackerClient, TrackerWriter};
 
 #[tokio::test]
@@ -38,6 +38,70 @@ async fn sends_auth_query_and_project_variables() {
     assert!(body["variables"]["after"].is_null());
     assert_eq!(body["variables"]["isOrganization"].as_bool(), Some(true));
     assert_eq!(body["variables"]["isUser"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn raw_graphql_executor_uses_configured_endpoint_auth_and_preserves_graphql_body() {
+    let response_body = json!({
+        "data": null,
+        "errors": [{"message": "field is unavailable", "path": ["viewer"]}]
+    });
+    let server = TestServer::new(vec![ok(response_body.clone())]);
+    let executor = raw_executor(server.url());
+    assert!(!format!("{executor:?}").contains("test-token"));
+
+    let body = executor
+        .execute(
+            "query Viewer($login: String!) { viewer { login } }",
+            json!({"login": "octocat"}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(body, response_body);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("authorization: Bearer test-token"));
+    let request: Value = serde_json::from_str(request_body(&requests[0])).unwrap();
+    assert_eq!(request["variables"], json!({"login": "octocat"}));
+    assert!(
+        request["query"]
+            .as_str()
+            .unwrap()
+            .contains("query Viewer($login: String!)")
+    );
+}
+
+#[tokio::test]
+async fn raw_graphql_executor_distinguishes_transport_status_and_malformed_responses() {
+    let refused = TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused_url = format!("http://{}/graphql", refused.local_addr().unwrap());
+    drop(refused);
+    let err = raw_executor(refused_url)
+        .execute("query { viewer { login } }", json!({}))
+        .await
+        .unwrap_err();
+    assert_tracker_kind(err, "github_transport");
+
+    let status_server = TestServer::new(vec![response(502, json!({"message": "upstream"}))]);
+    let err = raw_executor(status_server.url())
+        .execute("query { viewer { login } }", json!({}))
+        .await
+        .unwrap_err();
+    assert_tracker_kind(err, "github_status");
+
+    let malformed_server = TestServer::new(vec![raw_response(200, "not json")]);
+    let err = raw_executor(malformed_server.url())
+        .execute("query { viewer { login } }", json!({}))
+        .await
+        .unwrap_err();
+    assert_tracker_kind(err, "github_malformed");
+
+    let err = raw_executor(TestServer::new(Vec::new()).url())
+        .execute("query { viewer { login } }", json!(["not", "an", "object"]))
+        .await
+        .unwrap_err();
+    assert_tracker_kind(err, "github_malformed");
 }
 
 #[tokio::test]
@@ -278,10 +342,11 @@ async fn candidate_fetch_pages_nested_labels_and_field_values_before_normalizing
             None,
             vec![single_select("Status", "Todo"), text_field("Priority", "8")],
         )),
+        ok(labels_page(true, Some("label-cursor-2"), vec!["P1"])),
         ok(labels_page(
             false,
             None,
-            vec!["P1", "blocked-by:octo-org/octo-repo#8"],
+            vec!["blocked-by:octo-org/octo-repo#8"],
         )),
     ]);
     let client = client(server.url(), vec!["Todo"], BTreeMap::new());
@@ -302,7 +367,7 @@ async fn candidate_fetch_pages_nested_labels_and_field_values_before_normalizing
     );
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     let field_body: Value = serde_json::from_str(request_body(&requests[1])).unwrap();
     assert!(
         field_body["query"]
@@ -321,6 +386,8 @@ async fn candidate_fetch_pages_nested_labels_and_field_values_before_normalizing
     );
     assert_eq!(labels_body["variables"]["id"], "I_nested");
     assert_eq!(labels_body["variables"]["after"], "label-cursor-1");
+    let second_labels_body: Value = serde_json::from_str(request_body(&requests[3])).unwrap();
+    assert_eq!(second_labels_body["variables"]["after"], "label-cursor-2");
 }
 
 #[tokio::test]
@@ -411,32 +478,191 @@ async fn state_refresh_pages_issue_project_items_and_nested_field_values() {
 }
 
 #[tokio::test]
+async fn pagination_boundaries_fail_without_returning_partially_normalized_issues() {
+    let field_cursor_missing = json!({
+        "id": "ITEM_field_cursor",
+        "content": issue_node("I_field_cursor", 60, &["Bug"]),
+        "fieldValues": {
+            "pageInfo": {"hasNextPage": true, "endCursor": null},
+            "nodes": [single_select("Status", "Todo")]
+        }
+    });
+    let field_cursor_client = client(
+        TestServer::new(vec![ok(project_page(
+            false,
+            None,
+            vec![field_cursor_missing],
+        ))])
+        .url(),
+        vec!["Todo"],
+        BTreeMap::new(),
+    );
+    assert_tracker_kind(
+        field_cursor_client
+            .fetch_candidate_issues()
+            .await
+            .unwrap_err(),
+        "github_pagination",
+    );
+
+    let mut label_content = issue_node("I_label_cursor", 61, &["Bug"]);
+    label_content.as_object_mut().unwrap().insert(
+        "labels".to_string(),
+        json!({
+            "pageInfo": {"hasNextPage": true, "endCursor": null},
+            "nodes": [{"name": "Bug"}]
+        }),
+    );
+    let label_cursor_missing = json!({
+        "id": "ITEM_label_cursor",
+        "content": label_content,
+        "fieldValues": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [single_select("Status", "Todo")]
+        }
+    });
+    let label_cursor_client = client(
+        TestServer::new(vec![ok(project_page(
+            false,
+            None,
+            vec![label_cursor_missing],
+        ))])
+        .url(),
+        vec!["Todo"],
+        BTreeMap::new(),
+    );
+    assert_tracker_kind(
+        label_cursor_client
+            .fetch_candidate_issues()
+            .await
+            .unwrap_err(),
+        "github_pagination",
+    );
+
+    let mut project_item_cursor_missing = issue_node("I_item_cursor", 62, &["Bug"]);
+    project_item_cursor_missing.as_object_mut().unwrap().insert(
+        "projectItems".to_string(),
+        json!({
+            "pageInfo": {"hasNextPage": true, "endCursor": null},
+            "nodes": []
+        }),
+    );
+    let project_item_cursor_client = client(
+        TestServer::new(vec![ok(
+            json!({"data": {"nodes": [project_item_cursor_missing]}}),
+        )])
+        .url(),
+        vec!["Todo"],
+        BTreeMap::new(),
+    );
+    assert_tracker_kind(
+        project_item_cursor_client
+            .fetch_issue_states_by_ids(&["I_item_cursor".to_string()])
+            .await
+            .unwrap_err(),
+        "github_pagination",
+    );
+
+    let mut nested_field_cursor_missing = issue_node("I_refresh_field_cursor", 63, &["Bug"]);
+    nested_field_cursor_missing.as_object_mut().unwrap().insert(
+        "projectItems".to_string(),
+        json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "id": "ITEM_refresh_field_cursor",
+                "project": configured_project(),
+                "fieldValues": {
+                    "pageInfo": {"hasNextPage": true, "endCursor": null},
+                    "nodes": [single_select("Status", "Todo")]
+                }
+            }]
+        }),
+    );
+    let nested_field_cursor_client = client(
+        TestServer::new(vec![ok(
+            json!({"data": {"nodes": [nested_field_cursor_missing]}}),
+        )])
+        .url(),
+        vec!["Todo"],
+        BTreeMap::new(),
+    );
+    assert_tracker_kind(
+        nested_field_cursor_client
+            .fetch_issue_states_by_ids(&["I_refresh_field_cursor".to_string()])
+            .await
+            .unwrap_err(),
+        "github_pagination",
+    );
+
+    let missing_page_info = json!({
+        "id": "ITEM_missing_page_info",
+        "content": issue_node("I_missing_page_info", 64, &["Bug"]),
+        "fieldValues": {"nodes": [single_select("Status", "Todo")]}
+    });
+    let malformed_connection_client = client(
+        TestServer::new(vec![ok(project_page(false, None, vec![missing_page_info]))]).url(),
+        vec!["Todo"],
+        BTreeMap::new(),
+    );
+    assert_tracker_kind(
+        malformed_connection_client
+            .fetch_candidate_issues()
+            .await
+            .unwrap_err(),
+        "github_malformed",
+    );
+}
+
+#[tokio::test]
+async fn project_item_pagination_has_an_explicit_safety_limit() {
+    let responses = (0..1_000)
+        .map(|page| {
+            ok(project_page(
+                true,
+                Some(&format!("cursor-{page}")),
+                Vec::new(),
+            ))
+        })
+        .collect();
+    let server = TestServer::new(responses);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    let err = client.fetch_candidate_issues().await.unwrap_err();
+
+    assert_tracker_kind(err, "github_pagination");
+    assert_eq!(server.requests().len(), 1_000);
+}
+
+#[tokio::test]
 async fn state_refresh_uses_only_the_configured_project_status() {
     let mut issue = issue_node("I_multiple_projects", 55, &["Bug"]);
     issue.as_object_mut().unwrap().insert(
         "projectItems".to_string(),
-        json!({"nodes": [
-            issue_project_item(
-                "ITEM_wrong_owner",
-                project("Organization", "other-org", 7),
-                vec![single_select("Status", "Done")],
-            ),
-            issue_project_item(
-                "ITEM_wrong_owner_type",
-                project("User", "octo-org", 7),
-                vec![single_select("Status", "In Progress")],
-            ),
-            issue_project_item(
-                "ITEM_wrong_number",
-                project("Organization", "octo-org", 8),
-                vec![single_select("Status", "Review")],
-            ),
-            issue_project_item(
-                "ITEM_configured",
-                configured_project(),
-                vec![single_select("Status", "Todo")],
-            )
-        ]}),
+        json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [
+                issue_project_item(
+                    "ITEM_wrong_owner",
+                    project("Organization", "other-org", 7),
+                    vec![single_select("Status", "Done")],
+                ),
+                issue_project_item(
+                    "ITEM_wrong_owner_type",
+                    project("User", "octo-org", 7),
+                    vec![single_select("Status", "In Progress")],
+                ),
+                issue_project_item(
+                    "ITEM_wrong_number",
+                    project("Organization", "octo-org", 8),
+                    vec![single_select("Status", "Review")],
+                ),
+                issue_project_item(
+                    "ITEM_configured",
+                    configured_project(),
+                    vec![single_select("Status", "Todo")],
+                )
+            ]
+        }),
     );
     let server = TestServer::new(vec![ok(json!({"data": {"nodes": [issue]}}))]);
     let client = client(server.url(), vec!["Todo"], BTreeMap::new());
@@ -455,18 +681,21 @@ async fn state_refresh_matches_user_owned_configured_project() {
     let mut issue = issue_node("I_user_project", 56, &["Bug"]);
     issue.as_object_mut().unwrap().insert(
         "projectItems".to_string(),
-        json!({"nodes": [
-            issue_project_item(
-                "ITEM_org",
-                configured_project(),
-                vec![single_select("Status", "Done")],
-            ),
-            issue_project_item(
-                "ITEM_user",
-                project("User", "octo-user", 7),
-                vec![single_select("Status", "Review")],
-            )
-        ]}),
+        json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [
+                issue_project_item(
+                    "ITEM_org",
+                    configured_project(),
+                    vec![single_select("Status", "Done")],
+                ),
+                issue_project_item(
+                    "ITEM_user",
+                    project("User", "octo-user", 7),
+                    vec![single_select("Status", "Review")],
+                )
+            ]
+        }),
     );
     let server = TestServer::new(vec![ok(json!({"data": {"nodes": [issue]}}))]);
     let client = client_for_owner_type(
@@ -490,11 +719,14 @@ async fn state_refresh_treats_absence_from_configured_project_as_missing_state()
     let mut not_a_member = issue_node("I_not_a_member", 57, &["Bug"]);
     not_a_member.as_object_mut().unwrap().insert(
         "projectItems".to_string(),
-        json!({"nodes": [issue_project_item(
-            "ITEM_other",
-            project("Organization", "other-org", 7),
-            vec![single_select("Status", "Todo")],
-        )]}),
+        json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [issue_project_item(
+                "ITEM_other",
+                project("Organization", "other-org", 7),
+                vec![single_select("Status", "Todo")],
+            )]
+        }),
     );
     let server = TestServer::new(vec![ok(json!({
         "data": {"nodes": [not_a_member]}
@@ -514,11 +746,14 @@ async fn state_refresh_rejects_configured_project_item_missing_status() {
     let mut no_status = issue_node("I_missing_status", 58, &["Bug"]);
     no_status.as_object_mut().unwrap().insert(
         "projectItems".to_string(),
-        json!({"nodes": [issue_project_item(
-            "ITEM_no_status",
-            configured_project(),
-            vec![text_field("Priority", "1")],
-        )]}),
+        json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [issue_project_item(
+                "ITEM_no_status",
+                configured_project(),
+                vec![text_field("Priority", "1")],
+            )]
+        }),
     );
     let server = TestServer::new(vec![ok(json!({"data": {"nodes": [no_status]}}))]);
     let missing_status_client = client(server.url(), vec!["Todo"], BTreeMap::new());
@@ -831,6 +1066,10 @@ fn issue_project_items_page_for_writer() -> Value {
     })
 }
 
+fn raw_executor(endpoint: String) -> GitHubGraphqlExecutor {
+    client(endpoint, vec!["Todo"], BTreeMap::new()).graphql_executor()
+}
+
 fn client(
     endpoint: String,
     active_states: Vec<&str>,
@@ -966,7 +1205,10 @@ fn project_item(
     json!({
         "id": format!("ITEM_{id}"),
         "content": issue_node(id, number, labels),
-        "fieldValues": {"nodes": fields}
+        "fieldValues": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": fields
+        }
     })
 }
 
@@ -974,11 +1216,17 @@ fn issue_node_with_project_item(id: &str, number: i64, status: &str) -> Value {
     let mut node = issue_node(id, number, &["Bug"]);
     node.as_object_mut().unwrap().insert(
         "projectItems".to_string(),
-        json!({"nodes": [{
-            "id": format!("ITEM_{id}"),
-            "project": configured_project(),
-            "fieldValues": {"nodes": [single_select("Status", status)]}
-        }]}),
+        json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "id": format!("ITEM_{id}"),
+                "project": configured_project(),
+                "fieldValues": {
+                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [single_select("Status", status)]
+                }
+            }]
+        }),
     );
     node
 }
@@ -998,7 +1246,10 @@ fn issue_project_item(id: &str, project: Value, fields: Vec<Value>) -> Value {
     json!({
         "id": id,
         "project": project,
-        "fieldValues": {"nodes": fields}
+        "fieldValues": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": fields
+        }
     })
 }
 fn issue_node(id: &str, number: i64, labels: &[&str]) -> Value {
@@ -1016,7 +1267,10 @@ fn issue_node(id: &str, number: i64, labels: &[&str]) -> Value {
             "name": "octo-repo",
             "owner": {"login": "octo-org"}
         },
-        "labels": {"nodes": labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()}
+        "labels": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()
+        }
     })
 }
 
@@ -1075,6 +1329,13 @@ fn ok(body: Value) -> HttpResponse {
 }
 
 fn response(status: u16, body: Value) -> HttpResponse {
+    HttpResponse {
+        status,
+        body: body.to_string(),
+    }
+}
+
+fn raw_response(status: u16, body: &str) -> HttpResponse {
     HttpResponse {
         status,
         body: body.to_string(),

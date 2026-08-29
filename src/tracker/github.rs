@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -242,24 +243,26 @@ mutation SymphonyUpdateProjectStatus(
 }
 "#;
 
-#[derive(Clone, Debug)]
-pub struct GitHubTrackerClient {
+#[derive(Clone)]
+pub struct GitHubGraphqlExecutor {
     http: reqwest::Client,
     endpoint: String,
     token: String,
-    active_states: Vec<String>,
-    github: GithubConfig,
 }
 
-impl GitHubTrackerClient {
-    pub fn new(config: &EffectiveConfig) -> Result<Self> {
-        Self::from_tracker_config(&config.tracker)
+impl fmt::Debug for GitHubGraphqlExecutor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubGraphqlExecutor")
+            .finish_non_exhaustive()
     }
+}
 
+impl GitHubGraphqlExecutor {
     pub fn from_tracker_config(tracker: &TrackerConfig) -> Result<Self> {
         let github = tracker
             .github
-            .clone()
+            .as_ref()
             .ok_or(SymphonyError::MissingGithubConfig { field: "github" })?;
         let token = tracker
             .api_key
@@ -278,9 +281,74 @@ impl GitHubTrackerClient {
             http,
             endpoint: tracker.endpoint.clone(),
             token,
+        })
+    }
+
+    pub async fn execute(&self, query: &str, variables: Value) -> Result<Value> {
+        if !variables.is_object() {
+            return Err(tracker_error(
+                "github_malformed",
+                "GraphQL variables must be a JSON object",
+            ));
+        }
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&json!({ "query": query, "variables": variables }))
+            .send()
+            .await
+            .map_err(|err| tracker_error("github_transport", err.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| tracker_error("github_transport", err.to_string()))?;
+        if status != StatusCode::OK {
+            return Err(tracker_error(
+                "github_status",
+                format!("GitHub GraphQL HTTP status {}", status.as_u16()),
+            ));
+        }
+        let body: Value = serde_json::from_str(&body)
+            .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+        if !body.is_object() {
+            return Err(tracker_error(
+                "github_malformed",
+                "GitHub GraphQL response must be a JSON object",
+            ));
+        }
+        Ok(body)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GitHubTrackerClient {
+    graphql_executor: GitHubGraphqlExecutor,
+    active_states: Vec<String>,
+    github: GithubConfig,
+}
+
+impl GitHubTrackerClient {
+    pub fn new(config: &EffectiveConfig) -> Result<Self> {
+        Self::from_tracker_config(&config.tracker)
+    }
+
+    pub fn from_tracker_config(tracker: &TrackerConfig) -> Result<Self> {
+        let github = tracker
+            .github
+            .clone()
+            .ok_or(SymphonyError::MissingGithubConfig { field: "github" })?;
+        Ok(Self {
+            graphql_executor: GitHubGraphqlExecutor::from_tracker_config(tracker)?,
             active_states: tracker.active_states.clone(),
             github,
         })
+    }
+
+    pub fn graphql_executor(&self) -> GitHubGraphqlExecutor {
+        self.graphql_executor.clone()
     }
 
     async fn fetch_project_issues_for_states(&self, states: &[String]) -> Result<Vec<Issue>> {
@@ -360,27 +428,8 @@ impl GitHubTrackerClient {
     }
 
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        let response = self
-            .http
-            .post(&self.endpoint)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .json(&json!({ "query": query, "variables": variables }))
-            .send()
-            .await
-            .map_err(|err| tracker_error("github_transport", err.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|err| tracker_error("github_transport", err.to_string()))?;
-        if status != StatusCode::OK {
-            return Err(tracker_error(
-                "github_status",
-                format!("GitHub GraphQL HTTP status {}", status.as_u16()),
-            ));
-        }
-        let envelope: GraphqlEnvelope = serde_json::from_str(&body)
+        let body = self.graphql_executor.execute(query, variables).await?;
+        let envelope: GraphqlEnvelope = serde_json::from_value(body)
             .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
         if let Some(errors) = envelope.errors
             && !errors.is_empty()
@@ -423,13 +472,11 @@ impl GitHubTrackerClient {
         let Some(connection) = labels.as_object_mut() else {
             return Err(tracker_error("github_malformed", "malformed issue labels"));
         };
-        let mut page_info: PageInfo = serde_json::from_value(
-            connection
-                .get("pageInfo")
-                .cloned()
-                .unwrap_or_else(default_page_info_value),
-        )
-        .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+        let mut page_info: PageInfo =
+            serde_json::from_value(connection.get("pageInfo").cloned().ok_or_else(|| {
+                tracker_error("github_malformed", "missing issue label pageInfo")
+            })?)
+            .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
         let mut after = page_info.end_cursor.clone();
         for _ in 0..1_000 {
             if !page_info.has_next_page {
@@ -548,13 +595,11 @@ impl GitHubTrackerClient {
                 "malformed issue projectItems",
             ));
         };
-        let mut page_info: PageInfo = serde_json::from_value(
-            connection
-                .get("pageInfo")
-                .cloned()
-                .unwrap_or_else(default_page_info_value),
-        )
-        .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+        let mut page_info: PageInfo =
+            serde_json::from_value(connection.get("pageInfo").cloned().ok_or_else(|| {
+                tracker_error("github_malformed", "missing issue project item pageInfo")
+            })?)
+            .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
         let mut after = page_info.end_cursor.clone();
         for _ in 0..1_000 {
             if !page_info.has_next_page {
@@ -644,7 +689,7 @@ impl GitHubTrackerClient {
         item_id: &str,
         connection: &mut FieldValueConnection,
     ) -> Result<()> {
-        let mut page_info = std::mem::take(&mut connection.page_info);
+        let mut page_info = connection.page_info.clone();
         let mut after = page_info.end_cursor.clone();
         for _ in 0..1_000 {
             if !page_info.has_next_page {
@@ -717,13 +762,11 @@ impl GitHubTrackerClient {
             {
                 return Ok((project_id.to_string(), field_id, option_id));
             }
-            let page_info: PageInfo = serde_json::from_value(
-                fields
-                    .get("pageInfo")
-                    .cloned()
-                    .unwrap_or_else(default_page_info_value),
-            )
-            .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+            let page_info: PageInfo =
+                serde_json::from_value(fields.get("pageInfo").cloned().ok_or_else(|| {
+                    tracker_error("github_malformed", "missing project field pageInfo")
+                })?)
+                .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
             if !page_info.has_next_page {
                 return Err(tracker_error(
                     "github_malformed",
@@ -896,7 +939,7 @@ struct ProjectItemsConnection {
     nodes: Vec<ProjectItem>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PageInfo {
     has_next_page: bool,
@@ -917,7 +960,6 @@ struct ProjectItem {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FieldValueConnection {
-    #[serde(default)]
     page_info: PageInfo,
     nodes: Vec<Value>,
 }
@@ -950,8 +992,8 @@ struct RepositoryOwnerNode {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct LabelConnection {
-    #[serde(default)]
     page_info: PageInfo,
     nodes: Vec<LabelNode>,
 }
@@ -1200,10 +1242,6 @@ fn extend_connection_nodes(
         .ok_or_else(|| tracker_error("github_malformed", "missing connection nodes"))?;
     values.extend(nodes.iter().cloned());
     Ok(())
-}
-
-fn default_page_info_value() -> Value {
-    json!({"hasNextPage": false, "endCursor": null})
 }
 
 fn tracker_error(kind: &'static str, message: impl Into<String>) -> SymphonyError {
