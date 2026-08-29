@@ -13,9 +13,11 @@ use crate::config::{
     HooksConfig, WorkspacePopulationConfig, WorkspacePopulationKind, WorkspacePopulationReusePolicy,
 };
 use crate::error::{Result, SymphonyError};
+use crate::process::ManagedChild;
 
 const MAX_HOOK_OUTPUT_BYTES: usize = 8 * 1024;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug)]
 pub struct HookContext {
@@ -106,7 +108,8 @@ pub async fn run_hook(kind: HookKind, hooks: &HooksConfig, context: HookContext)
         "hook started"
     );
     let started_at = Instant::now();
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-lc")
         .arg(script)
         .current_dir(&context.workspace_path)
@@ -125,43 +128,39 @@ pub async fn run_hook(kind: HookKind, hooks: &HooksConfig, context: HookContext)
         .env(
             "SYMPHONY_ISSUE_KEY",
             crate::workspace::sanitize_workspace_key(&context.issue_identifier),
+        );
+    let mut child = ManagedChild::spawn(command).map_err(|err| {
+        hook_error(
+            kind,
+            &context,
+            started_at,
+            format!("spawn_failed={err}"),
+            None,
+            None,
         )
-        .spawn()
-        .map_err(|err| {
-            hook_error(
-                kind,
-                &context,
-                started_at,
-                format!("spawn_failed={err}"),
-                None,
-                None,
-            )
-        })?;
+    })?;
 
     let stdout = Arc::new(Mutex::new(CapturedOutput::default()));
     let stderr = Arc::new(Mutex::new(CapturedOutput::default()));
     let mut stdout_task = spawn_output_drain(
-        child.stdout.take().expect("hook stdout must be piped"),
+        child.take_stdout().expect("hook stdout must be piped"),
         Arc::clone(&stdout),
     );
     let mut stderr_task = spawn_output_drain(
-        child.stderr.take().expect("hook stderr must be piped"),
+        child.take_stderr().expect("hook stderr must be piped"),
         Arc::clone(&stderr),
     );
 
     let completion = match timeout(Duration::from_millis(hooks.timeout_ms), child.wait()).await {
         Ok(Ok(status)) => Ok(status),
         Ok(Err(error)) => Err(format!("wait_failed={error}")),
-        Err(_) => {
-            let _ = child.start_kill();
-            match child.wait().await {
-                Ok(_) => Err(format!("timeout after {} ms", hooks.timeout_ms)),
-                Err(error) => Err(format!(
-                    "timeout after {} ms; reap_failed={error}",
-                    hooks.timeout_ms
-                )),
-            }
-        }
+        Err(_) => match child.terminate_tree(PROCESS_TERMINATION_GRACE).await {
+            Ok(_) => Err(format!("timeout after {} ms", hooks.timeout_ms)),
+            Err(error) => Err(format!(
+                "timeout after {} ms; process_tree_cleanup_failed={error}",
+                hooks.timeout_ms
+            )),
+        },
     };
 
     drain_or_abort(&mut stdout_task).await;

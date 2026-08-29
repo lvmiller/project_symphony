@@ -9,6 +9,7 @@ pub mod hooks;
 pub mod logging;
 pub mod observability;
 pub mod orchestrator;
+pub(crate) mod process;
 pub mod prompt;
 pub mod service;
 pub mod shutdown;

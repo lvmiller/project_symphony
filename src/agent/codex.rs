@@ -7,12 +7,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::time::{Instant, timeout};
 
 use crate::config::CodexConfig;
 use crate::domain::{CodexEvent, ExecutionTarget, TokenTotals};
 use crate::error::{Result, SymphonyError};
+use crate::process::ManagedChild;
 use crate::tracker::github::GitHubGraphqlExecutor;
 
 const MAX_JSONL_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -28,6 +29,8 @@ const METHOD_COMMAND_APPROVAL: &str = "item/commandExecution/requestApproval";
 const METHOD_FILE_APPROVAL: &str = "item/fileChange/requestApproval";
 const METHOD_TOOL_CALL: &str = "item/tool/call";
 const METHOD_USER_INPUT: &str = "item/tool/requestUserInput";
+const CODEX_PROTOCOL_SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
+const CODEX_PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -246,7 +249,7 @@ struct CodexJsonlSession<'a> {
     github_graphql: Option<&'a GitHubGraphqlExecutor>,
     target: ExecutionTarget,
     workspace: PathBuf,
-    child: Child,
+    child: ManagedChild,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_request_id: i64,
@@ -305,13 +308,12 @@ impl<'a> CodexJsonlSession<'a> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
+            .stderr(Stdio::inherit());
         #[cfg(not(windows))]
         if target.is_local() {
             command.current_dir(&workspace);
         }
-        let mut child = match command.spawn() {
+        let mut child = match ManagedChild::spawn(command) {
             Ok(child) => child,
             Err(source) => {
                 let error = SymphonyError::io(None, source);
@@ -319,28 +321,30 @@ impl<'a> CodexJsonlSession<'a> {
                 return Err(error);
             }
         };
-        let stdin = match child.stdin.take() {
+        let stdin = match child.take_stdin() {
             Some(stdin) => stdin,
             None => {
                 let error = SymphonyError::codex(
                     "spawn_failed",
                     "codex app-server stdin was not available",
                 );
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                let _ = child
+                    .force_terminate_tree(CODEX_PROCESS_TERMINATION_GRACE)
+                    .await;
                 emit_startup_failed(on_event, &error);
                 return Err(error);
             }
         };
-        let stdout = match child.stdout.take() {
+        let stdout = match child.take_stdout() {
             Some(stdout) => stdout,
             None => {
                 let error = SymphonyError::codex(
                     "spawn_failed",
                     "codex app-server stdout was not available",
                 );
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                let _ = child
+                    .force_terminate_tree(CODEX_PROCESS_TERMINATION_GRACE)
+                    .await;
                 emit_startup_failed(on_event, &error);
                 return Err(error);
             }
@@ -898,12 +902,26 @@ impl<'a> CodexJsonlSession<'a> {
 
     async fn shutdown(&mut self) {
         let _ = self.stdin.shutdown().await;
-        if timeout(Duration::from_millis(200), self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
-            let _ = self.child.wait().await;
+        match self.child.wait_bounded(CODEX_PROTOCOL_SHUTDOWN_GRACE).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                #[cfg(unix)]
+                let _ = self
+                    .child
+                    .terminate_tree(CODEX_PROCESS_TERMINATION_GRACE)
+                    .await;
+                #[cfg(windows)]
+                let _ = self
+                    .child
+                    .force_terminate_tree(CODEX_PROCESS_TERMINATION_GRACE)
+                    .await;
+            }
+            Err(_) => {
+                let _ = self
+                    .child
+                    .force_terminate_tree(CODEX_PROCESS_TERMINATION_GRACE)
+                    .await;
+            }
         }
     }
 }
@@ -930,8 +948,10 @@ impl CodexSession for CodexJsonlSession<'_> {
             })
         }
         .await;
-        if is_protocol_error(&result) {
-            self.emit("protocol_error", None, None, None);
+        if result.is_err() {
+            if is_protocol_error(&result) {
+                self.emit("protocol_error", None, None, None);
+            }
             self.shutdown().await;
         }
         result

@@ -14,6 +14,20 @@ use symphony::workspace::{
 };
 use tempfile::TempDir;
 
+async fn assert_exact_process_exits(pid: u64) {
+    for _ in 0..100 {
+        let alive = Command::new("sh")
+            .args(["-lc", &format!("kill -0 {pid}")])
+            .status()
+            .expect("query exact descendant process")
+            .success();
+        if !alive {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("descendant process {pid} remained alive");
+}
 fn hooks_with_timeout(timeout_ms: u64) -> HooksConfig {
     HooksConfig {
         timeout_ms,
@@ -367,6 +381,31 @@ async fn hook_diagnostics_bound_large_stdout_and_stderr() {
         "diagnostics must retain bounded excerpts, got {} bytes",
         message.len()
     );
+}
+
+#[tokio::test]
+async fn timed_out_hook_terminates_its_exact_background_descendant() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(3_000);
+    hooks.before_run = Some("sleep 30 & printf '%s' \"$!\" > descendant.pid; wait".to_string());
+    let manager = manager(temp.path(), hooks);
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("create should succeed");
+
+    let error = manager
+        .before_run_for_source_issue("default", &issue("issue-1"), &workspace.path)
+        .await
+        .expect_err("hook must time out");
+    assert_hook_error(error, "before_run", "timeout after 3000 ms");
+
+    let pid = fs::read_to_string(workspace.path.join("descendant.pid"))
+        .expect("hook records descendant pid")
+        .trim()
+        .parse()
+        .expect("descendant pid is numeric");
+    assert_exact_process_exits(pid).await;
 }
 
 #[tokio::test]

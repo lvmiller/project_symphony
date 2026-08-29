@@ -21,6 +21,7 @@ const COMPATIBILITY_FIXTURE: &str = include_str!("fixtures/codex-app-server-v2/c
 const FAKE_CODEX: &str = r#"#!/usr/bin/env python3
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -87,6 +88,13 @@ if scenario == "thread_missing_id":
     send({"id": thread["id"], "result": {"thread": {}}})
     time.sleep(30)
 send({"id": str(thread["id"]) if scenario == "string_response_ids" else thread["id"], "result": fresh_fixture("startup", "thread_start_result")})
+
+if scenario == "shutdown_descendant":
+    descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    log({"descendant_pid": descendant.pid})
+    while recv() is not None:
+        pass
+    time.sleep(30)
 
 turn_number = 0
 while True:
@@ -215,6 +223,8 @@ while True:
         sys.stdout.flush()
         break
     elif scenario == "hang":
+        descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        log({"descendant_pid": descendant.pid})
         time.sleep(30)
     elif scenario == "bad_status":
         completed = fresh_fixture("turn", "completed_notification")
@@ -926,7 +936,7 @@ async fn github_graphql_errors_preserve_the_response_body_but_fail_the_tool() {
 #[tokio::test]
 async fn github_graphql_invalid_arguments_and_missing_configuration_fail_without_stalling() {
     for scenario in ["tool_invalid", "tool_invalid_variables"] {
-        let result = timeout(Duration::from_secs(1), run_scenario(scenario))
+        let result = timeout(Duration::from_secs(5), run_scenario(scenario))
             .await
             .expect("invalid tool call must not hang");
         let (harness, result) = result;
@@ -937,7 +947,7 @@ async fn github_graphql_invalid_arguments_and_missing_configuration_fail_without
         );
     }
 
-    let result = timeout(Duration::from_secs(1), run_scenario("tool_success"))
+    let result = timeout(Duration::from_secs(5), run_scenario("tool_success"))
         .await
         .expect("unavailable tool must not hang");
     let (harness, result) = result;
@@ -1279,6 +1289,39 @@ async fn oversized_jsonl_messages_fail_with_a_malformed_event() {
 }
 
 #[tokio::test]
+async fn shutdown_terminates_the_exact_app_server_descendant() {
+    let harness = harness("shutdown_descendant");
+    let client = CodexAppServerClient::new(config(harness.command.clone()));
+    let workspace_path = fs::canonicalize(harness.workspace.path()).expect("canonical workspace");
+    let mut on_event = |_| {};
+    let mut session = client
+        .start_session(&workspace_path, &mut on_event)
+        .await
+        .expect("session starts");
+
+    let descendant_pid = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(content) = fs::read_to_string(&harness.log_path)
+                && let Some(pid) = content.lines().find_map(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .ok()
+                        .and_then(|entry| entry.get("descendant_pid").and_then(Value::as_u64))
+                })
+            {
+                return pid;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake app-server records descendant pid");
+
+    session.shutdown().await;
+    drop(session);
+    assert_exact_process_exits(descendant_pid).await;
+}
+
+#[tokio::test]
 async fn aborting_worker_task_terminates_the_app_server() {
     let harness = harness("hang");
     let log_path = harness.log_path.clone();
@@ -1290,31 +1333,43 @@ async fn aborting_worker_task_terminates_the_app_server() {
         session.run_turn("hang").await
     });
 
-    let pid = timeout(Duration::from_secs(3), async {
+    let (pid, descendant_pid) = timeout(Duration::from_secs(3), async {
         loop {
-            if let Ok(content) = fs::read_to_string(&log_path)
-                && let Some(pid) = content.lines().find_map(|line| {
-                    serde_json::from_str::<Value>(line)
-                        .ok()
-                        .and_then(|entry| entry.get("pid").and_then(Value::as_u64))
-                })
-            {
-                return pid;
+            if let Ok(content) = fs::read_to_string(&log_path) {
+                let entries: Vec<_> = content
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect();
+                if let (Some(pid), Some(descendant_pid)) = (
+                    entries
+                        .iter()
+                        .find_map(|entry| entry.get("pid").and_then(Value::as_u64)),
+                    entries
+                        .iter()
+                        .find_map(|entry| entry.get("descendant_pid").and_then(Value::as_u64)),
+                ) {
+                    return (pid, descendant_pid);
+                }
             }
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("fake app-server starts");
+    .expect("fake app-server starts its descendant");
     task.abort();
     let _ = task.await;
+    assert_exact_process_exits(pid).await;
+    assert_exact_process_exits(descendant_pid).await;
+}
+
+async fn assert_exact_process_exits(pid: u64) {
     for _ in 0..100 {
         if !process_is_alive(pid) {
             return;
         }
         sleep(Duration::from_millis(10)).await;
     }
-    panic!("app-server process {pid} remained alive after worker cancellation");
+    panic!("process {pid} remained alive after lifecycle cleanup");
 }
 
 fn process_is_alive(pid: u64) -> bool {
@@ -1322,6 +1377,6 @@ fn process_is_alive(pid: u64) -> bool {
         .arg("-lc")
         .arg(format!("kill -0 {pid}"))
         .status()
-        .expect("run bash")
+        .expect("query exact process")
         .success()
 }
