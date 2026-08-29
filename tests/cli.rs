@@ -301,6 +301,274 @@ fn config_schema_emits_json_without_workflow_or_token() {
     );
 }
 
+#[test]
+fn config_doctor_reports_literal_tracker_key_without_exposing_it() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("literal.md");
+    let sentinel = "super-secret-token";
+    std::fs::write(
+        &workflow,
+        workflow_with_tracker_key(sentinel, "workspace:\n  root: workspaces"),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("GITHUB_TOKEN", "another-secret-token")
+        .args(["config", "doctor"])
+        .arg(&workflow)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("workflow_path"));
+    assert!(stdout.contains("parse_status"));
+    assert!(stdout.contains("dispatch_validation_status"));
+    assert!(stdout.contains("status: passed"));
+    assert!(stdout.contains("source: literal"));
+    assert!(stdout.contains("presence: present"));
+    assert!(!stdout.contains(sentinel));
+    assert!(!stderr.contains(sentinel));
+}
+
+#[test]
+fn config_doctor_reports_github_token_indirection_presence() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("github-token.md");
+    std::fs::write(
+        &workflow,
+        workflow_with_tracker_key("$GITHUB_TOKEN", "workspace:\n  root: workspaces"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("GITHUB_TOKEN", "super-secret-token")
+        .args(["config", "doctor"])
+        .arg(&workflow)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("source: $GITHUB_TOKEN")
+                .and(predicate::str::contains("presence: present"))
+                .and(predicate::str::contains("super-secret-token").not()),
+        )
+        .stderr(predicate::str::contains("super-secret-token").not());
+}
+
+#[test]
+fn config_doctor_reports_custom_token_indirection_presence() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("custom-token.md");
+    std::fs::write(
+        &workflow,
+        workflow_with_tracker_key("$SYMPHONY_DOCTOR_TOKEN", "workspace:\n  root: workspaces"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("SYMPHONY_DOCTOR_TOKEN", "super-secret-token")
+        .args(["config", "doctor"])
+        .arg(&workflow)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("source: $SYMPHONY_DOCTOR_TOKEN")
+                .and(predicate::str::contains("presence: present"))
+                .and(predicate::str::contains("super-secret-token").not()),
+        )
+        .stderr(predicate::str::contains("super-secret-token").not());
+}
+
+#[test]
+fn config_doctor_fails_for_missing_required_token() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("missing-token.md");
+    std::fs::write(
+        &workflow,
+        workflow_with_tracker_key("$GITHUB_TOKEN", "workspace:\n  root: workspaces"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env_remove("GITHUB_TOKEN")
+        .args(["config", "doctor"])
+        .arg(&workflow)
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("source: $GITHUB_TOKEN")
+                .and(predicate::str::contains("presence: missing")),
+        )
+        .stderr(predicate::str::contains("config_failed"));
+}
+
+#[test]
+fn config_doctor_fails_for_empty_required_token() {
+    let temp = TempDir::new().unwrap();
+
+    let workflow = temp.path().join("empty-token.md");
+    std::fs::write(
+        &workflow,
+        workflow_with_tracker_key("$GITHUB_TOKEN", "workspace:\n  root: workspaces"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("GITHUB_TOKEN", "")
+        .args(["config", "doctor"])
+        .arg(&workflow)
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("source: $GITHUB_TOKEN")
+                .and(predicate::str::contains("presence: empty")),
+        )
+        .stderr(predicate::str::contains("config_failed"));
+}
+
+#[test]
+fn config_doctor_fails_for_workflow_parse_errors() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("invalid.md");
+    std::fs::write(&workflow, "---\ntracker: [\n---\n").unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["config", "doctor"])
+        .arg(&workflow)
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("parse_status")
+                .and(predicate::str::contains("status: failed"))
+                .and(predicate::str::contains("workflow_parse_error")),
+        )
+        .stderr(predicate::str::contains("config_failed"));
+}
+
+#[test]
+fn config_doctor_reports_normalized_workspace_root_from_environment() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("root-env.md");
+    let root = temp
+        .path()
+        .join("nested")
+        .join("..")
+        .join("diagnostic-root");
+    std::fs::write(
+        &workflow,
+        workflow_with_tracker_key(
+            "$GITHUB_TOKEN",
+            "workspace:\n  root: $SYMPHONY_WORKSPACE_ROOT",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("GITHUB_TOKEN", "super-secret-token")
+        .env("SYMPHONY_WORKSPACE_ROOT", &root)
+        .args(["config", "doctor"])
+        .arg(&workflow)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("source: $SYMPHONY_WORKSPACE_ROOT"));
+    assert!(stdout.contains("environment: SYMPHONY_WORKSPACE_ROOT"));
+    assert!(stdout.contains("presence: present"));
+    assert!(stdout.contains("normalized_path"));
+    assert!(
+        stdout.contains(
+            temp.path()
+                .join("diagnostic-root")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(!stdout.contains("super-secret-token"));
+}
+
+#[test]
+fn config_doctor_fails_for_missing_workspace_root_environment() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("missing-root-env.md");
+    std::fs::write(
+        &workflow,
+        workflow_with_tracker_key(
+            "$GITHUB_TOKEN",
+            "workspace:\n  root: $SYMPHONY_WORKSPACE_ROOT",
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("GITHUB_TOKEN", "super-secret-token")
+        .env_remove("SYMPHONY_WORKSPACE_ROOT")
+        .args(["config", "doctor"])
+        .arg(&workflow)
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("source: $SYMPHONY_WORKSPACE_ROOT")
+                .and(predicate::str::contains(
+                    "environment: SYMPHONY_WORKSPACE_ROOT",
+                ))
+                .and(predicate::str::contains("presence: missing")),
+        )
+        .stderr(
+            predicate::str::contains("config_failed")
+                .and(predicate::str::contains("super-secret-token").not()),
+        );
+}
+
+#[test]
+fn config_commands_respect_explicit_environment_semantics_and_redact_secrets() {
+    let temp = TempDir::new().unwrap();
+    let workflow = temp.path().join("literal-key.md");
+    let sentinel = "super-secret-token";
+    std::fs::write(
+        &workflow,
+        workflow_with_tracker_key(sentinel, "workspace:\n  root: workspaces"),
+    )
+    .unwrap();
+
+    for command in [
+        vec!["config", "doctor"],
+        vec!["config", "explain", "--format", "json"],
+        vec!["config", "validate"],
+    ] {
+        let output = Command::cargo_bin("symphony")
+            .unwrap()
+            .current_dir(temp.path())
+            .env("GITHUB_TOKEN", "environment-secret-token")
+            .args(command)
+            .arg(&workflow)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8(output.stdout).unwrap().contains(sentinel));
+        assert!(!String::from_utf8(output.stderr).unwrap().contains(sentinel));
+    }
+}
+
 fn workflow_with_defaults() -> &'static str {
     r#"---
 tracker:
@@ -318,6 +586,29 @@ workspace:
 ---
 Handle {{ issue.identifier }}
 "#
+}
+
+fn workflow_with_tracker_key(api_key: &str, workspace: &str) -> String {
+    format!(
+        r#"---
+tracker:
+  kind: github
+  api_key: {api_key}
+  repository:
+    owner: acme
+    name: symphony
+  project:
+    owner_type: organization
+    owner_login: acme
+    number: 1
+    status_field: Status
+{workspace}
+agent:
+  max_turns: 1
+---
+Handle {{{{ issue.identifier }}}}
+"#
+    )
 }
 
 fn valid_workflow() -> &'static str {
