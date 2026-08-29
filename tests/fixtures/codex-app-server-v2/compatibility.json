@@ -63,7 +63,7 @@
       "method": "item/tool/requestUserInput",
       "params": { "itemId": "item-3", "threadId": "thread-1", "turnId": "turn-1", "questions": [] }
     },
-    "approval_result": { "decision": "acceptForSession" },
+    "approval_result": { "decision": "decline" },
     "tool_result": { "success": false, "contentItems": [] },
     "user_input_result": { "answers": {} }
   }

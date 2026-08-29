@@ -3,9 +3,9 @@
 //! Implementation-defined choices documented here:
 //! - Tracker adapter: this Rust implementation supports `tracker.kind: github` and maps GitHub
 //!   Projects v2 Status values onto Symphony issue states. Repository-only issues are not dispatched.
-//! - Approval/sandbox posture: default Codex policy is high-trust (`approvalPolicy = "never"`,
-//!   thread sandbox `danger-full-access`, turn sandbox policy `{type: "dangerFullAccess"}`). Workflows
-//!   may override these pass-through values with schema-valid Codex values.
+//! - Approval/sandbox posture: Codex `approvalPolicy = "never"`, thread sandbox
+//!   `danger-full-access`, and turn sandbox policy `{type: "dangerFullAccess"}` are pass-through
+//!   values. Regardless of them, Symphony declines every command or file-change approval request.
 //! - Workspace population: Symphony creates/reuses per-issue directories and removes them after a
 //!   successful direct-commit completion unless `workspace.cleanup.after_success: never` is set.
 //!   Checkout/sync/bootstrap is owned by configured hooks.

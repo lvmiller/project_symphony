@@ -600,14 +600,9 @@ impl<'a> CodexJsonlSession<'a> {
         match method {
             METHOD_COMMAND_APPROVAL | METHOD_FILE_APPROVAL => {
                 validate_request_fields(value, &["itemId", "threadId", "turnId"])?;
-                self.send_response(id.into_value(), json!({ "decision": "acceptForSession" }))
+                self.send_response(id.into_value(), json!({ "decision": "decline" }))
                     .await?;
-                self.emit(
-                    "approval_auto_approved",
-                    Some(method.to_string()),
-                    None,
-                    None,
-                );
+                self.emit("approval_declined", Some(method.to_string()), None, None);
                 Ok(())
             }
             METHOD_TOOL_CALL => {
@@ -1331,10 +1326,10 @@ fn event_summary(
             )
         }),
         "rate_limits" => Some("Codex rate limits updated".to_string()),
-        "approval_auto_approved" => match detail.as_deref() {
-            Some(METHOD_COMMAND_APPROVAL) => Some("command approval auto-approved".to_string()),
-            Some(METHOD_FILE_APPROVAL) => Some("file-change approval auto-approved".to_string()),
-            _ => Some("approval auto-approved".to_string()),
+        "approval_declined" => match detail.as_deref() {
+            Some(METHOD_COMMAND_APPROVAL) => Some("command approval declined".to_string()),
+            Some(METHOD_FILE_APPROVAL) => Some("file-change approval declined".to_string()),
+            _ => Some("approval declined".to_string()),
         },
         "turn_input_required" => Some("Codex requires user input".to_string()),
         "unsupported_tool_call" => Some("unsupported dynamic tool request".to_string()),

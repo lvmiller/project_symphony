@@ -233,8 +233,9 @@ while True:
     elif scenario == "missing_request_id":
         send({"method": "item/tool/call", "params": {"threadId": "thread-1", "turnId": turn_id, "tool": "unknown", "callId": "call-1", "arguments": {}}})
         time.sleep(30)
-    elif scenario == "bad_approval":
-        send({"id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {"threadId": "thread-1", "turnId": turn_id}})
+    elif scenario in ("bad_approval", "bad_file_approval"):
+        method = "item/fileChange/requestApproval" if scenario == "bad_file_approval" else "item/commandExecution/requestApproval"
+        send({"id": "approval-1", "method": method, "params": {"threadId": "thread-1", "turnId": turn_id}})
         time.sleep(30)
     else:
         raise SystemExit(f"unknown scenario: {scenario}")
@@ -673,9 +674,9 @@ async fn accepts_string_encoded_client_response_ids() {
 }
 
 #[tokio::test]
-async fn auto_approves_command_and_file_requests_for_session() {
+async fn declines_command_and_file_approval_requests_per_request() {
     let (harness, result) = run_scenario("approval").await;
-    let events = result.expect("run completes");
+    let events = result.expect("declining approvals does not fail the protocol session");
     let fixture = compatibility_fixture();
     let log = log_entries(&harness.log_path);
     let command = log
@@ -691,6 +692,8 @@ async fn auto_approves_command_and_file_requests_for_session() {
         file["id"],
         fixture["server_requests"]["file_approval"]["id"]
     );
+    assert_eq!(command["result"], json!({ "decision": "decline" }));
+    assert_eq!(file["result"], json!({ "decision": "decline" }));
     assert_eq!(
         command["result"],
         fixture["server_requests"]["approval_result"]
@@ -702,21 +705,18 @@ async fn auto_approves_command_and_file_requests_for_session() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| event.event == "approval_auto_approved")
+            .filter(|event| event.event == "approval_declined")
             .count(),
         2
     );
     let approval_summaries: Vec<&str> = events
         .iter()
-        .filter(|event| event.event == "approval_auto_approved")
+        .filter(|event| event.event == "approval_declined")
         .filter_map(|event| event.message.as_deref())
         .collect();
     assert_eq!(
         approval_summaries,
-        vec![
-            "command approval auto-approved",
-            "file-change approval auto-approved"
-        ]
+        vec!["command approval declined", "file-change approval declined"]
     );
 }
 
@@ -998,6 +998,7 @@ async fn protocol_drift_errors_are_typed_and_reap_the_child() {
         "bad_rate_limits",
         "missing_request_id",
         "bad_approval",
+        "bad_file_approval",
     ] {
         let harness = harness(scenario);
         let client = CodexAppServerClient::new(config(harness.command.clone()));

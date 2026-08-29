@@ -1078,7 +1078,7 @@ Important emitted events include, for example:
 - `turn_cancelled`
 - `turn_ended_with_error`
 - `turn_input_required`
-- `approval_auto_approved`
+- `approval_declined`
 - `unsupported_tool_call`
 - `notification`
 - `other_message`
@@ -1096,10 +1096,10 @@ Policy requirements:
   implementation MAY either satisfy them, surface them to an operator, auto-resolve them, or
   fail the run according to its documented policy.
 
-Example high-trust behavior:
+Symphony's non-interactive behavior:
 
-- Auto-approve command execution approvals for the session.
-- Auto-approve file-change approvals for the session.
+- Validate command-execution and file-change approval request correlation fields, then decline
+  each request individually and continue the protocol session.
 - Treat user-input-required turns as hard failure.
 
 Unsupported dynamic tool calls:
