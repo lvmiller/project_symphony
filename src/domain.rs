@@ -116,6 +116,17 @@ impl LiveSession {
     }
 }
 
+/// A bounded, observability-only summary of a coding-agent event.
+///
+/// This deliberately excludes protocol payloads, identifiers, token totals, and rate-limit data.
+/// The latter remain available in their dedicated snapshot fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentEvent {
+    pub at: DateTime<Utc>,
+    pub event: String,
+    pub message: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RetryEntry {
     pub source_id: String,
@@ -137,6 +148,7 @@ pub struct RetrySnapshot {
     pub error: Option<String>,
     /// Delay relative to the snapshot's monotonic observation point.
     pub remaining_delay_ms: u64,
+    pub recent_events: Vec<RecentEvent>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +186,7 @@ pub struct RunningSnapshot {
     pub last_event_at: Option<DateTime<Utc>>,
     pub tokens: TokenTotals,
     pub started_at: DateTime<Utc>,
+    pub recent_events: Vec<RecentEvent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -18,7 +18,10 @@ use symphony::orchestrator::scheduler::{
     DispatchIneligibleReason, dispatch_ineligible_reason, dispatch_ineligible_reason_for_source,
     is_dispatch_eligible, is_dispatch_eligible_for_source, sort_for_dispatch,
 };
-use symphony::orchestrator::state::{OrchestratorState, ReconcileDecision};
+use symphony::orchestrator::state::{
+    OrchestratorState, RECENT_EVENT_HISTORY_LIMIT, RECENT_EVENT_MESSAGE_LIMIT_BYTES,
+    ReconcileDecision, source_issue_key,
+};
 
 fn ts(ms: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_millis_opt(ms).single().unwrap()
@@ -66,6 +69,7 @@ fn config(
         workspace: WorkspaceConfig {
             root: PathBuf::from("work"),
             cleanup: WorkspaceCleanupConfig::default(),
+            retention: Default::default(),
             population: Default::default(),
         },
         hooks: HooksConfig::default(),
@@ -106,6 +110,21 @@ fn issue(id: &str, identifier: &str, state: &str) -> Issue {
         blocked_by: Vec::new(),
         created_at: None,
         updated_at: None,
+    }
+}
+
+fn codex_event(issue_id: &str, event: String, timestamp: chrono::DateTime<Utc>) -> CodexEvent {
+    CodexEvent {
+        issue_id: issue_id.to_string(),
+        event,
+        timestamp,
+        session_id: Some("session".to_string()),
+        thread_id: Some("thread".to_string()),
+        turn_id: Some("turn".to_string()),
+        codex_app_server_pid: None,
+        message: None,
+        absolute_token_totals: None,
+        rate_limits: None,
     }
 }
 
@@ -561,6 +580,119 @@ fn codex_events_aggregate_only_positive_token_deltas_and_latest_rate_limits() {
         .unwrap();
     assert_eq!(session.turn_count, 1);
     assert_eq!(session.codex_app_server_pid, Some(42));
+}
+
+#[test]
+fn recent_events_are_chronological_bounded_and_preserve_latest_session_data() {
+    let mut state = OrchestratorState::default();
+    let issue = issue("id", "S-001", "In Progress");
+    state.claim_running(issue.clone(), None, ts(0));
+    let oversized_message = "x".repeat(RECENT_EVENT_MESSAGE_LIMIT_BYTES + 1);
+    for index in 0..RECENT_EVENT_HISTORY_LIMIT + 2 {
+        let mut event = codex_event(
+            &issue.id,
+            format!("event-{index}"),
+            ts((index as i64 + 1) * 100),
+        );
+        event.message = Some(if index + 1 == RECENT_EVENT_HISTORY_LIMIT + 2 {
+            oversized_message.clone()
+        } else {
+            format!("message-{index}")
+        });
+        state.apply_codex_event(event);
+    }
+
+    let running = &state.snapshot_at(ts(10_000), 0).running[0];
+    assert_eq!(running.recent_events.len(), RECENT_EVENT_HISTORY_LIMIT);
+    assert_eq!(running.recent_events[0].event, "event-2");
+    for (offset, event) in running.recent_events.iter().enumerate() {
+        assert_eq!(event.event, format!("event-{}", offset + 2));
+    }
+    let latest = running.recent_events.last().unwrap();
+    assert_eq!(latest.at, ts((RECENT_EVENT_HISTORY_LIMIT as i64 + 2) * 100));
+    assert_eq!(
+        latest.message.as_ref().unwrap().len(),
+        RECENT_EVENT_MESSAGE_LIMIT_BYTES
+    );
+    assert!(latest.message.as_ref().unwrap().ends_with("..."));
+    assert_eq!(running.last_event.as_deref(), Some(latest.event.as_str()));
+    assert_eq!(
+        running.last_message.as_deref(),
+        Some(oversized_message.as_str())
+    );
+}
+
+#[test]
+fn recent_events_are_isolated_by_source_and_cleaned_on_release() {
+    let config = config(1, []);
+    let mut state = OrchestratorState::default();
+    let default_issue = issue("shared", "S-001", "In Progress");
+    let secondary_issue = issue("shared", "S-002", "In Progress");
+    state.claim_running(default_issue.clone(), None, ts(0));
+    state.claim_running_for_source("secondary", secondary_issue.clone(), None, ts(0));
+
+    state.apply_codex_event(codex_event(
+        &default_issue.id,
+        "default-event".to_string(),
+        ts(100),
+    ));
+    state.apply_codex_event(codex_event(
+        &source_issue_key("secondary", &secondary_issue.id),
+        "secondary-event".to_string(),
+        ts(200),
+    ));
+
+    let IssueSnapshot::Running(default_snapshot) = state.issue_snapshot("S-001", 0) else {
+        panic!("default issue should be running");
+    };
+    assert_eq!(
+        default_snapshot
+            .recent_events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        vec!["default-event"]
+    );
+    let IssueSnapshot::Running(secondary_snapshot) = state.issue_snapshot("S-002", 0) else {
+        panic!("secondary issue should be running");
+    };
+    assert_eq!(
+        secondary_snapshot
+            .recent_events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        vec!["secondary-event"]
+    );
+
+    state
+        .worker_exit_for_source(
+            "secondary",
+            &secondary_issue.id,
+            WorkerExitReason::Failed("transient failure".to_string()),
+            &config,
+            1_000,
+            ts(1_000),
+        )
+        .expect("secondary issue should enter retry");
+    let IssueSnapshot::Retrying(secondary_retry) = state.issue_snapshot("S-002", 0) else {
+        panic!("secondary issue should be retrying");
+    };
+    assert_eq!(
+        secondary_retry.recent_events[0].event, "secondary-event",
+        "retrying issue keeps its observability history"
+    );
+
+    state.release(&default_issue.id);
+    assert!(matches!(
+        state.issue_snapshot("S-001", 0),
+        IssueSnapshot::NotFound
+    ));
+    state.release_for_source("secondary", &secondary_issue.id);
+    assert!(matches!(
+        state.issue_snapshot("S-002", 0),
+        IssueSnapshot::NotFound
+    ));
 }
 
 #[test]

@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::config::{EffectiveConfig, GithubProjectOwnerType, GithubRepositoryConfig};
-use crate::domain::{RetrySnapshot, RunningSnapshot, RuntimeSnapshot, TokenTotals};
+use crate::domain::{RecentEvent, RetrySnapshot, RunningSnapshot, RuntimeSnapshot, TokenTotals};
 use crate::error::{Result, SymphonyError};
 use crate::orchestrator::OrchestratorState;
 use crate::time::{now_utc, system_monotonic_ms};
@@ -117,13 +117,6 @@ pub struct CodexSessionLog {
     pub label: String,
     pub path: String,
     pub url: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecentEvent {
-    pub at: DateTime<Utc>,
-    pub event: String,
-    pub message: Option<String>,
 }
 
 #[derive(Debug)]
@@ -492,17 +485,7 @@ fn issue_details(snapshot: &RuntimeSnapshot, configs: &[EffectiveConfig]) -> Vec
 }
 
 fn running_issue_detail(running: &RunningSnapshot, configs: &[EffectiveConfig]) -> IssueDetail {
-    let recent_events = running
-        .last_event
-        .as_ref()
-        .zip(running.last_event_at)
-        .map(|(event, at)| RecentEvent {
-            at,
-            event: event.clone(),
-            message: running.last_message.clone(),
-        })
-        .into_iter()
-        .collect();
+    let recent_events = running.recent_events.clone();
     IssueDetail {
         source_id: running.source_id.clone(),
         issue_identifier: running.issue_identifier.clone(),
@@ -558,7 +541,7 @@ fn retrying_issue_detail(retry: &RetrySnapshot, configs: &[EffectiveConfig]) -> 
         running: None,
         retry: Some(retry_detail(retry)),
         logs: LogsDetail::default(),
-        recent_events: Vec::new(),
+        recent_events: retry.recent_events.clone(),
         last_error: retry.error.clone(),
         tracked: serde_json::Value::Object(Default::default()),
     }

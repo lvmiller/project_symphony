@@ -1,18 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::config::{DEFAULT_SOURCE_ID, EffectiveConfig, normalize_state};
 use crate::domain::{
-    CodexEvent, Issue, IssueSnapshot, LiveSession, RetryEntry, RetrySnapshot, RunningSnapshot,
-    RuntimeSnapshot, RuntimeSnapshotCounts, StateCounts, TokenTotals, WorkerExitReason,
+    CodexEvent, Issue, IssueSnapshot, LiveSession, RecentEvent, RetryEntry, RetrySnapshot,
+    RunningSnapshot, RuntimeSnapshot, RuntimeSnapshotCounts, StateCounts, TokenTotals,
+    WorkerExitReason,
 };
 use crate::orchestrator::retry::{
     continuation_retry_due_at_ms, failure_retry_delay_ms, failure_retry_due_at_ms,
 };
 use crate::time::{ms_from_now, system_monotonic_ms, utc_elapsed_ms};
 use crate::workspace::sanitize_workspace_key;
+
+pub const RECENT_EVENT_HISTORY_LIMIT: usize = 32;
+pub const RECENT_EVENT_MESSAGE_LIMIT_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug)]
 pub struct RunningEntry {
@@ -46,6 +50,7 @@ pub struct OrchestratorState {
     pub codex_totals: TokenTotals,
     pub ended_runtime_seconds: f64,
     pub codex_rate_limits: Option<Value>,
+    recent_events: BTreeMap<String, VecDeque<RecentEvent>>,
 }
 
 impl OrchestratorState {
@@ -153,7 +158,12 @@ impl OrchestratorState {
     }
 
     pub fn apply_codex_event(&mut self, event: CodexEvent) {
-        if let Some(entry) = self.running.get_mut(&event.issue_id) {
+        let summary = RecentEvent {
+            at: event.timestamp,
+            event: event.event.clone(),
+            message: event.message.as_deref().map(bounded_recent_event_message),
+        };
+        let applied_to_running_issue = if let Some(entry) = self.running.get_mut(&event.issue_id) {
             if let (Some(thread_id), Some(turn_id)) =
                 (event.thread_id.clone(), event.turn_id.clone())
             {
@@ -198,6 +208,19 @@ impl OrchestratorState {
                 session.last_codex_event = Some(event.event.clone());
                 session.last_codex_timestamp = Some(event.timestamp);
                 session.last_codex_message = event.message.clone();
+            }
+            true
+        } else {
+            false
+        };
+        if applied_to_running_issue {
+            let events = self
+                .recent_events
+                .entry(event.issue_id.clone())
+                .or_default();
+            events.push_back(summary);
+            if events.len() > RECENT_EVENT_HISTORY_LIMIT {
+                let _ = events.pop_front();
             }
         }
         if let Some(rate_limits) = event.rate_limits {
@@ -281,6 +304,7 @@ impl OrchestratorState {
         if let Some(retry) = self.retry_attempts.remove(&issue_key) {
             workspace_keys.push(retry.workspace_key);
         }
+        self.recent_events.remove(&issue_key);
         self.claimed.remove(&issue_key);
         self.release_tracker_issue_id_if_unowned(issue_id);
         for workspace_key in workspace_keys {
@@ -364,13 +388,13 @@ impl OrchestratorState {
     pub fn snapshot_at(&self, now: DateTime<Utc>, observed_monotonic_ms: u64) -> RuntimeSnapshot {
         let running = self
             .running
-            .values()
-            .map(Self::running_snapshot)
+            .iter()
+            .map(|(issue_key, entry)| self.running_snapshot(issue_key, entry))
             .collect::<Vec<_>>();
         let retrying = self
             .retry_attempts
-            .values()
-            .map(|retry| Self::retry_snapshot(retry, observed_monotonic_ms))
+            .iter()
+            .map(|(issue_key, retry)| self.retry_snapshot(issue_key, retry, observed_monotonic_ms))
             .collect::<Vec<_>>();
         let active_seconds = self
             .running
@@ -400,23 +424,27 @@ impl OrchestratorState {
         issue_identifier: &str,
         observed_monotonic_ms: u64,
     ) -> IssueSnapshot {
-        if let Some(entry) = self
+        if let Some((issue_key, entry)) = self
             .running
-            .values()
-            .find(|entry| entry.identifier == issue_identifier)
+            .iter()
+            .find(|(_, entry)| entry.identifier == issue_identifier)
         {
-            return IssueSnapshot::Running(Self::running_snapshot(entry));
+            return IssueSnapshot::Running(self.running_snapshot(issue_key, entry));
         }
         self.retry_attempts
-            .values()
-            .find(|retry| retry.identifier == issue_identifier)
-            .map(|retry| {
-                IssueSnapshot::Retrying(Self::retry_snapshot(retry, observed_monotonic_ms))
+            .iter()
+            .find(|(_, retry)| retry.identifier == issue_identifier)
+            .map(|(issue_key, retry)| {
+                IssueSnapshot::Retrying(self.retry_snapshot(
+                    issue_key,
+                    retry,
+                    observed_monotonic_ms,
+                ))
             })
             .unwrap_or(IssueSnapshot::NotFound)
     }
 
-    fn running_snapshot(entry: &RunningEntry) -> RunningSnapshot {
+    fn running_snapshot(&self, issue_key: &str, entry: &RunningEntry) -> RunningSnapshot {
         let session = entry.live_session.as_ref();
         RunningSnapshot {
             source_id: entry.source_id.clone(),
@@ -438,10 +466,16 @@ impl OrchestratorState {
                 .map(|session| session.codex_tokens.clone())
                 .unwrap_or_default(),
             started_at: entry.started_at,
+            recent_events: self.recent_events_for_key(issue_key),
         }
     }
 
-    fn retry_snapshot(retry: &RetryEntry, observed_monotonic_ms: u64) -> RetrySnapshot {
+    fn retry_snapshot(
+        &self,
+        issue_key: &str,
+        retry: &RetryEntry,
+        observed_monotonic_ms: u64,
+    ) -> RetrySnapshot {
         RetrySnapshot {
             source_id: retry.source_id.clone(),
             issue_id: retry.issue_id.clone(),
@@ -450,7 +484,15 @@ impl OrchestratorState {
             attempt: retry.attempt,
             error: retry.error.clone(),
             remaining_delay_ms: retry.due_at_ms.saturating_sub(observed_monotonic_ms),
+            recent_events: self.recent_events_for_key(issue_key),
         }
+    }
+
+    fn recent_events_for_key(&self, issue_key: &str) -> Vec<RecentEvent> {
+        self.recent_events
+            .get(issue_key)
+            .map(|events| events.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn schedule_retry_now(
@@ -538,6 +580,17 @@ impl OrchestratorState {
             self.claimed_workspace_keys.remove(workspace_key);
         }
     }
+}
+fn bounded_recent_event_message(message: &str) -> String {
+    if message.len() <= RECENT_EVENT_MESSAGE_LIMIT_BYTES {
+        return message.to_string();
+    }
+
+    let mut end = RECENT_EVENT_MESSAGE_LIMIT_BYTES - "...".len();
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &message[..end])
 }
 
 pub fn source_issue_key(source_id: &str, issue_id: &str) -> String {

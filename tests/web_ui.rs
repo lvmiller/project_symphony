@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use symphony::config::EffectiveConfig;
 use symphony::domain::{CodexEvent, Issue, RetryEntry, TokenTotals};
 use symphony::observability::http::{SharedStatus, spawn_http_server};
-use symphony::orchestrator::OrchestratorState;
+use symphony::orchestrator::state::{OrchestratorState, RECENT_EVENT_MESSAGE_LIMIT_BYTES};
 use symphony::time::ms_from_now;
 use tokio::sync::mpsc;
 
@@ -242,6 +242,66 @@ async fn issue_detail_exposes_complete_baseline_schema() {
     assert_eq!(retry["retry"]["issue_identifier"], "MT-650");
     assert!(retry["retry"]["remaining_delay_ms"].is_u64());
     assert_eq!(retry["retry"]["error"], "no available orchestrator slots");
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn issue_detail_exposes_chronological_bounded_recent_event_summaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_workflow(temp.path());
+    let mut state = populated_state();
+    state.apply_codex_event(CodexEvent {
+        issue_id: "abc123".to_string(),
+        event: "progress".to_string(),
+        timestamp: Utc
+            .with_ymd_and_hms(2026, 2, 24, 20, 15, 0)
+            .single()
+            .unwrap(),
+        session_id: Some("thread-1-turn-1".to_string()),
+        thread_id: Some("thread-1".to_string()),
+        turn_id: Some("turn-1".to_string()),
+        codex_app_server_pid: Some(42),
+        message: Some("Inspecting workspace".to_string()),
+        absolute_token_totals: None,
+        rate_limits: None,
+    });
+    state.apply_codex_event(CodexEvent {
+        issue_id: "abc123".to_string(),
+        event: "progress".to_string(),
+        timestamp: Utc
+            .with_ymd_and_hms(2026, 2, 24, 20, 15, 1)
+            .single()
+            .unwrap(),
+        session_id: Some("thread-1-turn-1".to_string()),
+        thread_id: Some("thread-1".to_string()),
+        turn_id: Some("turn-1".to_string()),
+        codex_app_server_pid: Some(42),
+        message: Some("x".repeat(RECENT_EVENT_MESSAGE_LIMIT_BYTES + 1)),
+        absolute_token_totals: None,
+        rate_limits: None,
+    });
+    let (base, server, _refresh_rx) = start_server(&path, state).await;
+
+    let detail = get_json(&base, "/api/v1/MT-649").await;
+    let recent_events = detail["recent_events"].as_array().unwrap();
+    assert_eq!(recent_events.len(), 3);
+    assert_eq!(recent_events[0]["event"], "notification");
+    assert_eq!(recent_events[1]["message"], "Inspecting workspace");
+    assert_eq!(
+        recent_events[2]["message"].as_str().unwrap().len(),
+        RECENT_EVENT_MESSAGE_LIMIT_BYTES
+    );
+    assert!(
+        recent_events[2]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("...")
+    );
+    for event in recent_events {
+        assert_eq!(event.as_object().unwrap().len(), 3);
+        assert!(event.get("rate_limits").is_none());
+        assert!(event.get("absolute_token_totals").is_none());
+    }
     server.task.abort();
 }
 
