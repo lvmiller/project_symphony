@@ -249,8 +249,33 @@ mutation SymphonyUpdateProjectStatus(
 "#;
 
 #[derive(Clone)]
+pub struct GitHubHttpClient {
+    client: reqwest::Client,
+}
+
+impl fmt::Debug for GitHubHttpClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubHttpClient")
+            .finish_non_exhaustive()
+    }
+}
+
+impl GitHubHttpClient {
+    pub fn new() -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent("symphony-rust-runtime")
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| tracker_error("github_transport", "failed to build GitHub HTTP client"))?;
+        Ok(Self { client })
+    }
+}
+
+#[derive(Clone)]
 pub struct GitHubGraphqlExecutor {
-    http: reqwest::Client,
+    http: GitHubHttpClient,
     endpoint: reqwest::Url,
     token: String,
 }
@@ -265,6 +290,13 @@ impl fmt::Debug for GitHubGraphqlExecutor {
 
 impl GitHubGraphqlExecutor {
     pub fn from_tracker_config(tracker: &TrackerConfig) -> Result<Self> {
+        Self::from_tracker_config_with_http(tracker, GitHubHttpClient::new()?)
+    }
+
+    pub fn from_tracker_config_with_http(
+        tracker: &TrackerConfig,
+        http: GitHubHttpClient,
+    ) -> Result<Self> {
         let github = tracker
             .github
             .as_ref()
@@ -278,12 +310,6 @@ impl GitHubGraphqlExecutor {
         }
         github.validate()?;
         let endpoint = tracker.github_endpoint_url()?;
-        let http = reqwest::Client::builder()
-            .user_agent("symphony-rust-runtime")
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| tracker_error("github_transport", "failed to build GitHub HTTP client"))?;
         Ok(Self {
             http,
             endpoint,
@@ -300,6 +326,7 @@ impl GitHubGraphqlExecutor {
         }
         let response = self
             .http
+            .client
             .post(self.endpoint.clone())
             .bearer_auth(&self.token)
             .header("Accept", "application/vnd.github+json")
@@ -369,12 +396,36 @@ impl GitHubTrackerClient {
     }
 
     pub fn from_tracker_config(tracker: &TrackerConfig) -> Result<Self> {
+        Self::from_tracker_config_with_http(tracker, GitHubHttpClient::new()?)
+    }
+
+    pub fn from_tracker_config_with_http(
+        tracker: &TrackerConfig,
+        http: GitHubHttpClient,
+    ) -> Result<Self> {
+        let executor = GitHubGraphqlExecutor::from_tracker_config_with_http(tracker, http)?;
+        Self::from_tracker_config_with_executor(tracker, executor)
+    }
+
+    pub fn from_tracker_config_with_executor(
+        tracker: &TrackerConfig,
+        graphql_executor: GitHubGraphqlExecutor,
+    ) -> Result<Self> {
         let github = tracker
             .github
             .clone()
             .ok_or(SymphonyError::MissingGithubConfig { field: "github" })?;
+        let token = tracker
+            .api_key
+            .as_deref()
+            .ok_or(SymphonyError::MissingTrackerApiKey)?;
+        if token.is_empty() {
+            return Err(SymphonyError::MissingTrackerApiKey);
+        }
+        github.validate()?;
+        tracker.github_endpoint_url()?;
         Ok(Self {
-            graphql_executor: GitHubGraphqlExecutor::from_tracker_config(tracker)?,
+            graphql_executor,
             active_states: tracker.active_states.clone(),
             github,
         })

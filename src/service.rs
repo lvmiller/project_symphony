@@ -13,15 +13,16 @@ use tracing::{info, warn};
 use crate::agent::codex::CodexAppServerClient;
 use crate::agent::runner::{AgentRunner, SymphonyAgentRunner, WorkerOutcome};
 use crate::config::{
-    ConfigReloader, ConfigSetReloader, EffectiveConfig, ServerConfig, config_reload_error_class,
+    ConfigReloader, ConfigSetReloader, EffectiveConfig, ServerConfig, TrackerConfig,
+    config_reload_error_class,
 };
 use crate::domain::{CodexEvent, ExecutionTarget, Issue, WorkerExitReason};
 use crate::error::Result;
-use crate::observability::http::{SharedStatus, spawn_http_server};
+use crate::observability::http::{PollHealthRegistry, SharedStatus, spawn_http_server};
 use crate::orchestrator::state::{ReconcileDecision, source_issue_key};
 use crate::orchestrator::{OrchestratorState, is_dispatch_eligible_for_source};
 use crate::time::{ms_from_now, now_utc, system_monotonic_ms};
-use crate::tracker::github::{GitHubGraphqlExecutor, GitHubTrackerClient};
+use crate::tracker::github::{GitHubGraphqlExecutor, GitHubHttpClient, GitHubTrackerClient};
 use crate::tracker::{TrackerClient, TrackerWriter};
 use crate::workspace::{WorkspaceManager, source_workspace_key, source_workspace_namespace};
 
@@ -53,6 +54,102 @@ struct SourceRun {
     config: EffectiveConfig,
     tracker: Arc<GitHubTrackerClient>,
     candidates: Vec<Issue>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GithubTransportIdentity {
+    endpoint: String,
+    api_key: Option<String>,
+    allow_insecure_loopback: bool,
+}
+
+impl GithubTransportIdentity {
+    fn from_tracker_config(tracker: &TrackerConfig) -> Self {
+        Self {
+            endpoint: tracker.endpoint.clone(),
+            api_key: tracker.api_key.clone(),
+            allow_insecure_loopback: tracker.allow_insecure_loopback,
+        }
+    }
+}
+
+struct SourceTrackerRuntime {
+    transport_identity: GithubTransportIdentity,
+    tracker_config: TrackerConfig,
+    http: GitHubHttpClient,
+    executor: Arc<GitHubGraphqlExecutor>,
+    tracker: Arc<GitHubTrackerClient>,
+}
+
+#[derive(Default)]
+struct SourceTrackerRuntimes {
+    sources: BTreeMap<String, SourceTrackerRuntime>,
+}
+
+impl SourceTrackerRuntimes {
+    fn synchronize(&mut self, configs: &[EffectiveConfig]) {
+        self.sources
+            .retain(|source_id, _| configs.iter().any(|config| config.source.id == *source_id));
+    }
+
+    fn tracker_for(&mut self, config: &EffectiveConfig) -> Result<Arc<GitHubTrackerClient>> {
+        let source_id = &config.source.id;
+        let transport_identity = GithubTransportIdentity::from_tracker_config(&config.tracker);
+        if let Some(runtime) = self.sources.get(source_id)
+            && runtime.tracker_config == config.tracker
+        {
+            return Ok(runtime.tracker.clone());
+        }
+
+        let (http, executor) = match self
+            .sources
+            .get(source_id)
+            .filter(|runtime| runtime.transport_identity == transport_identity)
+        {
+            Some(runtime) => (runtime.http.clone(), runtime.executor.clone()),
+            None => {
+                let http = GitHubHttpClient::new()?;
+                let executor = Arc::new(GitHubGraphqlExecutor::from_tracker_config_with_http(
+                    &config.tracker,
+                    http.clone(),
+                )?);
+                (http, executor)
+            }
+        };
+        let tracker = Arc::new(GitHubTrackerClient::from_tracker_config_with_executor(
+            &config.tracker,
+            executor.as_ref().clone(),
+        )?);
+        self.sources.insert(
+            source_id.clone(),
+            SourceTrackerRuntime {
+                transport_identity,
+                tracker_config: config.tracker.clone(),
+                http,
+                executor,
+                tracker: tracker.clone(),
+            },
+        );
+        Ok(tracker)
+    }
+}
+
+struct SourcePollPlan {
+    source_index: usize,
+    config: EffectiveConfig,
+    tracker: Arc<GitHubTrackerClient>,
+    reconciliation_ids: Vec<String>,
+    fetch_candidates: bool,
+}
+
+struct SourcePollResult {
+    source_index: usize,
+    config: EffectiveConfig,
+    tracker: Arc<GitHubTrackerClient>,
+    reconciliation_ids: Vec<String>,
+    reconciliation: Result<Vec<Issue>>,
+    candidates: Option<Result<Vec<Issue>>>,
+    observed_at: chrono::DateTime<chrono::Utc>,
 }
 
 struct DispatchRequest {
@@ -167,6 +264,8 @@ pub async fn run_multi_source_service_until_shutdown(
     let mut state = OrchestratorState::default();
     let initial_configs = reloaders.current_cloned();
     let shared_status = SharedStatus::new(&initial_configs);
+    let poll_health = shared_status.poll_health_registry();
+    let mut tracker_runtimes = SourceTrackerRuntimes::default();
     let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel::<()>();
     let refresh_pending = Arc::new(AtomicBool::new(false));
     let http_server = if let Some(bind_addr) = server_bind {
@@ -219,7 +318,17 @@ pub async fn run_multi_source_service_until_shutdown(
             }
         }
         let configs = reloaders.current_cloned();
-        tick(&mut state, &mut workers, configs.clone(), channels.clone()).await;
+        poll_health.sync_configured_sources(&configs);
+        tracker_runtimes.synchronize(&configs);
+        tick(
+            &mut state,
+            &mut workers,
+            &mut tracker_runtimes,
+            configs.clone(),
+            channels.clone(),
+            poll_health.clone(),
+        )
+        .await;
         if startup_retention_pending {
             for config in &configs {
                 let source_namespace_segments = configs
@@ -408,45 +517,139 @@ async fn startup_orphan_workspace_pruning(
 async fn tick(
     state: &mut OrchestratorState,
     workers: &mut WorkerRegistry,
+    tracker_runtimes: &mut SourceTrackerRuntimes,
     configs: Vec<EffectiveConfig>,
     channels: WorkerChannels,
+    poll_health: PollHealthRegistry,
 ) {
-    let mut runs = Vec::new();
-    for config in configs {
+    let mut plans = Vec::with_capacity(configs.len());
+    for (source_index, config) in configs.into_iter().enumerate() {
         reconcile_stalled(state, workers, &config).await;
-        let tracker = match GitHubTrackerClient::new(&config) {
-            Ok(tracker) => Arc::new(tracker),
+        let tracker = match tracker_runtimes.tracker_for(&config) {
+            Ok(tracker) => tracker,
             Err(error) => {
                 warn!(source_id = %config.source.id, error = %error, "tracker_create_failed");
+                poll_health.record_poll_result(&config.source.id, false, now_utc());
                 continue;
             }
         };
-        reconcile_tracker_states(state, workers, &config, tracker.as_ref()).await;
-        if let Err(error) = config.validate_dispatch() {
-            warn!(source_id = %config.source.id, error = %error, "dispatch_validation_failed");
-            continue;
+        let fetch_candidates = match config.validate_dispatch() {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(source_id = %config.source.id, error = %error, "dispatch_validation_failed");
+                false
+            }
+        };
+        plans.push(SourcePollPlan {
+            source_index,
+            reconciliation_ids: state.running_issue_ids_for_source(&config.source.id),
+            config,
+            tracker,
+            fetch_candidates,
+        });
+    }
+
+    let mut polls = tokio::task::JoinSet::new();
+    for plan in plans {
+        polls.spawn(fetch_source_poll(plan));
+    }
+    let mut results = BTreeMap::new();
+    while let Some(result) = polls.join_next().await {
+        match result {
+            Ok(result) => {
+                let success = result.reconciliation.is_ok()
+                    && result
+                        .candidates
+                        .as_ref()
+                        .is_none_or(|candidates| candidates.is_ok());
+                poll_health.record_poll_result(
+                    &result.config.source.id,
+                    success,
+                    result.observed_at,
+                );
+                results.insert(result.source_index, result);
+            }
+            Err(error) => warn!(error = %error, "source_poll_task_failed"),
         }
-        let candidates = match tracker.fetch_candidate_issues().await {
+    }
+
+    let mut runs = Vec::new();
+    for (_, result) in results {
+        match result.reconciliation {
+            Ok(refreshed) => {
+                reconcile_tracker_states(
+                    state,
+                    workers,
+                    &result.config,
+                    result.reconciliation_ids,
+                    refreshed,
+                )
+                .await;
+            }
+            Err(error) => {
+                warn!(source_id = %result.config.source.id, error = %error, "reconcile_refresh_failed");
+            }
+        }
+        let Some(candidates) = result.candidates else {
+            continue;
+        };
+        let candidates = match candidates {
             Ok(issues) => issues,
             Err(error) => {
-                warn!(source_id = %config.source.id, error = %error, "candidate_fetch_failed");
-                reschedule_due_retries_after_fetch_error(state, &config);
+                warn!(source_id = %result.config.source.id, error = %error, "candidate_fetch_failed");
+                reschedule_due_retries_after_fetch_error(state, &result.config);
                 continue;
             }
         };
         runs.push(SourceRun {
-            config,
-            tracker,
+            config: result.config,
+            tracker: result.tracker,
             candidates,
         });
     }
 
+    dispatch_runs(state, workers, runs, channels).await;
+}
+
+async fn fetch_source_poll(plan: SourcePollPlan) -> SourcePollResult {
+    let reconciliation = async {
+        if plan.reconciliation_ids.is_empty() {
+            Ok(Vec::new())
+        } else {
+            plan.tracker
+                .fetch_issue_states_by_ids(&plan.reconciliation_ids)
+                .await
+        }
+    };
+    let (reconciliation, candidates) = if plan.fetch_candidates {
+        let candidates = plan.tracker.fetch_candidate_issues();
+        let (reconciliation, candidates) = tokio::join!(reconciliation, candidates);
+        (reconciliation, Some(candidates))
+    } else {
+        (reconciliation.await, None)
+    };
+    SourcePollResult {
+        source_index: plan.source_index,
+        config: plan.config,
+        tracker: plan.tracker,
+        reconciliation_ids: plan.reconciliation_ids,
+        reconciliation,
+        candidates,
+        observed_at: now_utc(),
+    }
+}
+
+async fn dispatch_runs(
+    state: &mut OrchestratorState,
+    workers: &mut WorkerRegistry,
+    runs: Vec<SourceRun>,
+    channels: WorkerChannels,
+) {
     let global_agent_limit = runs
         .iter()
         .map(|run| run.config.agent.max_concurrent_agents)
         .min()
         .unwrap_or(0);
-
     let mut dispatch_candidates = Vec::new();
     for (source_index, run) in runs.iter().enumerate() {
         for issue in &run.candidates {
@@ -557,19 +760,12 @@ async fn reconcile_tracker_states(
     state: &mut OrchestratorState,
     workers: &mut WorkerRegistry,
     config: &EffectiveConfig,
-    tracker: &dyn TrackerClient,
+    ids: Vec<String>,
+    refreshed: Vec<Issue>,
 ) {
-    let ids = state.running_issue_ids_for_source(&config.source.id);
     if ids.is_empty() {
         return;
     }
-    let refreshed = match tracker.fetch_issue_states_by_ids(&ids).await {
-        Ok(issues) => issues,
-        Err(error) => {
-            warn!(source_id = %config.source.id, error = %error, "reconcile_refresh_failed");
-            return;
-        }
-    };
     let workspace = WorkspaceManager::new(&config.workspace, config.hooks.clone()).ok();
     for issue_id in ids {
         let latest = refreshed.iter().find(|issue| issue.id == issue_id).cloned();
@@ -780,7 +976,7 @@ async fn dispatch_issue(
         let writer: Arc<dyn TrackerWriter> = tracker.clone();
         writer
     });
-    let github_graphql = GitHubGraphqlExecutor::from_tracker_config(&config.tracker).ok();
+    let github_graphql = Some(tracker.graphql_executor());
     let codex = Arc::new(CodexAppServerClient::with_github_graphql(
         config.codex.clone(),
         github_graphql,
@@ -938,12 +1134,15 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{
-        WorkerEvent, WorkerRegistry, WorkerResult, abort_worker, apply_worker_event,
-        apply_worker_outcome, await_worker, next_retry_delay, select_execution_target,
-        shutdown_workers, worker_dispatch_permitted,
+        SourceTrackerRuntimes, WorkerEvent, WorkerRegistry, WorkerResult, abort_worker,
+        apply_worker_event, apply_worker_outcome, await_worker, next_retry_delay,
+        select_execution_target, shutdown_workers, worker_dispatch_permitted,
     };
     use crate::agent::runner::WorkerOutcome;
-    use crate::config::EffectiveConfig;
+    use crate::config::{
+        EffectiveConfig, GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig,
+        TrackerConfig,
+    };
     use crate::domain::{CodexEvent, ExecutionTarget, Issue, WorkerExitReason, WorkflowDefinition};
     use crate::orchestrator::OrchestratorState;
     use crate::orchestrator::state::source_workspace_key;
@@ -968,6 +1167,57 @@ mod tests {
             path: workspace_root.join("WORKFLOW.md"),
         })
         .unwrap()
+    }
+
+    fn github_tracker_config(endpoint: &str) -> TrackerConfig {
+        TrackerConfig {
+            kind: "github".to_string(),
+            endpoint: endpoint.to_string(),
+            allow_insecure_loopback: true,
+            api_key: Some("test-token".to_string()),
+            active_states: vec!["Todo".to_string()],
+            terminal_states: vec!["Done".to_string()],
+            github: Some(GithubConfig {
+                repository_owner: "octo-org".to_string(),
+                repository_name: "octo-repo".to_string(),
+                repositories: vec![GithubRepositoryConfig {
+                    owner: "octo-org".to_string(),
+                    name: "octo-repo".to_string(),
+                }],
+                project_owner_type: GithubProjectOwnerType::Organization,
+                project_owner_login: "octo-org".to_string(),
+                project_number: 7,
+                status_field_name: "Status".to_string(),
+                priority_field_name: Some("Priority".to_string()),
+                blocker_field_name: None,
+                blocker_label_prefix: None,
+                priority_labels: Default::default(),
+            }),
+        }
+    }
+
+    #[test]
+    fn tracker_runtime_reuses_a_pool_until_transport_identity_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = config(temporary.path());
+        config.tracker = github_tracker_config("http://127.0.0.1:8080/graphql");
+        let mut runtimes = SourceTrackerRuntimes::default();
+
+        let first_tracker = runtimes.tracker_for(&config).unwrap();
+        let same_tracker = runtimes.tracker_for(&config).unwrap();
+        let first_executor = runtimes.sources["default"].executor.clone();
+        assert!(Arc::ptr_eq(&first_tracker, &same_tracker));
+
+        config.tracker.active_states.push("In Progress".to_string());
+        let updated_tracker = runtimes.tracker_for(&config).unwrap();
+        let updated_executor = runtimes.sources["default"].executor.clone();
+        assert!(!Arc::ptr_eq(&first_tracker, &updated_tracker));
+        assert!(Arc::ptr_eq(&first_executor, &updated_executor));
+
+        config.tracker.endpoint = "http://127.0.0.1:8081/graphql".to_string();
+        runtimes.tracker_for(&config).unwrap();
+        let replaced_executor = runtimes.sources["default"].executor.clone();
+        assert!(!Arc::ptr_eq(&updated_executor, &replaced_executor));
     }
     impl Drop for TerminationProbe {
         fn drop(&mut self) {
