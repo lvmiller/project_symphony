@@ -101,7 +101,7 @@ pub async fn run_hook(kind: HookKind, hooks: &HooksConfig, context: HookContext)
         hook = kind.name(),
         workspace = %context.workspace_path.display(),
         workspace_key = %context.workspace_key,
-        source_key = %crate::workspace::sanitize_workspace_key(&context.source_id),
+        source_key = %crate::workspace::source_workspace_namespace(&context.source_id),
         issue_key = %crate::workspace::sanitize_workspace_key(&context.issue_identifier),
         "hook started"
     );
@@ -119,7 +119,7 @@ pub async fn run_hook(kind: HookKind, hooks: &HooksConfig, context: HookContext)
         .env("SYMPHONY_SOURCE_ID", &context.source_id)
         .env(
             "SYMPHONY_SOURCE_KEY",
-            crate::workspace::sanitize_workspace_key(&context.source_id),
+            crate::workspace::source_workspace_namespace(&context.source_id),
         )
         .env("SYMPHONY_ISSUE_IDENTIFIER", &context.issue_identifier)
         .env(
@@ -250,7 +250,7 @@ fn hook_error(
         started_at.elapsed().as_millis(),
         context.workspace_path.display(),
         context.workspace_key,
-        crate::workspace::sanitize_workspace_key(&context.source_id),
+        crate::workspace::source_workspace_namespace(&context.source_id),
         crate::workspace::sanitize_workspace_key(&context.issue_identifier),
     );
     if let Some(stdout) = stdout {

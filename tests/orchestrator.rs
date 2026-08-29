@@ -6,10 +6,10 @@ use serde_json::json;
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, EffectiveConfig, GithubConfig,
     GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig, ServerConfig,
-    SourceConfig, TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
+    SourceConfig, TrackerConfig, WorkerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
 };
 use symphony::domain::{
-    BlockerRef, CodexEvent, Issue, IssueSnapshot, TokenTotals, WorkerExitReason,
+    BlockerRef, CodexEvent, ExecutionTarget, Issue, IssueSnapshot, TokenTotals, WorkerExitReason,
 };
 use symphony::orchestrator::retry::{
     continuation_retry_due_at_ms, failure_retry_delay_ms, retry_is_due,
@@ -22,6 +22,7 @@ use symphony::orchestrator::state::{
     OrchestratorState, RECENT_EVENT_HISTORY_LIMIT, RECENT_EVENT_MESSAGE_LIMIT_BYTES,
     ReconcileDecision, source_issue_key,
 };
+use symphony::workspace::source_workspace_key;
 
 fn ts(ms: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_millis_opt(ms).single().unwrap()
@@ -68,11 +69,13 @@ fn config(
         polling: PollingConfig { interval_ms: 1_000 },
         workspace: WorkspaceConfig {
             root: PathBuf::from("work"),
+            remote_root: "/work".to_string(),
             cleanup: WorkspaceCleanupConfig::default(),
             retention: Default::default(),
             population: Default::default(),
         },
         hooks: HooksConfig::default(),
+        worker: WorkerConfig::default(),
         agent: AgentConfig {
             max_concurrent_agents: max_global,
             max_turns: 20,
@@ -294,7 +297,11 @@ fn source_scoped_workspaces_do_not_collide_but_duplicate_tracker_issue_is_blocke
         Some(DispatchIneligibleReason::AlreadyRunningOrClaimed)
     );
     assert!(state.claimed.contains("3:apisame-id"));
-    assert!(state.claimed_workspace_keys.contains("api/S_001"));
+    assert!(
+        state
+            .claimed_workspace_keys
+            .contains(&source_workspace_key("api", "S/001"))
+    );
 }
 
 #[test]
@@ -387,7 +394,16 @@ fn worker_exit_schedules_normal_continuation_retry_and_keeps_retry_claim() {
     let config = config(1, []);
     let mut state = OrchestratorState::default();
     let issue = issue("id", "S-001", "In Progress");
-    state.claim_running(issue.clone(), None, ts(0));
+    state.claim_running_on_target_for_source(
+        "default",
+        issue.clone(),
+        None,
+        ExecutionTarget::Ssh {
+            host: "worker-a".to_string(),
+        },
+        PathBuf::from("/remote/work/S-001"),
+        ts(0),
+    );
 
     let retry = state
         .worker_exit(&issue.id, WorkerExitReason::Normal, &config, 50, ts(2_500))
@@ -396,6 +412,13 @@ fn worker_exit_schedules_normal_continuation_retry_and_keeps_retry_claim() {
     assert_eq!(retry.attempt, 1);
     assert_eq!(retry.due_at_ms, continuation_retry_due_at_ms(50));
     assert_eq!(retry.error, None);
+    assert_eq!(
+        retry.execution_target,
+        ExecutionTarget::Ssh {
+            host: "worker-a".to_string()
+        }
+    );
+    assert_eq!(retry.workspace_path, PathBuf::from("/remote/work/S-001"));
     assert!(state.completed.contains(&issue.id));
     assert!(state.claimed.contains(&issue.id));
     assert!(retry_is_due(retry.due_at_ms, 1_050));

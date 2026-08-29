@@ -5,15 +5,15 @@ use serde_json::Value;
 
 use crate::config::{DEFAULT_SOURCE_ID, EffectiveConfig, normalize_state};
 use crate::domain::{
-    CodexEvent, Issue, IssueSnapshot, LiveSession, RecentEvent, RetryEntry, RetrySnapshot,
-    RunningSnapshot, RuntimeSnapshot, RuntimeSnapshotCounts, StateCounts, TokenTotals,
-    WorkerExitReason,
+    CodexEvent, ExecutionTarget, Issue, IssueSnapshot, LiveSession, RecentEvent, RetryEntry,
+    RetrySnapshot, RunningSnapshot, RuntimeSnapshot, RuntimeSnapshotCounts, StateCounts,
+    TokenTotals, WorkerExitReason,
 };
 use crate::orchestrator::retry::{
     continuation_retry_due_at_ms, failure_retry_delay_ms, failure_retry_due_at_ms,
 };
 use crate::time::{ms_from_now, system_monotonic_ms, utc_elapsed_ms};
-use crate::workspace::sanitize_workspace_key;
+use crate::workspace::source_workspace_key as workspace_source_workspace_key;
 
 pub const RECENT_EVENT_HISTORY_LIMIT: usize = 32;
 pub const RECENT_EVENT_MESSAGE_LIMIT_BYTES: usize = 1_024;
@@ -26,6 +26,8 @@ pub struct RunningEntry {
     pub workspace_key: String,
     pub started_at: DateTime<Utc>,
     pub retry_attempt: Option<u32>,
+    pub execution_target: ExecutionTarget,
+    pub workspace_path: std::path::PathBuf,
     pub live_session: Option<LiveSession>,
     pub cancel_requested: bool,
 }
@@ -65,6 +67,25 @@ impl OrchestratorState {
         attempt: Option<u32>,
         started_at: DateTime<Utc>,
     ) {
+        self.claim_running_on_target_for_source(
+            source_id,
+            issue,
+            attempt,
+            ExecutionTarget::Local,
+            std::path::PathBuf::new(),
+            started_at,
+        );
+    }
+
+    pub fn claim_running_on_target_for_source(
+        &mut self,
+        source_id: &str,
+        issue: Issue,
+        attempt: Option<u32>,
+        execution_target: ExecutionTarget,
+        workspace_path: std::path::PathBuf,
+        started_at: DateTime<Utc>,
+    ) {
         let issue_key = source_issue_key(source_id, &issue.id);
         let issue_id = issue.id.clone();
         let identifier = issue.identifier.clone();
@@ -87,6 +108,8 @@ impl OrchestratorState {
                 issue,
                 identifier,
                 workspace_key,
+                execution_target,
+                workspace_path,
                 started_at,
                 retry_attempt: attempt,
                 live_session: None,
@@ -282,6 +305,8 @@ impl OrchestratorState {
             source_id: entry.source_id,
             issue_id,
             identifier: entry.identifier,
+            execution_target: entry.execution_target,
+            workspace_path: entry.workspace_path,
             workspace_key: entry.workspace_key,
             attempt,
             due_at_ms,
@@ -448,6 +473,8 @@ impl OrchestratorState {
         let session = entry.live_session.as_ref();
         RunningSnapshot {
             source_id: entry.source_id.clone(),
+            execution_target: entry.execution_target.clone(),
+            workspace_path: entry.workspace_path.clone(),
             issue_id: entry.issue.id.clone(),
             issue_identifier: entry.identifier.clone(),
             state: entry.issue.state.clone(),
@@ -478,6 +505,8 @@ impl OrchestratorState {
     ) -> RetrySnapshot {
         RetrySnapshot {
             source_id: retry.source_id.clone(),
+            execution_target: retry.execution_target.clone(),
+            workspace_path: retry.workspace_path.clone(),
             issue_id: retry.issue_id.clone(),
             issue_identifier: retry.identifier.clone(),
             workspace_key: retry.workspace_key.clone(),
@@ -513,6 +542,8 @@ impl OrchestratorState {
     ) -> RetryEntry {
         let retry = RetryEntry {
             source_id: source_id.to_string(),
+            execution_target: ExecutionTarget::Local,
+            workspace_path: std::path::PathBuf::new(),
             issue_id: issue.id.clone(),
             identifier: issue.identifier.clone(),
             workspace_key: source_workspace_key(source_id, &issue.identifier),
@@ -602,12 +633,7 @@ pub fn source_issue_key(source_id: &str, issue_id: &str) -> String {
 }
 
 pub fn source_workspace_key(source_id: &str, identifier: &str) -> String {
-    let issue_key = sanitize_workspace_key(identifier);
-    if source_id == DEFAULT_SOURCE_ID {
-        issue_key
-    } else {
-        format!("{}/{}", sanitize_workspace_key(source_id), issue_key)
-    }
+    workspace_source_workspace_key(source_id, identifier)
 }
 
 #[cfg(test)]
@@ -643,5 +669,31 @@ mod tests {
 
         state.release_workspace_key_if_unowned(&retry.workspace_key);
         assert!(!state.claimed_workspace_keys.contains(&retry.workspace_key));
+    }
+
+    #[test]
+    fn running_snapshot_retains_ssh_target_and_workspace_path() {
+        let mut state = OrchestratorState::default();
+        let issue = issue("id-ssh", "S-SSH");
+        let path = std::path::PathBuf::from("/remote/work/S-SSH");
+        state.claim_running_on_target_for_source(
+            DEFAULT_SOURCE_ID,
+            issue,
+            Some(2),
+            ExecutionTarget::Ssh {
+                host: "worker-a".to_string(),
+            },
+            path.clone(),
+            chrono::Utc::now(),
+        );
+
+        let snapshot = state.snapshot(chrono::Utc::now());
+        assert_eq!(snapshot.running[0].workspace_path, path);
+        assert_eq!(
+            snapshot.running[0].execution_target,
+            ExecutionTarget::Ssh {
+                host: "worker-a".to_string()
+            }
+        );
     }
 }

@@ -13,7 +13,7 @@ use symphony::agent::runner::{AgentRunner, SymphonyAgentRunner};
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
     GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig,
-    ServerConfig, SourceConfig, TrackerConfig, WorkspaceCleanupAfterSuccess,
+    ServerConfig, SourceConfig, TrackerConfig, WorkerConfig, WorkspaceCleanupAfterSuccess,
     WorkspaceCleanupConfig, WorkspaceConfig,
 };
 use symphony::domain::{CodexEvent, Issue, WorkerExitReason};
@@ -503,11 +503,16 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
         },
         workspace: WorkspaceConfig {
             root: root.join("workspaces"),
+            remote_root: format!(
+                "/{}",
+                root.to_string_lossy().replace('\\', "/").replace(':', "")
+            ),
             cleanup: WorkspaceCleanupConfig::default(),
             population: Default::default(),
             retention: Default::default(),
         },
         hooks: HooksConfig::default(),
+        worker: WorkerConfig::default(),
         agent: AgentConfig {
             max_concurrent_agents: 1,
             max_turns,

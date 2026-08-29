@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use crate::agent::codex::CodexClient;
 use crate::completion::{DirectCommitCompletion, ExpectedGithubRepository};
 use crate::config::EffectiveConfig;
-use crate::domain::{CodexEvent, Issue, WorkerExitReason};
+use crate::domain::{CodexEvent, ExecutionTarget, Issue, WorkerExitReason};
 use crate::error::Result;
 use crate::prompt::{PromptSourceContext, continuation_prompt, render_prompt_with_source};
 use crate::tracker::{TrackerClient, TrackerWriter};
@@ -31,6 +31,16 @@ pub trait AgentRunner: Send + Sync {
         attempt: Option<u32>,
         on_event: Box<dyn FnMut(CodexEvent) + Send>,
     ) -> Result<WorkerOutcome>;
+    async fn run_on_target(
+        &self,
+        issue: Issue,
+        attempt: Option<u32>,
+        target: ExecutionTarget,
+        on_event: Box<dyn FnMut(CodexEvent) + Send>,
+    ) -> Result<WorkerOutcome> {
+        let _ = target;
+        self.run(issue, attempt, on_event).await
+    }
 }
 
 pub struct SymphonyAgentRunner {
@@ -78,11 +88,12 @@ impl SymphonyAgentRunner {
         &self,
         issue: &Issue,
         attempt: Option<u32>,
+        target: &ExecutionTarget,
         on_event: &mut (dyn FnMut(CodexEvent) + Send),
     ) -> (WorkerExitReason, Option<String>) {
         let workspace = match self
             .workspace
-            .create_for_source_issue(&self.config.source.id, issue)
+            .create_for_target(target, &self.config.source.id, issue)
             .await
         {
             Ok(workspace) => workspace,
@@ -94,7 +105,7 @@ impl SymphonyAgentRunner {
         }
 
         let (mut reason, mut terminal_state) = match self
-            .run_in_workspace(&working_issue, attempt, on_event, &workspace.path)
+            .run_in_workspace(&working_issue, attempt, target, on_event, &workspace.path)
             .await
         {
             Ok(outcome) => outcome,
@@ -102,7 +113,8 @@ impl SymphonyAgentRunner {
         };
 
         self.workspace
-            .after_run_best_effort_for_source_issue(
+            .after_run_best_effort_for_target(
+                target,
                 &self.config.source.id,
                 &working_issue,
                 &workspace.path,
@@ -116,13 +128,14 @@ impl SymphonyAgentRunner {
                 Ok(true) => {
                     if let Err(error) = self
                         .workspace
-                        .remove_for_source_issue(&self.config.source.id, &working_issue)
+                        .remove_for_target(target, &self.config.source.id, &working_issue)
                         .await
                     {
                         warn!(
                             source_id = %self.config.source.id,
                             issue_id = %working_issue.id,
                             issue_identifier = %working_issue.identifier,
+                            execution_target = ?target,
                             error = %error,
                             "workspace_cleanup_after_commit_failed"
                         );
@@ -212,6 +225,7 @@ impl SymphonyAgentRunner {
         &self,
         issue: &Issue,
         attempt: Option<u32>,
+        target: &ExecutionTarget,
         on_event: &mut (dyn FnMut(CodexEvent) + Send),
         workspace_path: &std::path::Path,
     ) -> Result<(WorkerExitReason, Option<String>)> {
@@ -219,11 +233,12 @@ impl SymphonyAgentRunner {
             source_id = %self.config.source.id,
             issue_id = %issue.id,
             issue_identifier = %issue.identifier,
+            execution_target = ?target,
             workspace = %workspace_path.display(),
             "worker_starting"
         );
         self.workspace
-            .before_run_for_source_issue(&self.config.source.id, issue, workspace_path)
+            .before_run_for_target(target, &self.config.source.id, issue, workspace_path)
             .await?;
 
         let source = PromptSourceContext::from_config(&self.config);
@@ -234,7 +249,10 @@ impl SymphonyAgentRunner {
             &source,
         )?;
         let max_turns = self.config.agent.max_turns;
-        let mut session = self.codex.start_session(workspace_path, on_event).await?;
+        let mut session = self
+            .codex
+            .start_session_on_target(target, workspace_path, on_event)
+            .await?;
         let result = async {
             for turn_index in 0..max_turns {
                 let turn_number = turn_index + 1;
@@ -250,6 +268,7 @@ impl SymphonyAgentRunner {
                     issue_identifier = %issue.identifier,
                     turn = turn_number,
                     max_turns,
+                    execution_target = ?target,
                     "worker_turn_starting"
                 );
                 let turn = session.run_turn(prompt.as_ref()).await?;
@@ -259,6 +278,7 @@ impl SymphonyAgentRunner {
                     issue_identifier = %issue.identifier,
                     session_id = %turn.session_id,
                     thread_id = %turn.thread_id,
+                    execution_target = ?target,
                     turn_id = %turn.turn_id,
                     turn = turn_number,
                     max_turns,
@@ -305,17 +325,31 @@ impl AgentRunner for SymphonyAgentRunner {
         &self,
         issue: Issue,
         attempt: Option<u32>,
+        on_event: Box<dyn FnMut(CodexEvent) + Send>,
+    ) -> Result<WorkerOutcome> {
+        self.run_on_target(issue, attempt, ExecutionTarget::Local, on_event)
+            .await
+    }
+
+    async fn run_on_target(
+        &self,
+        issue: Issue,
+        attempt: Option<u32>,
+        target: ExecutionTarget,
         mut on_event: Box<dyn FnMut(CodexEvent) + Send>,
     ) -> Result<WorkerOutcome> {
         let issue_id = issue.id.clone();
         let issue_identifier = issue.identifier.clone();
-        let (reason, terminal_state) = self.run_inner(&issue, attempt, &mut *on_event).await;
+        let (reason, terminal_state) = self
+            .run_inner(&issue, attempt, &target, &mut *on_event)
+            .await;
         if reason.is_normal() {
-            info!(issue_id = %issue_id, issue_identifier = %issue_identifier, "worker_completed");
+            info!(issue_id = %issue_id, issue_identifier = %issue_identifier, execution_target = ?target, "worker_completed");
         } else {
             warn!(
                 issue_id = %issue_id,
                 issue_identifier = %issue_identifier,
+                execution_target = ?target,
                 reason = ?reason,
                 "worker_failed"
             );

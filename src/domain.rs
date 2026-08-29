@@ -49,6 +49,32 @@ pub struct Workspace {
     pub workspace_key: String,
     pub created_now: bool,
 }
+/// The machine responsible for a worker and its workspace.
+///
+/// An SSH host is part of the execution identity: a continuation must retain
+/// both this target and its target-local workspace.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionTarget {
+    #[default]
+    Local,
+    Ssh {
+        host: String,
+    },
+}
+
+impl ExecutionTarget {
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Ssh { host } => Some(host),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
@@ -69,6 +95,7 @@ pub enum RunStatus {
 pub struct RunAttempt {
     pub issue_id: String,
     pub issue_identifier: String,
+    pub execution_target: ExecutionTarget,
     pub attempt: Option<u32>,
     pub workspace_path: PathBuf,
     pub started_at: DateTime<Utc>,
@@ -130,6 +157,8 @@ pub struct RecentEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RetryEntry {
     pub source_id: String,
+    pub execution_target: ExecutionTarget,
+    pub workspace_path: PathBuf,
     pub issue_id: String,
     pub identifier: String,
     pub workspace_key: String,
@@ -142,6 +171,8 @@ pub struct RetryEntry {
 pub struct RetrySnapshot {
     pub source_id: String,
     pub issue_id: String,
+    pub execution_target: ExecutionTarget,
+    pub workspace_path: PathBuf,
     pub issue_identifier: String,
     pub workspace_key: String,
     pub attempt: u32,
@@ -170,6 +201,8 @@ pub struct RuntimeSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunningSnapshot {
     pub source_id: String,
+    pub execution_target: ExecutionTarget,
+    pub workspace_path: PathBuf,
     pub issue_id: String,
     pub issue_identifier: String,
     pub state: String,

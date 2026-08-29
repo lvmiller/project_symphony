@@ -7,7 +7,7 @@ use chrono::{TimeZone, Utc};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use symphony::config::EffectiveConfig;
-use symphony::domain::{CodexEvent, Issue, RetryEntry, TokenTotals};
+use symphony::domain::{CodexEvent, ExecutionTarget, Issue, RetryEntry, TokenTotals};
 use symphony::observability::http::{SharedStatus, spawn_http_server};
 use symphony::orchestrator::state::{OrchestratorState, RECENT_EVENT_MESSAGE_LIMIT_BYTES};
 use symphony::time::ms_from_now;
@@ -75,6 +75,8 @@ fn populated_state() -> OrchestratorState {
         "def456".to_string(),
         RetryEntry {
             source_id: "default".to_string(),
+            execution_target: ExecutionTarget::Local,
+            workspace_path: PathBuf::new(),
             issue_id: "def456".to_string(),
             identifier: "MT-650".to_string(),
             workspace_key: "MT-650".to_string(),

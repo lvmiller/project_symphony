@@ -18,5 +18,5 @@ pub mod workflow;
 pub mod workspace;
 
 pub use crate::config::{ConfigReloader, ConfigSetReloader, EffectiveConfig};
-pub use crate::domain::{BlockerRef, Issue, WorkflowDefinition};
+pub use crate::domain::{BlockerRef, ExecutionTarget, Issue, WorkflowDefinition};
 pub use crate::error::{Result, SymphonyError};

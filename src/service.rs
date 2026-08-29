@@ -15,7 +15,7 @@ use crate::agent::runner::{AgentRunner, SymphonyAgentRunner, WorkerOutcome};
 use crate::config::{
     ConfigReloader, ConfigSetReloader, EffectiveConfig, config_reload_error_class,
 };
-use crate::domain::{CodexEvent, Issue, WorkerExitReason};
+use crate::domain::{CodexEvent, ExecutionTarget, Issue, WorkerExitReason};
 use crate::error::Result;
 use crate::observability::http::{SharedStatus, spawn_http_server};
 use crate::orchestrator::state::{ReconcileDecision, source_issue_key};
@@ -23,7 +23,7 @@ use crate::orchestrator::{OrchestratorState, is_dispatch_eligible_for_source};
 use crate::time::{ms_from_now, now_utc, system_monotonic_ms};
 use crate::tracker::github::{GitHubGraphqlExecutor, GitHubTrackerClient};
 use crate::tracker::{TrackerClient, TrackerWriter};
-use crate::workspace::{WorkspaceManager, sanitize_workspace_key, source_workspace_key};
+use crate::workspace::{WorkspaceManager, source_workspace_key, source_workspace_namespace};
 
 struct WorkerEvent {
     issue_key: String,
@@ -45,6 +45,7 @@ struct WorkerChannels {
 
 struct WorkerTask {
     generation: u64,
+    target: ExecutionTarget,
     handle: JoinHandle<()>,
 }
 
@@ -52,6 +53,14 @@ struct SourceRun {
     config: EffectiveConfig,
     tracker: Arc<GitHubTrackerClient>,
     candidates: Vec<Issue>,
+}
+
+struct DispatchRequest {
+    config: EffectiveConfig,
+    tracker: Arc<GitHubTrackerClient>,
+    issue: Issue,
+    attempt: Option<u32>,
+    target: ExecutionTarget,
 }
 
 #[derive(Default)]
@@ -79,10 +88,34 @@ impl WorkerRegistry {
             .is_some_and(|task| task.generation == generation)
     }
 
-    fn insert(&mut self, issue_key: String, generation: u64, handle: JoinHandle<()>) {
+    fn active_on_ssh_host(&self, host: &str) -> usize {
+        self.tasks
+            .values()
+            .filter(|task| {
+                task.target
+                    .host()
+                    .is_some_and(|active_host| active_host.eq_ignore_ascii_case(host))
+            })
+            .count()
+    }
+
+    fn insert(
+        &mut self,
+        issue_key: String,
+        generation: u64,
+        target: ExecutionTarget,
+        handle: JoinHandle<()>,
+    ) {
         assert!(
             self.tasks
-                .insert(issue_key, WorkerTask { generation, handle })
+                .insert(
+                    issue_key,
+                    WorkerTask {
+                        generation,
+                        target,
+                        handle,
+                    },
+                )
                 .is_none(),
             "worker task already registered"
         );
@@ -91,6 +124,20 @@ impl WorkerRegistry {
 
 fn worker_dispatch_permitted(workers: &WorkerRegistry, issue_key: &str) -> bool {
     !workers.contains(issue_key)
+}
+
+fn select_execution_target(
+    workers: &WorkerRegistry,
+    config: &EffectiveConfig,
+) -> Option<ExecutionTarget> {
+    if config.worker.ssh_hosts.is_empty() {
+        return Some(ExecutionTarget::Local);
+    }
+
+    config.worker.ssh_hosts.iter().find_map(|host| {
+        (workers.active_on_ssh_host(host) < config.worker.max_concurrent_agents_per_host)
+            .then(|| ExecutionTarget::Ssh { host: host.clone() })
+    })
 }
 
 pub async fn run_service_until_shutdown(
@@ -179,7 +226,7 @@ pub async fn run_multi_source_service_until_shutdown(
                         other.workspace.root == config.workspace.root
                             && other.source.id != crate::config::DEFAULT_SOURCE_ID
                     })
-                    .map(|other| sanitize_workspace_key(&other.source.id))
+                    .map(|other| source_workspace_namespace(&other.source.id))
                     .collect();
                 startup_orphan_workspace_pruning(config, &state, &source_namespace_segments).await;
             }
@@ -412,13 +459,19 @@ async fn tick(
         if !is_dispatch_eligible_for_source(&run.config.source.id, &issue, state, &run.config) {
             continue;
         }
+        let Some(target) = select_execution_target(workers, &run.config) else {
+            continue;
+        };
         dispatch_issue(
             state,
             workers,
-            run.config.clone(),
-            run.tracker.clone(),
-            issue,
-            None,
+            DispatchRequest {
+                config: run.config.clone(),
+                tracker: run.tracker.clone(),
+                issue,
+                attempt: None,
+                target,
+            },
             channels.clone(),
         )
         .await;
@@ -519,14 +572,19 @@ async fn reconcile_tracker_states(
         match decision {
             ReconcileDecision::CancelTerminal => {
                 let issue = latest.expect("terminal reconciliation requires a tracker issue");
+                let target = state
+                    .running
+                    .get(&issue_key)
+                    .map(|entry| entry.execution_target.clone())
+                    .unwrap_or_default();
                 abort_worker(workers, &issue_key).await;
                 state.release_for_source(&config.source.id, &issue_id);
                 if let Some(workspace) = &workspace
                     && let Err(error) = workspace
-                        .remove_for_source_issue(&config.source.id, &issue)
+                        .remove_for_target(&target, &config.source.id, &issue)
                         .await
                 {
-                    warn!(source_id = %config.source.id, issue_id = %issue.id, issue_identifier = %issue.identifier, error = %error, "terminal_cleanup_failed");
+                    warn!(source_id = %config.source.id, issue_id = %issue.id, issue_identifier = %issue.identifier, execution_target = ?target, error = %error, "terminal_cleanup_failed");
                 }
             }
             ReconcileDecision::CancelNonActive | ReconcileDecision::MissingFromTracker => {
@@ -570,7 +628,7 @@ async fn dispatch_due_retries(
         if !worker_dispatch_permitted(workers, &issue_key) {
             continue;
         }
-        let Some(mut retry) = state.retry_attempts.remove(&issue_key) else {
+        let Some(retry) = state.retry_attempts.remove(&issue_key) else {
             continue;
         };
         state.release_retry_claim(&retry);
@@ -582,47 +640,63 @@ async fn dispatch_due_retries(
             continue;
         };
         if state.running.len() >= global_agent_limit {
-            retry.attempt = retry.attempt.saturating_add(1);
-            retry.error = Some("no available orchestrator slots".to_string());
-            retry.due_at_ms = ms_from_now(crate::orchestrator::failure_retry_delay_ms(
-                retry.attempt,
-                config.agent.max_retry_backoff_ms,
-            ));
             state.requeue_retry(retry);
             continue;
         }
-        if is_dispatch_eligible_for_source(&config.source.id, &issue, state, &config) {
-            dispatch_issue(
-                state,
-                workers,
-                config.clone(),
-                tracker.clone(),
-                issue,
-                Some(retry.attempt),
-                channels.clone(),
-            )
-            .await;
-        } else {
-            retry.attempt = retry.attempt.saturating_add(1);
-            retry.error = Some("no available orchestrator slots".to_string());
-            retry.due_at_ms = ms_from_now(crate::orchestrator::failure_retry_delay_ms(
-                retry.attempt,
-                config.agent.max_retry_backoff_ms,
-            ));
+        if !is_dispatch_eligible_for_source(&config.source.id, &issue, state, &config) {
             state.requeue_retry(retry);
+            continue;
         }
+
+        // A normal worker exit is a continuation of the same attempt, so it
+        // retains both the original host and that host-local workspace. A
+        // failed worker is already terminated before this new dispatch and
+        // therefore may receive a fresh target selection.
+        let target = if retry.error.is_none() {
+            let available = match &retry.execution_target {
+                ExecutionTarget::Local => true,
+                ExecutionTarget::Ssh { host } => {
+                    workers.active_on_ssh_host(host) < config.worker.max_concurrent_agents_per_host
+                }
+            };
+            available.then(|| retry.execution_target.clone())
+        } else {
+            select_execution_target(workers, &config)
+        };
+        let Some(target) = target else {
+            state.requeue_retry(retry);
+            continue;
+        };
+
+        dispatch_issue(
+            state,
+            workers,
+            DispatchRequest {
+                config: config.clone(),
+                tracker: tracker.clone(),
+                issue,
+                attempt: Some(retry.attempt),
+                target,
+            },
+            channels.clone(),
+        )
+        .await;
     }
 }
 
 async fn dispatch_issue(
     state: &mut OrchestratorState,
     workers: &mut WorkerRegistry,
-    config: EffectiveConfig,
-    tracker: Arc<GitHubTrackerClient>,
-    issue: Issue,
-    attempt: Option<u32>,
+    request: DispatchRequest,
     channels: WorkerChannels,
 ) {
+    let DispatchRequest {
+        config,
+        tracker,
+        issue,
+        attempt,
+        target,
+    } = request;
     let started_at = now_utc();
     let source_id = config.source.id.clone();
     let issue_key = source_issue_key(&source_id, &issue.id);
@@ -630,10 +704,17 @@ async fn dispatch_issue(
         warn!(issue_key = %issue_key, "worker_dispatch_blocked_existing_task");
         return;
     }
-    state.claim_running_for_source(&source_id, issue.clone(), attempt, started_at);
     let workspace = match WorkspaceManager::new(&config.workspace, config.hooks.clone()) {
         Ok(workspace) => workspace,
         Err(error) => {
+            state.claim_running_on_target_for_source(
+                &source_id,
+                issue.clone(),
+                attempt,
+                target,
+                std::path::PathBuf::new(),
+                started_at,
+            );
             state.worker_exit_for_source(
                 &source_id,
                 &issue.id,
@@ -645,6 +726,44 @@ async fn dispatch_issue(
             return;
         }
     };
+    let workspace_path =
+        match workspace.workspace_path_for_source_identifier(&source_id, &issue.identifier) {
+            Ok((_, path)) => path,
+            Err(error) => {
+                state.claim_running_on_target_for_source(
+                    &source_id,
+                    issue.clone(),
+                    attempt,
+                    target,
+                    std::path::PathBuf::new(),
+                    started_at,
+                );
+                state.worker_exit_for_source(
+                    &source_id,
+                    &issue.id,
+                    WorkerExitReason::Failed(error.to_string()),
+                    &config,
+                    system_monotonic_ms(),
+                    now_utc(),
+                );
+                return;
+            }
+        };
+    state.claim_running_on_target_for_source(
+        &source_id,
+        issue.clone(),
+        attempt,
+        target.clone(),
+        workspace_path,
+        started_at,
+    );
+    info!(
+        source_id = %source_id,
+        issue_id = %issue.id,
+        issue_identifier = %issue.identifier,
+        execution_target = ?target,
+        "worker_dispatched"
+    );
     let generation = workers.allocate_generation();
     let writer = config.completion.direct_commit.enabled.then(|| {
         let writer: Arc<dyn TrackerWriter> = tracker.clone();
@@ -657,15 +776,17 @@ async fn dispatch_issue(
     ));
     let runner = SymphonyAgentRunner::new(config, workspace, tracker, writer, codex);
     let worker_issue_key = issue_key.clone();
+    let worker_target = target.clone();
     let handle = tokio::spawn(async move {
         let event_issue_key = worker_issue_key.clone();
         let outcome_issue_key = worker_issue_key;
         let callback_tx = channels.event_tx.clone();
         let raw_issue_id = issue.id.clone();
         let mut outcome = runner
-            .run(
+            .run_on_target(
                 issue,
                 attempt,
+                worker_target,
                 Box::new(move |mut event| {
                     event.issue_id = event_issue_key.clone();
                     let _ = callback_tx.send(WorkerEvent {
@@ -688,7 +809,7 @@ async fn dispatch_issue(
             outcome,
         });
     });
-    workers.insert(issue_key, generation, handle);
+    workers.insert(issue_key, generation, target, handle);
 }
 
 fn apply_worker_event(state: &mut OrchestratorState, workers: &WorkerRegistry, event: WorkerEvent) {
@@ -722,7 +843,11 @@ async fn apply_worker_outcome(
             state.running.get(&outcome.issue_key).map(|entry| {
                 let mut issue = entry.issue.clone();
                 issue.state.clone_from(terminal_state);
-                (entry.source_id.clone(), issue)
+                (
+                    entry.source_id.clone(),
+                    entry.execution_target.clone(),
+                    issue,
+                )
             })
         });
     if !await_worker(workers, &outcome.issue_key, outcome.generation).await {
@@ -733,16 +858,19 @@ async fn apply_worker_outcome(
         warn!(issue_key = %outcome.issue_key, "worker_outcome_without_running_entry");
         return;
     };
-    if let Some((source_id, issue)) = terminal_issue {
+    if let Some((source_id, target, issue)) = terminal_issue {
         state.release_for_source(&source_id, &issue.id);
         match WorkspaceManager::new(&config.workspace, config.hooks.clone()) {
             Ok(workspace) => {
-                if let Err(error) = workspace.remove_for_source_issue(&source_id, &issue).await {
-                    warn!(source_id = %source_id, issue_id = %issue.id, issue_identifier = %issue.identifier, error = %error, "terminal_cleanup_failed");
+                if let Err(error) = workspace
+                    .remove_for_target(&target, &source_id, &issue)
+                    .await
+                {
+                    warn!(source_id = %source_id, issue_id = %issue.id, issue_identifier = %issue.identifier, execution_target = ?target, error = %error, "terminal_cleanup_failed");
                 }
             }
             Err(error) => {
-                warn!(source_id = %source_id, issue_id = %issue.id, issue_identifier = %issue.identifier, error = %error, "terminal_cleanup_workspace_unavailable");
+                warn!(source_id = %source_id, issue_id = %issue.id, issue_identifier = %issue.identifier, execution_target = ?target, error = %error, "terminal_cleanup_workspace_unavailable");
             }
         }
         return;
@@ -800,12 +928,12 @@ mod tests {
 
     use super::{
         WorkerEvent, WorkerRegistry, WorkerResult, abort_worker, apply_worker_event,
-        apply_worker_outcome, await_worker, next_retry_delay, shutdown_workers,
-        worker_dispatch_permitted,
+        apply_worker_outcome, await_worker, next_retry_delay, select_execution_target,
+        shutdown_workers, worker_dispatch_permitted,
     };
     use crate::agent::runner::WorkerOutcome;
     use crate::config::EffectiveConfig;
-    use crate::domain::{CodexEvent, Issue, WorkerExitReason, WorkflowDefinition};
+    use crate::domain::{CodexEvent, ExecutionTarget, Issue, WorkerExitReason, WorkflowDefinition};
     use crate::orchestrator::OrchestratorState;
     use crate::orchestrator::state::source_workspace_key;
     use crate::time::{now_utc, system_monotonic_ms};
@@ -886,7 +1014,7 @@ mod tests {
         let probe = Arc::new(AtomicBool::new(false));
         let mut workers = WorkerRegistry::default();
         let (handle, started) = pending_worker(probe.clone());
-        workers.insert(issue.id.clone(), 1, handle);
+        workers.insert(issue.id.clone(), 1, ExecutionTarget::Local, handle);
         started.await.unwrap();
 
         abort_worker(&mut workers, &issue.id).await;
@@ -903,7 +1031,7 @@ mod tests {
         let probe = Arc::new(AtomicBool::new(false));
         let mut workers = WorkerRegistry::default();
         let (handle, started) = pending_worker(probe.clone());
-        workers.insert(issue.id.clone(), 2, handle);
+        workers.insert(issue.id.clone(), 2, ExecutionTarget::Local, handle);
         started.await.unwrap();
 
         apply_worker_event(
@@ -929,7 +1057,7 @@ mod tests {
         let probe = Arc::new(AtomicBool::new(false));
         let mut workers = WorkerRegistry::default();
         let (handle, started) = pending_worker(probe.clone());
-        workers.insert("issue".to_string(), 1, handle);
+        workers.insert("issue".to_string(), 1, ExecutionTarget::Local, handle);
         started.await.unwrap();
         assert!(!worker_dispatch_permitted(&workers, "issue"));
         abort_worker(&mut workers, "issue").await;
@@ -944,8 +1072,8 @@ mod tests {
         let mut workers = WorkerRegistry::default();
         let (first_handle, first_started) = pending_worker(first.clone());
         let (second_handle, second_started) = pending_worker(second.clone());
-        workers.insert("one".to_string(), 1, first_handle);
-        workers.insert("two".to_string(), 2, second_handle);
+        workers.insert("one".to_string(), 1, ExecutionTarget::Local, first_handle);
+        workers.insert("two".to_string(), 2, ExecutionTarget::Local, second_handle);
         first_started.await.unwrap();
         second_started.await.unwrap();
 
@@ -956,6 +1084,48 @@ mod tests {
         assert!(second.load(Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn ssh_host_pool_is_deterministic_and_never_falls_back_to_local_when_saturated() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = config(temporary.path());
+        config.worker.ssh_hosts = vec!["ssh-a".to_string(), "ssh-b".to_string()];
+        config.worker.max_concurrent_agents_per_host = 1;
+        let state = OrchestratorState::default();
+        let mut workers = WorkerRegistry::default();
+
+        assert_eq!(
+            select_execution_target(&workers, &config),
+            Some(ExecutionTarget::Ssh {
+                host: "ssh-a".to_string()
+            })
+        );
+        workers.insert(
+            "one".to_string(),
+            1,
+            ExecutionTarget::Ssh {
+                host: "ssh-a".to_string(),
+            },
+            tokio::spawn(std::future::pending()),
+        );
+        assert_eq!(
+            select_execution_target(&workers, &config),
+            Some(ExecutionTarget::Ssh {
+                host: "ssh-b".to_string()
+            })
+        );
+        workers.insert(
+            "two".to_string(),
+            2,
+            ExecutionTarget::Ssh {
+                host: "ssh-b".to_string(),
+            },
+            tokio::spawn(std::future::pending()),
+        );
+        assert_eq!(select_execution_target(&workers, &config), None);
+        assert!(state.running.is_empty());
+
+        shutdown_workers(&mut workers).await;
+    }
     #[tokio::test]
     async fn terminal_outcome_releases_claim_and_removes_workspace() {
         let temporary = tempfile::tempdir().unwrap();
@@ -968,7 +1138,12 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         state.claim_running(issue.clone(), None, now_utc());
         let mut workers = WorkerRegistry::default();
-        workers.insert(issue.id.clone(), 1, tokio::spawn(async {}));
+        workers.insert(
+            issue.id.clone(),
+            1,
+            ExecutionTarget::Local,
+            tokio::spawn(async {}),
+        );
 
         apply_worker_outcome(
             &mut state,
@@ -1000,7 +1175,12 @@ mod tests {
         let issue = issue("continuing");
         state.claim_running(issue.clone(), None, now_utc());
         let mut workers = WorkerRegistry::default();
-        workers.insert(issue.id.clone(), 1, tokio::spawn(async {}));
+        workers.insert(
+            issue.id.clone(),
+            1,
+            ExecutionTarget::Local,
+            tokio::spawn(async {}),
+        );
 
         apply_worker_outcome(
             &mut state,
