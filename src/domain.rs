@@ -190,6 +190,7 @@ pub struct RuntimeSnapshotCounts {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {
+    pub draining: bool,
     pub running: Vec<RunningSnapshot>,
     pub retrying: Vec<RetrySnapshot>,
     pub counts: RuntimeSnapshotCounts,
@@ -207,6 +208,7 @@ pub struct RunningSnapshot {
     pub issue_identifier: String,
     pub state: String,
     pub workspace_key: String,
+    pub generation: u64,
     pub retry_attempt: Option<u32>,
     pub cancel_requested: bool,
     pub session_id: Option<String>,

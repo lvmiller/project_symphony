@@ -469,7 +469,8 @@ pub fn raw_workflow_json_schema() -> serde_json::Value {
                     "host": { "type": "string", "default": "127.0.0.1", "description": "IP address." },
                     "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
                     "auth_token": { "type": "string", "writeOnly": true, "description": "Optional literal credential or `$VAR_NAME`. Required when server.host is non-loopback. No secret value is included in this schema." },
-                    "refresh_cooldown_ms": { "type": "integer", "minimum": 1, "default": 1000, "description": "Minimum delay between accepted refresh requests." }
+                    "refresh_cooldown_ms": { "type": "integer", "minimum": 1, "default": 1000, "description": "Minimum delay between accepted operator mutations." },
+                    "drain_timeout_ms": { "type": "integer", "minimum": 1, "default": 30000, "description": "Maximum graceful-drain wait during shutdown before remaining workers are cancelled." }
                 },
                 "additionalProperties": true
             }
@@ -489,6 +490,7 @@ pub struct ServerConfig {
     #[serde(skip_serializing)]
     pub auth_token: Option<String>,
     pub refresh_cooldown_ms: u64,
+    pub drain_timeout_ms: u64,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -502,6 +504,7 @@ impl fmt::Debug for ServerConfig {
                 &self.auth_token.as_ref().map(|_| "<redacted>"),
             )
             .field("refresh_cooldown_ms", &self.refresh_cooldown_ms)
+            .field("drain_timeout_ms", &self.drain_timeout_ms)
             .finish()
     }
 }
@@ -513,6 +516,7 @@ impl Default for ServerConfig {
             port: None,
             auth_token: None,
             refresh_cooldown_ms: 1_000,
+            drain_timeout_ms: 30_000,
         }
     }
 }
@@ -1775,11 +1779,19 @@ fn parse_server(config: &Mapping) -> Result<ServerConfig> {
         "invalid_server_refresh_cooldown_ms",
         "server.refresh_cooldown_ms",
     )?;
+    let drain_timeout_ms = positive_u64_or_default(
+        Some(server),
+        "drain_timeout_ms",
+        ServerConfig::default().drain_timeout_ms,
+        "invalid_server_drain_timeout_ms",
+        "server.drain_timeout_ms",
+    )?;
     Ok(ServerConfig {
         host,
         port,
         auth_token,
         refresh_cooldown_ms,
+        drain_timeout_ms,
     })
 }
 

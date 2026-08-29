@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -17,7 +18,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -29,6 +30,7 @@ use crate::domain::{
 };
 use crate::error::{Result, SymphonyError};
 use crate::orchestrator::OrchestratorState;
+use crate::service::{ServiceControl, ServiceControlResult};
 use crate::time::{now_utc, system_monotonic_ms};
 use crate::workflow::load_workflow;
 
@@ -149,6 +151,7 @@ pub struct AttemptDetail {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunningDetail {
+    pub generation: u64,
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
@@ -197,6 +200,7 @@ struct AppState {
     poll_health: PollHealthRegistry,
     refresh_tx: mpsc::UnboundedSender<()>,
     refresh_pending: Arc<AtomicBool>,
+    control_tx: mpsc::Sender<ServiceControl>,
     auth_token: Option<Arc<str>>,
     refresh_cooldown_ms: u64,
     refresh_last_accepted_ms: Arc<AtomicU64>,
@@ -206,10 +210,10 @@ struct AppState {
 struct ProbeResponse {
     status: &'static str,
 }
-
 #[derive(Clone, Debug, Serialize)]
 pub struct StateResponse {
     pub generated_at: DateTime<Utc>,
+    pub draining: bool,
     pub counts: StateResponseCounts,
     pub running: Vec<StateRunningDetail>,
     pub retrying: Vec<RetryDetail>,
@@ -223,6 +227,7 @@ pub struct StateRunningDetail {
     pub issue_id: String,
     pub issue_identifier: String,
     pub workspace_key: String,
+    pub generation: u64,
     pub state: String,
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
@@ -277,6 +282,27 @@ pub struct RefreshResponse {
 #[derive(Clone, Debug, Deserialize)]
 struct SourceQuery {
     source_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OperatorRequest {}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WorkerAbortRequest {
+    source_id: String,
+    issue_id: String,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RetryPromotionRequest {
+    source_id: String,
+    issue_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ControlResponse {
+    draining: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -342,6 +368,7 @@ pub async fn spawn_http_server(
     shared_status: SharedStatus,
     refresh_tx: mpsc::UnboundedSender<()>,
     refresh_pending: Arc<AtomicBool>,
+    control_tx: mpsc::Sender<ServiceControl>,
     server_config: &ServerConfig,
 ) -> Result<HttpServerHandle> {
     let auth_token = server_config
@@ -369,6 +396,7 @@ pub async fn spawn_http_server(
         shared_status,
         refresh_tx,
         refresh_pending,
+        control_tx,
         auth_token,
         server_config.refresh_cooldown_ms.max(1),
     );
@@ -384,6 +412,7 @@ fn router(
     shared_status: SharedStatus,
     refresh_tx: mpsc::UnboundedSender<()>,
     refresh_pending: Arc<AtomicBool>,
+    control_tx: mpsc::Sender<ServiceControl>,
     auth_token: Option<Arc<str>>,
     refresh_cooldown_ms: u64,
 ) -> Router {
@@ -393,6 +422,7 @@ fn router(
         poll_health,
         refresh_tx,
         refresh_pending,
+        control_tx,
         auth_token,
         refresh_cooldown_ms,
         refresh_last_accepted_ms: Arc::new(AtomicU64::new(0)),
@@ -410,6 +440,16 @@ fn router(
         .route(
             "/refresh",
             post(refresh_api).fallback(api_method_not_allowed),
+        )
+        .route("/drain", post(drain_api).fallback(api_method_not_allowed))
+        .route("/resume", post(resume_api).fallback(api_method_not_allowed))
+        .route(
+            "/workers/abort",
+            post(abort_worker_api).fallback(api_method_not_allowed),
+        )
+        .route(
+            "/retries/promote",
+            post(promote_retry_api).fallback(api_method_not_allowed),
         )
         .route(
             "/{issue_identifier}",
@@ -469,6 +509,7 @@ async fn state_api(State(state): State<AppState>) -> Json<StateResponse> {
                 issue_id: issue.issue_id.clone(),
                 issue_identifier: issue.issue_identifier.clone(),
                 workspace_key: issue.workspace.key.clone(),
+                generation: running.generation,
                 state: running.state.clone(),
                 session_id: running.session_id.clone(),
                 thread_id: running.thread_id.clone(),
@@ -492,6 +533,7 @@ async fn state_api(State(state): State<AppState>) -> Json<StateResponse> {
         .collect();
     Json(StateResponse {
         generated_at: document.generated_at,
+        draining: document.state.draining,
         counts: StateResponseCounts {
             running: document.state.counts.running,
             retrying: document.state.counts.retrying,
@@ -507,6 +549,95 @@ async fn state_api(State(state): State<AppState>) -> Json<StateResponse> {
         },
         rate_limits: document.state.rate_limits,
     })
+}
+
+async fn drain_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<(StatusCode, Json<ControlResponse>), ApiError> {
+    parse_operator_request::<OperatorRequest>(&headers, &body)?;
+    submit_control(&state, &headers, |response| ServiceControl::Drain {
+        response,
+    })
+    .await
+}
+
+async fn resume_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<(StatusCode, Json<ControlResponse>), ApiError> {
+    parse_operator_request::<OperatorRequest>(&headers, &body)?;
+    submit_control(&state, &headers, |response| ServiceControl::Resume {
+        response,
+    })
+    .await
+}
+
+async fn abort_worker_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<(StatusCode, Json<ControlResponse>), ApiError> {
+    let request = parse_operator_request::<WorkerAbortRequest>(&headers, &body)?;
+    submit_control(&state, &headers, move |response| {
+        ServiceControl::AbortWorker {
+            source_id: request.source_id,
+            issue_id: request.issue_id,
+            generation: request.generation,
+            response,
+        }
+    })
+    .await
+}
+
+async fn promote_retry_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<(StatusCode, Json<ControlResponse>), ApiError> {
+    let request = parse_operator_request::<RetryPromotionRequest>(&headers, &body)?;
+    submit_control(&state, &headers, move |response| {
+        ServiceControl::PromoteRetry {
+            source_id: request.source_id,
+            issue_id: request.issue_id,
+            response,
+        }
+    })
+    .await
+}
+
+async fn submit_control(
+    state: &AppState,
+    headers: &HeaderMap,
+    command: impl FnOnce(oneshot::Sender<ServiceControlResult>) -> ServiceControl,
+) -> std::result::Result<(StatusCode, Json<ControlResponse>), ApiError> {
+    validate_refresh_request(headers)?;
+    claim_refresh_cooldown(state)?;
+    let (response_tx, response_rx) = oneshot::channel();
+    state
+        .control_tx
+        .try_send(command(response_tx))
+        .map_err(|_| ApiError::control_unavailable())?;
+    match response_rx
+        .await
+        .map_err(|_| ApiError::control_unavailable())?
+    {
+        ServiceControlResult::Applied { draining } => {
+            Ok((StatusCode::ACCEPTED, Json(ControlResponse { draining })))
+        }
+        ServiceControlResult::NotFound => Err(ApiError::control_target_not_found()),
+        ServiceControlResult::Stale => Err(ApiError::control_target_stale()),
+    }
+}
+
+fn parse_operator_request<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> std::result::Result<T, ApiError> {
+    validate_refresh_request(headers)?;
+    serde_json::from_slice(body).map_err(|_| ApiError::invalid_refresh_request())
 }
 
 async fn sources_api(State(state): State<AppState>) -> Json<SourcesResponse> {
@@ -743,6 +874,7 @@ fn running_issue_detail(running: &RunningSnapshot, configs: &[EffectiveConfig]) 
             current_retry_attempt: running.retry_attempt,
         },
         running: Some(RunningDetail {
+            generation: running.generation,
             session_id: running.session_id.clone(),
             thread_id: running.thread_id.clone(),
             turn_id: running.turn_id.clone(),
@@ -870,6 +1002,30 @@ impl ApiError {
             message: "refresh is temporarily rate limited".to_string(),
             retry_after_ms: Some(retry_after_ms),
         }
+    }
+
+    fn control_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control_unavailable",
+            "service control is temporarily unavailable",
+        )
+    }
+
+    fn control_target_not_found() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "control_target_not_found",
+            "the requested worker or retry is not current",
+        )
+    }
+
+    fn control_target_stale() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "control_target_stale",
+            "the requested worker generation is stale",
+        )
     }
 
     fn source_not_found() -> Self {
@@ -1015,11 +1171,13 @@ mod tests {
         shared_status.publish(&state, &[]).await;
 
         let (refresh_tx, _refresh_rx) = mpsc::unbounded_channel();
+        let (control_tx, _control_rx) = mpsc::channel(1);
         let server = spawn_http_server(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             shared_status,
             refresh_tx,
             Arc::new(AtomicBool::new(false)),
+            control_tx,
             &ServerConfig::default(),
         )
         .await
@@ -1048,11 +1206,13 @@ mod tests {
     async fn refresh_coalesces_and_api_errors_are_json() {
         let shared_status = SharedStatus::new(&[]);
         let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+        let (control_tx, _control_rx) = mpsc::channel(1);
         let server = spawn_http_server(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             shared_status,
             refresh_tx,
             Arc::new(AtomicBool::new(false)),
+            control_tx,
             &ServerConfig::default(),
         )
         .await

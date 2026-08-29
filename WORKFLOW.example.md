@@ -25,6 +25,9 @@ tracker:
 server:
   host: 127.0.0.1
   port: 8080
+  # Graceful shutdown waits this long for active workers before cancelling only
+  # the workers that remain. Operator drain/resume controls are transient.
+  drain_timeout_ms: 30000
 
 polling:
   interval_ms: 60000

@@ -116,11 +116,13 @@ async fn start_server_with_config(
     let shared_status = SharedStatus::new(std::slice::from_ref(&config));
     shared_status.publish(&state, &[config]).await;
     let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
+    let (control_tx, _control_rx) = mpsc::channel(1);
     let server = spawn_http_server(
         "127.0.0.1:0".parse().unwrap(),
         shared_status,
         refresh_tx,
         Arc::new(AtomicBool::new(false)),
+        control_tx,
         &server_config,
     )
     .await
@@ -144,12 +146,15 @@ async fn get_json(base: &str, path: &str) -> Value {
 async fn state_api_exposes_complete_baseline_schema_and_omits_secrets() {
     let temp = tempfile::tempdir().unwrap();
     let path = write_workflow(temp.path());
-    let (base, server, _refresh_rx) = start_server(&path, populated_state()).await;
+    let mut state = populated_state();
+    state.draining = true;
+    let (base, server, _refresh_rx) = start_server(&path, state).await;
 
     let response = reqwest::get(format!("{base}/api/v1/state")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let text = response.text().await.unwrap();
     let json: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["draining"], true);
 
     assert!(json["generated_at"].is_string());
     assert_eq!(
@@ -472,6 +477,7 @@ async fn authenticated_refresh_rejects_csrf_and_enforces_cooldown_without_leakin
     shared_status.publish(&populated_state(), &[config]).await;
     let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
     let refresh_pending = Arc::new(AtomicBool::new(false));
+    let (control_tx, _control_rx) = mpsc::channel(1);
     let server_config = ServerConfig {
         auth_token: Some("operator-secret".to_string()),
         refresh_cooldown_ms: 60_000,
@@ -482,6 +488,7 @@ async fn authenticated_refresh_rejects_csrf_and_enforces_cooldown_without_leakin
         shared_status,
         refresh_tx,
         refresh_pending.clone(),
+        control_tx,
         &server_config,
     )
     .await
@@ -580,6 +587,79 @@ async fn authenticated_refresh_rejects_csrf_and_enforces_cooldown_without_leakin
             .is_some_and(|ms| ms > 0)
     );
     assert!(refresh_rx.try_recv().is_err());
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn operator_controls_require_authentication_and_same_origin_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_workflow(temp.path());
+    let config = EffectiveConfig::load(Some(path)).unwrap();
+    let shared_status = SharedStatus::new(std::slice::from_ref(&config));
+    let (refresh_tx, _refresh_rx) = mpsc::unbounded_channel();
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    let server_config = ServerConfig {
+        auth_token: Some("operator-secret".to_string()),
+        ..ServerConfig::default()
+    };
+    let server = spawn_http_server(
+        "127.0.0.1:0".parse().unwrap(),
+        shared_status,
+        refresh_tx,
+        Arc::new(AtomicBool::new(false)),
+        control_tx,
+        &server_config,
+    )
+    .await
+    .unwrap();
+    let base = format!("http://{}", server.local_addr);
+    let client = reqwest::Client::new();
+
+    let unauthorized = client
+        .post(format!("{base}/api/v1/drain"))
+        .header("content-type", "application/json")
+        .header("origin", &base)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert!(control_rx.try_recv().is_err());
+
+    let cross_origin = client
+        .post(format!("{base}/api/v1/drain"))
+        .header("authorization", "Bearer operator-secret")
+        .header("content-type", "application/json")
+        .header("origin", "http://attacker.invalid")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+    assert!(control_rx.try_recv().is_err());
+    let accepted_base = base.clone();
+    let accepted_client = client.clone();
+    let accepted_request = tokio::spawn(async move {
+        accepted_client
+            .post(format!("{accepted_base}/api/v1/drain"))
+            .header("authorization", "Bearer operator-secret")
+            .header("content-type", "application/json")
+            .header("origin", &accepted_base)
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+    });
+    let control = control_rx.recv().await.unwrap();
+    let symphony::service::ServiceControl::Drain { response } = control else {
+        panic!("expected drain control");
+    };
+    response
+        .send(symphony::service::ServiceControlResult::Applied { draining: true })
+        .unwrap();
+    let accepted = accepted_request.await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    assert_eq!(accepted.json::<Value>().await.unwrap()["draining"], true);
 
     server.task.abort();
 }
@@ -587,11 +667,13 @@ async fn authenticated_refresh_rejects_csrf_and_enforces_cooldown_without_leakin
 #[tokio::test]
 async fn non_loopback_server_startup_requires_authentication() {
     let (refresh_tx, _refresh_rx) = mpsc::unbounded_channel();
+    let (control_tx, _control_rx) = mpsc::channel(1);
     let result = spawn_http_server(
         "0.0.0.0:0".parse().unwrap(),
         SharedStatus::new(&[]),
         refresh_tx,
         Arc::new(AtomicBool::new(false)),
+        control_tx,
         &ServerConfig::default(),
     )
     .await;
@@ -633,11 +715,13 @@ async fn start_health_server(
         .publish(&OrchestratorState::default(), configs)
         .await;
     let (refresh_tx, _refresh_rx) = mpsc::unbounded_channel();
+    let (control_tx, _control_rx) = mpsc::channel(1);
     let server = spawn_http_server(
         "127.0.0.1:0".parse().unwrap(),
         shared_status.clone(),
         refresh_tx,
         Arc::new(AtomicBool::new(false)),
+        control_tx,
         server_config,
     )
     .await

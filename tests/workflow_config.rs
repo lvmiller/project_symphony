@@ -854,6 +854,10 @@ fn raw_workflow_schema_is_static_extensible_and_documents_defaults() {
         1_000
     );
     assert_eq!(
+        schema["properties"]["server"]["properties"]["drain_timeout_ms"]["default"],
+        30_000
+    );
+    assert_eq!(
         schema["properties"]["server"]["properties"]["auth_token"]["writeOnly"],
         true
     );
@@ -887,6 +891,7 @@ fn server_config_is_parsed_and_validated() {
     );
     assert_eq!(config.server.port, Some(0));
     assert_eq!(config.server.refresh_cooldown_ms, 1_000);
+    assert_eq!(config.server.drain_timeout_ms, 30_000);
     assert!(config.server.auth_token.is_none());
 
     let invalid_host = write_workflow(
@@ -921,7 +926,7 @@ fn server_auth_token_is_resolved_redacted_and_required_off_loopback() {
     let temp = tempfile::tempdir().unwrap();
     let configured = valid_workflow(None).replacen(
         "---\n",
-        "---\nserver:\n  host: 0.0.0.0\n  port: 8080\n  auth_token: $SYMPHONY_SERVER_TEST_TOKEN\n  refresh_cooldown_ms: 250\n",
+        "---\nserver:\n  host: 0.0.0.0\n  port: 8080\n  auth_token: $SYMPHONY_SERVER_TEST_TOKEN\n  refresh_cooldown_ms: 250\n  drain_timeout_ms: 500\n",
         1,
     );
     let config = load_from_path(write_workflow(temp.path(), &configured));
@@ -930,6 +935,7 @@ fn server_auth_token_is_resolved_redacted_and_required_off_loopback() {
         Some("server-token-must-not-serialize")
     );
     assert_eq!(config.server.refresh_cooldown_ms, 250);
+    assert_eq!(config.server.drain_timeout_ms, 500);
     assert!(
         !serde_json::to_string(&config)
             .unwrap()
@@ -951,6 +957,12 @@ fn server_auth_token_is_resolved_redacted_and_required_off_loopback() {
     assert_config_code(
         write_workflow(temp.path(), &zero_cooldown),
         "invalid_server_refresh_cooldown_ms",
+    );
+    let zero_drain_timeout =
+        valid_workflow(None).replacen("---\n", "---\nserver:\n  drain_timeout_ms: 0\n", 1);
+    assert_config_code(
+        write_workflow(temp.path(), &zero_drain_timeout),
+        "invalid_server_drain_timeout_ms",
     );
 }
 

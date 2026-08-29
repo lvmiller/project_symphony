@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -42,6 +42,35 @@ struct WorkerResult {
 struct WorkerChannels {
     event_tx: mpsc::UnboundedSender<WorkerEvent>,
     outcome_tx: mpsc::UnboundedSender<WorkerResult>,
+}
+
+/// Commands accepted from the authenticated HTTP operator surface. The service
+/// exclusively owns the state and worker registry they mutate.
+pub enum ServiceControl {
+    Drain {
+        response: oneshot::Sender<ServiceControlResult>,
+    },
+    Resume {
+        response: oneshot::Sender<ServiceControlResult>,
+    },
+    AbortWorker {
+        source_id: String,
+        issue_id: String,
+        generation: u64,
+        response: oneshot::Sender<ServiceControlResult>,
+    },
+    PromoteRetry {
+        source_id: String,
+        issue_id: String,
+        response: oneshot::Sender<ServiceControlResult>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceControlResult {
+    Applied { draining: bool },
+    NotFound,
+    Stale,
 }
 
 struct WorkerTask {
@@ -268,6 +297,7 @@ pub async fn run_multi_source_service_until_shutdown(
     let mut tracker_runtimes = SourceTrackerRuntimes::default();
     let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel::<()>();
     let refresh_pending = Arc::new(AtomicBool::new(false));
+    let (control_tx, mut control_rx) = mpsc::channel(32);
     let http_server = if let Some(bind_addr) = server_bind {
         let server_config = server_config_for_http(&initial_configs);
         let server = spawn_http_server(
@@ -275,6 +305,7 @@ pub async fn run_multi_source_service_until_shutdown(
             shared_status.clone(),
             refresh_tx.clone(),
             refresh_pending.clone(),
+            control_tx,
             &server_config,
         )
         .await?;
@@ -318,6 +349,7 @@ pub async fn run_multi_source_service_until_shutdown(
             }
         }
         let configs = reloaders.current_cloned();
+        let draining = state.draining;
         poll_health.sync_configured_sources(&configs);
         tracker_runtimes.synchronize(&configs);
         tick(
@@ -327,6 +359,7 @@ pub async fn run_multi_source_service_until_shutdown(
             configs.clone(),
             channels.clone(),
             poll_health.clone(),
+            draining,
         )
         .await;
         if startup_retention_pending {
@@ -353,6 +386,19 @@ pub async fn run_multi_source_service_until_shutdown(
             _ = &mut shutdown => {
                 info!("shutdown_requested");
                 break Ok(());
+            }
+            control = control_rx.recv() => {
+                if let Some(control) = control {
+                    apply_service_control(
+                        control,
+                        &mut state,
+                        &mut workers,
+                        &reloaders.current_cloned(),
+                    ).await;
+                    shared_status
+                        .publish(&state, &reloaders.current_cloned())
+                        .await;
+                }
             }
             event = event_rx.recv() => {
                 if let Some(event) = event {
@@ -386,7 +432,19 @@ pub async fn run_multi_source_service_until_shutdown(
             _ = sleep(retry_delay) => {}
         }
     };
-    shutdown_workers(&mut workers).await;
+    state.draining = true;
+    let shutdown_configs = reloaders.current_cloned();
+    shared_status.publish(&state, &shutdown_configs).await;
+    graceful_shutdown_workers(
+        &mut state,
+        &mut workers,
+        &shutdown_configs,
+        &mut event_rx,
+        &mut outcome_rx,
+        &shared_status,
+        Duration::from_millis(server_config_for_http(&shutdown_configs).drain_timeout_ms),
+    )
+    .await;
     if let Some(server) = http_server {
         server.task.abort();
         let _ = server.task.await;
@@ -521,6 +579,7 @@ async fn tick(
     configs: Vec<EffectiveConfig>,
     channels: WorkerChannels,
     poll_health: PollHealthRegistry,
+    draining: bool,
 ) {
     let mut plans = Vec::with_capacity(configs.len());
     for (source_index, config) in configs.into_iter().enumerate() {
@@ -608,7 +667,7 @@ async fn tick(
         });
     }
 
-    dispatch_runs(state, workers, runs, channels).await;
+    dispatch_runs(state, workers, runs, channels, draining).await;
 }
 
 async fn fetch_source_poll(plan: SourcePollPlan) -> SourcePollResult {
@@ -644,7 +703,12 @@ async fn dispatch_runs(
     workers: &mut WorkerRegistry,
     runs: Vec<SourceRun>,
     channels: WorkerChannels,
+    draining: bool,
 ) {
+    if draining {
+        return;
+    }
+
     let global_agent_limit = runs
         .iter()
         .map(|run| run.config.agent.max_concurrent_agents)
@@ -972,6 +1036,7 @@ async fn dispatch_issue(
         "worker_dispatched"
     );
     let generation = workers.allocate_generation();
+    assert!(state.set_running_generation(&issue_key, generation));
     let writer = config.completion.direct_commit.enabled.then(|| {
         let writer: Arc<dyn TrackerWriter> = tracker.clone();
         writer
@@ -1121,6 +1186,110 @@ async fn shutdown_workers(workers: &mut WorkerRegistry) {
     }
 }
 
+async fn apply_service_control(
+    control: ServiceControl,
+    state: &mut OrchestratorState,
+    workers: &mut WorkerRegistry,
+    configs: &[EffectiveConfig],
+) {
+    match control {
+        ServiceControl::Drain { response } => {
+            state.draining = true;
+            let _ = response.send(ServiceControlResult::Applied { draining: true });
+        }
+        ServiceControl::Resume { response } => {
+            state.draining = false;
+            let _ = response.send(ServiceControlResult::Applied { draining: false });
+        }
+        ServiceControl::AbortWorker {
+            source_id,
+            issue_id,
+            generation,
+            response,
+        } => {
+            let issue_key = source_issue_key(&source_id, &issue_id);
+            let result = match workers.tasks.get(&issue_key) {
+                None if state.running.contains_key(&issue_key) => ServiceControlResult::Stale,
+                None => ServiceControlResult::NotFound,
+                Some(task) if task.generation != generation => ServiceControlResult::Stale,
+                Some(_) => {
+                    abort_worker(workers, &issue_key).await;
+                    if let Some(config) =
+                        configs.iter().find(|config| config.source.id == source_id)
+                    {
+                        state.worker_exit_by_key(
+                            &issue_key,
+                            WorkerExitReason::Failed("worker aborted by operator".to_string()),
+                            config,
+                            system_monotonic_ms(),
+                            now_utc(),
+                        );
+                    } else {
+                        state.release_for_source(&source_id, &issue_id);
+                    }
+                    ServiceControlResult::Applied {
+                        draining: state.draining,
+                    }
+                }
+            };
+            let _ = response.send(result);
+        }
+        ServiceControl::PromoteRetry {
+            source_id,
+            issue_id,
+            response,
+        } => {
+            let issue_key = source_issue_key(&source_id, &issue_id);
+            let result = match state.retry_attempts.get_mut(&issue_key) {
+                Some(retry) => {
+                    retry.due_at_ms = system_monotonic_ms();
+                    ServiceControlResult::Applied {
+                        draining: state.draining,
+                    }
+                }
+                None => ServiceControlResult::NotFound,
+            };
+            let _ = response.send(result);
+        }
+    }
+}
+
+async fn graceful_shutdown_workers(
+    state: &mut OrchestratorState,
+    workers: &mut WorkerRegistry,
+    configs: &[EffectiveConfig],
+    event_rx: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+    outcome_rx: &mut mpsc::UnboundedReceiver<WorkerResult>,
+    shared_status: &SharedStatus,
+    timeout: Duration,
+) {
+    if workers.tasks.is_empty() {
+        return;
+    }
+    let timeout = sleep(timeout);
+    tokio::pin!(timeout);
+    while !workers.tasks.is_empty() {
+        tokio::select! {
+            _ = &mut timeout => break,
+            event = event_rx.recv() => {
+                if let Some(event) = event {
+                    apply_worker_event(state, workers, event);
+                    shared_status.publish(state, configs).await;
+                }
+            }
+            outcome = outcome_rx.recv() => {
+                if let Some(outcome) = outcome {
+                    apply_worker_outcome(state, configs, workers, outcome).await;
+                    shared_status.publish(state, configs).await;
+                }
+            }
+        }
+    }
+    if !workers.tasks.is_empty() {
+        shutdown_workers(workers).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::pending;
@@ -1130,12 +1299,13 @@ mod tests {
     use std::time::Duration;
 
     use serde_yaml::{Mapping, Value};
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
 
     use super::{
-        SourceTrackerRuntimes, WorkerEvent, WorkerRegistry, WorkerResult, abort_worker,
-        apply_worker_event, apply_worker_outcome, await_worker, next_retry_delay,
+        ServiceControl, ServiceControlResult, SourceTrackerRuntimes, WorkerEvent, WorkerRegistry,
+        WorkerResult, abort_worker, apply_service_control, apply_worker_event,
+        apply_worker_outcome, await_worker, graceful_shutdown_workers, next_retry_delay,
         select_execution_target, shutdown_workers, worker_dispatch_permitted,
     };
     use crate::agent::runner::WorkerOutcome;
@@ -1144,6 +1314,7 @@ mod tests {
         TrackerConfig,
     };
     use crate::domain::{CodexEvent, ExecutionTarget, Issue, WorkerExitReason, WorkflowDefinition};
+    use crate::observability::http::SharedStatus;
     use crate::orchestrator::OrchestratorState;
     use crate::orchestrator::state::source_workspace_key;
     use crate::time::{now_utc, system_monotonic_ms};
@@ -1474,5 +1645,185 @@ mod tests {
 
         assert_eq!(state.next_retry_due_at_ms(), Some(due_at_ms));
         assert!(next_retry_delay(&state) < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn targeted_abort_is_generation_fenced_and_isolated() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = config(temporary.path());
+        let mut state = OrchestratorState::default();
+        let first_issue = issue("one");
+        let second_issue = issue("two");
+        state.claim_running(first_issue.clone(), None, now_utc());
+        state.claim_running(second_issue.clone(), None, now_utc());
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let mut workers = WorkerRegistry::default();
+        let (first_handle, first_started) = pending_worker(first.clone());
+        let (second_handle, second_started) = pending_worker(second.clone());
+        workers.insert(
+            first_issue.id.clone(),
+            1,
+            ExecutionTarget::Local,
+            first_handle,
+        );
+        workers.insert(
+            second_issue.id.clone(),
+            2,
+            ExecutionTarget::Local,
+            second_handle,
+        );
+        first_started.await.unwrap();
+        second_started.await.unwrap();
+
+        let (response, receiver) = oneshot::channel();
+        apply_service_control(
+            ServiceControl::AbortWorker {
+                source_id: "default".to_string(),
+                issue_id: first_issue.id.clone(),
+                generation: 1,
+                response,
+            },
+            &mut state,
+            &mut workers,
+            std::slice::from_ref(&config),
+        )
+        .await;
+        assert_eq!(
+            receiver.await.unwrap(),
+            ServiceControlResult::Applied { draining: false }
+        );
+        assert!(first.load(Ordering::Acquire));
+        assert!(!workers.contains(&first_issue.id));
+        assert!(workers.matches(&second_issue.id, 2));
+        assert!(state.retry_attempts.contains_key(&first_issue.id));
+
+        let (response, receiver) = oneshot::channel();
+        apply_service_control(
+            ServiceControl::AbortWorker {
+                source_id: "default".to_string(),
+                issue_id: second_issue.id.clone(),
+                generation: 1,
+                response,
+            },
+            &mut state,
+            &mut workers,
+            std::slice::from_ref(&config),
+        )
+        .await;
+        assert_eq!(receiver.await.unwrap(), ServiceControlResult::Stale);
+        assert!(!second.load(Ordering::Acquire));
+        assert!(workers.matches(&second_issue.id, 2));
+        shutdown_workers(&mut workers).await;
+    }
+
+    #[tokio::test]
+    async fn retry_promotion_changes_only_the_selected_entry() {
+        let mut state = OrchestratorState::default();
+        let first = issue("one");
+        let second = issue("two");
+        state.schedule_retry_now(&first, 1, Some("first".to_string()));
+        state.schedule_retry_now(&second, 1, Some("second".to_string()));
+        let later = system_monotonic_ms().saturating_add(60_000);
+        state.retry_attempts.get_mut(&first.id).unwrap().due_at_ms = later;
+        state.retry_attempts.get_mut(&second.id).unwrap().due_at_ms = later;
+        let mut workers = WorkerRegistry::default();
+        let (response, receiver) = oneshot::channel();
+
+        apply_service_control(
+            ServiceControl::PromoteRetry {
+                source_id: "default".to_string(),
+                issue_id: first.id.clone(),
+                response,
+            },
+            &mut state,
+            &mut workers,
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            receiver.await.unwrap(),
+            ServiceControlResult::Applied { draining: false }
+        );
+        assert!(
+            state.retry_attempts[&first.id].due_at_ms <= system_monotonic_ms(),
+            "promoted retry must wake the next service iteration"
+        );
+        assert_eq!(state.retry_attempts[&second.id].due_at_ms, later);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_normal_completion_before_timeout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = config(temporary.path());
+        let mut state = OrchestratorState::default();
+        state.draining = true;
+        let issue = issue("one");
+        state.claim_running(issue.clone(), None, now_utc());
+        let mut workers = WorkerRegistry::default();
+        let (_event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel();
+        let issue_key = issue.id.clone();
+        let outcome_issue_id = issue.id.clone();
+        let handle = tokio::spawn(async move {
+            let _ = outcome_tx.send(WorkerResult {
+                issue_key,
+                generation: 1,
+                outcome: WorkerOutcome {
+                    issue_id: outcome_issue_id,
+                    reason: WorkerExitReason::Normal,
+                    terminal_state: None,
+                },
+            });
+        });
+        workers.insert(issue.id.clone(), 1, ExecutionTarget::Local, handle);
+        let shared_status = SharedStatus::new(std::slice::from_ref(&config));
+
+        graceful_shutdown_workers(
+            &mut state,
+            &mut workers,
+            std::slice::from_ref(&config),
+            &mut event_rx,
+            &mut outcome_rx,
+            &shared_status,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(workers.tasks.is_empty());
+        assert!(state.retry_attempts.contains_key(&issue.id));
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_aborts_only_workers_remaining_after_timeout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = config(temporary.path());
+        let mut state = OrchestratorState::default();
+        state.draining = true;
+        let issue = issue("one");
+        state.claim_running(issue.clone(), None, now_utc());
+        let probe = Arc::new(AtomicBool::new(false));
+        let mut workers = WorkerRegistry::default();
+        let (handle, started) = pending_worker(probe.clone());
+        workers.insert(issue.id.clone(), 1, ExecutionTarget::Local, handle);
+        started.await.unwrap();
+        let (_event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_outcome_tx, mut outcome_rx) = mpsc::unbounded_channel();
+        let shared_status = SharedStatus::new(std::slice::from_ref(&config));
+
+        graceful_shutdown_workers(
+            &mut state,
+            &mut workers,
+            std::slice::from_ref(&config),
+            &mut event_rx,
+            &mut outcome_rx,
+            &shared_status,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(workers.tasks.is_empty());
+        assert!(probe.load(Ordering::Acquire));
     }
 }

@@ -28,6 +28,7 @@ pub struct RunningEntry {
     pub retry_attempt: Option<u32>,
     pub execution_target: ExecutionTarget,
     pub workspace_path: std::path::PathBuf,
+    pub worker_generation: u64,
     pub live_session: Option<LiveSession>,
     pub cancel_requested: bool,
 }
@@ -43,6 +44,9 @@ pub enum ReconcileDecision {
 
 #[derive(Clone, Debug, Default)]
 pub struct OrchestratorState {
+    /// Transient operator state: when set, polling and reconciliation continue but
+    /// no new worker is dispatched.
+    pub draining: bool,
     pub running: BTreeMap<String, RunningEntry>,
     pub claimed: BTreeSet<String>,
     pub claimed_issue_ids: BTreeSet<String>,
@@ -112,6 +116,7 @@ impl OrchestratorState {
                 workspace_path,
                 started_at,
                 retry_attempt: attempt,
+                worker_generation: 0,
                 live_session: None,
                 cancel_requested: false,
             },
@@ -163,6 +168,14 @@ impl OrchestratorState {
     ) -> Option<&mut RunningEntry> {
         let issue_key = source_issue_key(source_id, issue_id);
         self.running.get_mut(&issue_key)
+    }
+
+    pub fn set_running_generation(&mut self, issue_key: &str, generation: u64) -> bool {
+        let Some(entry) = self.running.get_mut(issue_key) else {
+            return false;
+        };
+        entry.worker_generation = generation;
+        true
     }
 
     pub fn due_retry_keys_for_source(&self, source_id: &str, now_ms: u64) -> Vec<String> {
@@ -432,6 +445,7 @@ impl OrchestratorState {
             })
             .sum::<f64>();
         RuntimeSnapshot {
+            draining: self.draining,
             counts: RuntimeSnapshotCounts {
                 running: running.len(),
                 retrying: retrying.len(),
@@ -479,6 +493,7 @@ impl OrchestratorState {
             issue_identifier: entry.identifier.clone(),
             state: entry.issue.state.clone(),
             workspace_key: entry.workspace_key.clone(),
+            generation: entry.worker_generation,
             retry_attempt: entry.retry_attempt,
             cancel_requested: entry.cancel_requested,
             session_id: session.map(|session| session.session_id.clone()),
