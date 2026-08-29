@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use symphony::config::{
-    ConfigReloader, ConfigSetReloader, DEFAULT_GITHUB_ENDPOINT, EffectiveConfig,
-    WorkspaceCleanupAfterSuccess, WorkspacePopulationKind, WorkspacePopulationReusePolicy,
-    raw_workflow_json_schema,
+    ConfigDiagnosticStatus, ConfigReloader, ConfigSetReloader, DEFAULT_GITHUB_ENDPOINT,
+    EffectiveConfig, EnvironmentValuePresence, TrackerApiKeySource, WorkspaceCleanupAfterSuccess,
+    WorkspacePopulationKind, WorkspacePopulationReusePolicy, WorkspaceRootSource,
+    config_reload_error_class, raw_workflow_json_schema, workflow_diagnostics,
 };
 use symphony::error::SymphonyError;
 use symphony::workflow::{load_workflow, parse_workflow, select_workflow_path};
@@ -303,7 +304,7 @@ fn provided_invalid_hooks_timeout_and_agent_max_turns_never_default() {
         ("agent:\n  max_turns: true\n", "invalid_max_turns"),
         ("agent:\n  max_turns: [1]\n", "invalid_max_turns"),
         ("agent:\n  max_turns: \"1.5\"\n", "invalid_max_turns"),
-        ("agent:\n  max_turns: \"4294967296\"\n", "invalid_max_turns"),
+        ("agent:\n  max_turns: 4294967296\n", "invalid_max_turns"),
         ("agent:\n  max_turns: 0\n", "invalid_max_turns"),
         ("agent:\n  max_turns: -1\n", "invalid_max_turns"),
     ] {
@@ -314,6 +315,161 @@ fn provided_invalid_hooks_timeout_and_agent_max_turns_never_default() {
         let path = write_workflow(temp.path(), &workflow);
         assert_config_code(path, code);
     }
+}
+
+#[test]
+fn agent_max_turns_accepts_the_u32_limit_without_truncation() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_workflow(
+        temp.path(),
+        &format!(
+            "---\nagent:\n  max_turns: {}\n{}",
+            u32::MAX,
+            valid_workflow(None).strip_prefix("---\n").unwrap()
+        ),
+    );
+
+    let config = load_from_path(path);
+
+    assert_eq!(config.agent.max_turns, u32::MAX);
+}
+
+#[test]
+fn workflow_diagnostics_reports_environment_prerequisites_without_secret_values() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_workflow(temp.path(), &valid_workflow(None));
+
+    unsafe { env::remove_var("GITHUB_TOKEN") };
+    let missing = workflow_diagnostics(Some(path.clone())).unwrap();
+    assert_eq!(missing.parse.status, ConfigDiagnosticStatus::Passed);
+    assert_eq!(missing.dispatch.status, ConfigDiagnosticStatus::Failed);
+    assert!(matches!(
+        &missing.tracker_api_key.source,
+        TrackerApiKeySource::Environment { variable } if variable == "GITHUB_TOKEN"
+    ));
+    assert_eq!(
+        missing.tracker_api_key.presence,
+        EnvironmentValuePresence::Missing
+    );
+    assert!(!missing.is_healthy());
+
+    unsafe { env::set_var("GITHUB_TOKEN", "") };
+    let empty = workflow_diagnostics(Some(path.clone())).unwrap();
+    assert_eq!(
+        empty.tracker_api_key.presence,
+        EnvironmentValuePresence::Empty
+    );
+    assert_eq!(empty.dispatch.status, ConfigDiagnosticStatus::Failed);
+
+    unsafe { env::set_var("GITHUB_TOKEN", "super-secret-token") };
+    let present = workflow_diagnostics(Some(path.clone())).unwrap();
+    assert!(present.is_healthy());
+    assert_eq!(
+        present.tracker_api_key.presence,
+        EnvironmentValuePresence::Present
+    );
+    assert!(
+        !serde_json::to_string(&present)
+            .unwrap()
+            .contains("super-secret-token"),
+        "workflow diagnostics must not serialize resolved tracker secrets"
+    );
+
+    unsafe { env::set_var("SYMPHONY_TEST_TOKEN", "explicit-secret") };
+    let explicit_path = write_workflow(
+        temp.path(),
+        &valid_workflow(None).replacen(
+            "kind: github\n",
+            "kind: github\n  api_key: $SYMPHONY_TEST_TOKEN\n",
+            1,
+        ),
+    );
+    let explicit = workflow_diagnostics(Some(explicit_path)).unwrap();
+    assert!(explicit.is_healthy());
+    assert!(matches!(
+        &explicit.tracker_api_key.source,
+        TrackerApiKeySource::Environment { variable } if variable == "SYMPHONY_TEST_TOKEN"
+    ));
+    assert!(
+        !serde_json::to_string(&explicit)
+            .unwrap()
+            .contains("explicit-secret")
+    );
+
+    let literal_path = write_workflow(
+        temp.path(),
+        &valid_workflow(None).replacen(
+            "kind: github\n",
+            "kind: github\n  api_key: configured-literal\n",
+            1,
+        ),
+    );
+    let literal = workflow_diagnostics(Some(literal_path)).unwrap();
+    assert!(literal.is_healthy());
+    assert!(matches!(
+        &literal.tracker_api_key.source,
+        TrackerApiKeySource::Literal
+    ));
+    assert_eq!(
+        literal.tracker_api_key.presence,
+        EnvironmentValuePresence::Present
+    );
+    assert!(
+        !serde_json::to_string(&literal)
+            .unwrap()
+            .contains("configured-literal")
+    );
+
+    let workspace_path = write_workflow(
+        temp.path(),
+        &valid_workflow(None).replacen(
+            "number: 7\n",
+            "number: 7\nworkspace:\n  root: $SYMPHONY_TEST_WORKSPACE_ROOT\n",
+            1,
+        ),
+    );
+    unsafe { env::remove_var("SYMPHONY_TEST_WORKSPACE_ROOT") };
+    let workspace_missing = workflow_diagnostics(Some(workspace_path.clone())).unwrap();
+    assert_eq!(
+        workspace_missing.parse.status,
+        ConfigDiagnosticStatus::Failed
+    );
+    assert!(matches!(
+        &workspace_missing.workspace_root.source,
+        WorkspaceRootSource::Environment { variable }
+            if variable == "SYMPHONY_TEST_WORKSPACE_ROOT"
+    ));
+    assert_eq!(
+        workspace_missing.workspace_root.environment_presence,
+        Some(EnvironmentValuePresence::Missing)
+    );
+    assert_eq!(
+        workspace_missing
+            .workspace_root
+            .status
+            .error_class
+            .as_deref(),
+        Some("missing_path_env")
+    );
+    assert_eq!(workspace_missing.workspace_root.normalized_path, None);
+
+    unsafe {
+        env::set_var(
+            "SYMPHONY_TEST_WORKSPACE_ROOT",
+            temp.path().join("nested/../workspace"),
+        )
+    };
+    let workspace_present = workflow_diagnostics(Some(workspace_path)).unwrap();
+    assert!(workspace_present.is_healthy());
+    assert!(matches!(
+        &workspace_present.workspace_root.source,
+        WorkspaceRootSource::Environment { variable }
+            if variable == "SYMPHONY_TEST_WORKSPACE_ROOT"
+    ));
+    assert!(workspace_present.workspace_root.normalized_path.is_some());
 }
 
 #[test]
@@ -407,7 +563,12 @@ fn invalid_reload_returns_error_and_preserves_last_known_good_config() {
     let last_good_prompt = reloader.current().prompt_template.clone();
 
     std::fs::write(&path, "---\ntracker: [not-a-map]\n---\nBroken").unwrap();
-    assert!(reloader.reload_now().is_err());
+    let error = reloader.reload_now().unwrap_err();
+    assert_eq!(
+        config_reload_error_class(&error),
+        "unsupported_tracker_kind"
+    );
+    assert_eq!(reloader.workflow_path(), path);
     assert_eq!(reloader.current().prompt_template, last_good_prompt);
     assert_eq!(reloader.current().tracker.kind, "github");
 }

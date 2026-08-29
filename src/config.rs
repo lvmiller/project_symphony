@@ -35,6 +35,188 @@ pub const DEFAULT_PROMPT: &str = "You are working on an issue from GitHub.";
 
 pub const DEFAULT_SOURCE_ID: &str = "default";
 
+/// A secret-safe result for one configuration diagnostic check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConfigDiagnosticCheck {
+    pub status: ConfigDiagnosticStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+}
+
+impl ConfigDiagnosticCheck {
+    fn passed() -> Self {
+        Self {
+            status: ConfigDiagnosticStatus::Passed,
+            error_class: None,
+        }
+    }
+
+    fn failed(error: &SymphonyError) -> Self {
+        Self {
+            status: ConfigDiagnosticStatus::Failed,
+            error_class: Some(config_reload_error_class(error).to_string()),
+        }
+    }
+
+    fn not_run() -> Self {
+        Self {
+            status: ConfigDiagnosticStatus::NotRun,
+            error_class: None,
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.status == ConfigDiagnosticStatus::Passed
+    }
+}
+
+/// The outcome of a configuration diagnostic check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDiagnosticStatus {
+    Passed,
+    Failed,
+    NotRun,
+}
+
+/// Whether an explicitly configured environment value can be used, without retaining its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentValuePresence {
+    Present,
+    Missing,
+    Empty,
+}
+
+/// The configured source of a tracker API key, excluding the key itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TrackerApiKeySource {
+    Literal,
+    Environment { variable: String },
+    Missing,
+}
+
+/// A secret-safe tracker API key diagnostic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TrackerApiKeyDiagnostic {
+    pub source: TrackerApiKeySource,
+    pub presence: EnvironmentValuePresence,
+}
+
+/// The configured source of a workspace root.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum WorkspaceRootSource {
+    Literal,
+    Environment { variable: String },
+    Default,
+}
+
+/// A workspace root diagnostic that never retains a resolved environment value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkspaceRootDiagnostic {
+    pub source: WorkspaceRootSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_presence: Option<EnvironmentValuePresence>,
+    pub status: ConfigDiagnosticCheck,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_path: Option<PathBuf>,
+}
+
+/// Secret-safe diagnostics for loading and dispatching one workflow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkflowDiagnostics {
+    pub workflow_path: PathBuf,
+    pub parse: ConfigDiagnosticCheck,
+    pub dispatch: ConfigDiagnosticCheck,
+    pub tracker_api_key: TrackerApiKeyDiagnostic,
+    pub workspace_root: WorkspaceRootDiagnostic,
+}
+
+impl WorkflowDiagnostics {
+    /// Returns whether parsing, workspace resolution, and dispatch validation all succeeded.
+    pub fn is_healthy(&self) -> bool {
+        self.parse.is_success()
+            && self.dispatch.is_success()
+            && self.workspace_root.status.is_success()
+    }
+}
+
+/// Produces workflow diagnostics without retaining or serializing resolved secret values.
+///
+/// A selected workflow path is required to produce a report; all workflow load, parse, and
+/// dispatch failures are instead represented by the returned diagnostic statuses.
+pub fn workflow_diagnostics(explicit_path: Option<PathBuf>) -> Result<WorkflowDiagnostics> {
+    let workflow_path = select_workflow_path(explicit_path)?;
+    let workflow = match load_workflow(&workflow_path) {
+        Ok(workflow) => workflow,
+        Err(error) => {
+            return Ok(WorkflowDiagnostics {
+                workflow_path,
+                parse: ConfigDiagnosticCheck::failed(&error),
+                dispatch: ConfigDiagnosticCheck::not_run(),
+                tracker_api_key: TrackerApiKeyDiagnostic {
+                    source: TrackerApiKeySource::Missing,
+                    presence: EnvironmentValuePresence::Missing,
+                },
+                workspace_root: default_workspace_root_diagnostic(),
+            });
+        }
+    };
+
+    let tracker_api_key = tracker_api_key_diagnostic(&workflow.config);
+    let workspace_root = workspace_root_diagnostic(&workflow.config, workflow.path.parent());
+    let config = match EffectiveConfig::from_workflow(workflow) {
+        Ok(config) => config,
+        Err(error) => {
+            return Ok(WorkflowDiagnostics {
+                workflow_path,
+                parse: ConfigDiagnosticCheck::failed(&error),
+                dispatch: ConfigDiagnosticCheck::not_run(),
+                tracker_api_key,
+                workspace_root,
+            });
+        }
+    };
+    let dispatch = match config.validate_dispatch() {
+        Ok(()) => ConfigDiagnosticCheck::passed(),
+        Err(error) => ConfigDiagnosticCheck::failed(&error),
+    };
+
+    Ok(WorkflowDiagnostics {
+        workflow_path,
+        parse: ConfigDiagnosticCheck::passed(),
+        dispatch,
+        tracker_api_key,
+        workspace_root,
+    })
+}
+
+/// Returns a stable, secret-safe classification for a configuration or reload error.
+pub fn config_reload_error_class(error: &SymphonyError) -> &'static str {
+    match error {
+        SymphonyError::MissingWorkflowFile { .. } => "missing_workflow_file",
+        SymphonyError::WorkflowPathNotFile { .. } => "workflow_path_not_file",
+        SymphonyError::WorkflowParseError { .. } => "workflow_parse_error",
+        SymphonyError::WorkflowFrontMatterNotMap { .. } => "workflow_front_matter_not_a_map",
+        SymphonyError::ConfigValidation { code, .. } => code,
+        SymphonyError::UnsupportedTrackerKind { .. } => "unsupported_tracker_kind",
+        SymphonyError::MissingTrackerApiKey => "missing_tracker_api_key",
+        SymphonyError::MissingGithubConfig { .. } => "missing_github_config",
+        SymphonyError::TemplateParseError(_) => "template_parse_error",
+        SymphonyError::TemplateRenderError(_) => "template_render_error",
+        SymphonyError::Workspace(_) => "workspace_error",
+        SymphonyError::Hook { .. } => "hook_error",
+        SymphonyError::Tracker { .. } => "tracker_error",
+        SymphonyError::Codex { .. } => "codex_error",
+        SymphonyError::Io { .. } => "io_error",
+        SymphonyError::Yaml(_) => "yaml_error",
+        SymphonyError::Json(_) => "json_error",
+        SymphonyError::Http(_) => "http_error",
+    }
+}
+
 /// Returns the stable JSON Schema for raw `WORKFLOW.md` YAML front matter.
 ///
 /// This describes accepted source keys rather than [`EffectiveConfig`], which contains resolved
@@ -612,6 +794,11 @@ impl ConfigReloader {
         &self.last_good.source.id
     }
 
+    /// Returns the configured workflow path, including when a failed reload keeps the last good config.
+    pub fn workflow_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn reload_now(&mut self) -> Result<&EffectiveConfig> {
         let next = EffectiveConfig::from_workflow(load_workflow(&self.path)?)?;
         next.validate_dispatch()?;
@@ -734,12 +921,13 @@ impl ConfigSetReloader {
         Ok(Some(SocketAddr::new(host, port)))
     }
 
-    pub fn reload_if_changed(&mut self) -> Vec<(String, Result<bool>)> {
+    pub fn reload_if_changed(&mut self) -> Vec<(String, PathBuf, Result<bool>)> {
         self.reloaders
             .iter_mut()
             .map(|reloader| {
                 let source_id = reloader.source_id().to_string();
-                (source_id, reloader.reload_if_changed())
+                let workflow_path = reloader.workflow_path().to_path_buf();
+                (source_id, workflow_path, reloader.reload_if_changed())
             })
             .collect()
     }
@@ -1334,6 +1522,125 @@ fn parse_server(config: &Mapping) -> Result<ServerConfig> {
     Ok(ServerConfig { host, port })
 }
 
+fn tracker_api_key_diagnostic(config: &Mapping) -> TrackerApiKeyDiagnostic {
+    let tracker = get_map(config, "tracker");
+    let kind = get_string(tracker, "kind")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let raw_api_key = get_string(tracker, "api_key")
+        .or_else(|| get_string(tracker, "token"))
+        .or_else(|| (kind == "github").then(|| "$GITHUB_TOKEN".to_string()));
+    let Some(raw_api_key) = raw_api_key else {
+        return TrackerApiKeyDiagnostic {
+            source: TrackerApiKeySource::Missing,
+            presence: EnvironmentValuePresence::Missing,
+        };
+    };
+    if let Some(variable) = environment_reference(&raw_api_key) {
+        return TrackerApiKeyDiagnostic {
+            source: TrackerApiKeySource::Environment {
+                variable: variable.to_string(),
+            },
+            presence: environment_value_presence(variable),
+        };
+    }
+    TrackerApiKeyDiagnostic {
+        source: TrackerApiKeySource::Literal,
+        presence: if raw_api_key.is_empty() {
+            EnvironmentValuePresence::Empty
+        } else {
+            EnvironmentValuePresence::Present
+        },
+    }
+}
+
+fn default_workspace_root_diagnostic() -> WorkspaceRootDiagnostic {
+    let root = env::temp_dir().join("symphony_workspaces");
+    match normalize_absolute_path(&root) {
+        Ok(normalized_path) => WorkspaceRootDiagnostic {
+            source: WorkspaceRootSource::Default,
+            environment_presence: None,
+            status: ConfigDiagnosticCheck::passed(),
+            normalized_path: Some(normalized_path),
+        },
+        Err(error) => WorkspaceRootDiagnostic {
+            source: WorkspaceRootSource::Default,
+            environment_presence: None,
+            status: ConfigDiagnosticCheck::failed(&error),
+            normalized_path: None,
+        },
+    }
+}
+
+fn workspace_root_diagnostic(
+    config: &Mapping,
+    workflow_dir: Option<&Path>,
+) -> WorkspaceRootDiagnostic {
+    let root = get_string(get_map(config, "workspace"), "root");
+    let (source, environment_presence, root) = match root {
+        Some(value) => match environment_reference(&value) {
+            Some(variable) => (
+                WorkspaceRootSource::Environment {
+                    variable: variable.to_string(),
+                },
+                Some(environment_value_presence(variable)),
+                resolve_path_value(&value),
+            ),
+            None => (
+                WorkspaceRootSource::Literal,
+                None,
+                resolve_path_value(&value),
+            ),
+        },
+        None => return default_workspace_root_diagnostic(),
+    };
+    let root = match root {
+        Ok(root) => root,
+        Err(error) => {
+            return WorkspaceRootDiagnostic {
+                source,
+                environment_presence,
+                status: ConfigDiagnosticCheck::failed(&error),
+                normalized_path: None,
+            };
+        }
+    };
+    let workflow_dir = workflow_dir.unwrap_or_else(|| Path::new("."));
+    let expanded = if root.is_absolute() {
+        root
+    } else {
+        workflow_dir.join(root)
+    };
+    match normalize_absolute_path(&expanded) {
+        Ok(normalized_path) => WorkspaceRootDiagnostic {
+            source,
+            environment_presence,
+            status: ConfigDiagnosticCheck::passed(),
+            normalized_path: Some(normalized_path),
+        },
+        Err(error) => WorkspaceRootDiagnostic {
+            source,
+            environment_presence,
+            status: ConfigDiagnosticCheck::failed(&error),
+            normalized_path: None,
+        },
+    }
+}
+
+fn environment_reference(value: &str) -> Option<&str> {
+    let name = value.strip_prefix('$')?;
+    (!name.is_empty() && !name.contains(['/', ' ', '$'])).then_some(name)
+}
+
+fn environment_value_presence(name: &str) -> EnvironmentValuePresence {
+    match env::var(name) {
+        Ok(value) if value.is_empty() => EnvironmentValuePresence::Empty,
+        Ok(_) => EnvironmentValuePresence::Present,
+        Err(env::VarError::NotPresent) => EnvironmentValuePresence::Missing,
+        Err(env::VarError::NotUnicode(_)) => EnvironmentValuePresence::Empty,
+    }
+}
+
 pub fn normalize_state(state: &str) -> String {
     state.to_ascii_lowercase()
 }
@@ -1361,32 +1668,22 @@ pub fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn resolve_secret(value: &str) -> Option<String> {
-    let resolved = if let Some(name) = value.strip_prefix('$') {
-        if name.is_empty() || name.contains(['/', ' ', '$']) {
-            value.to_string()
-        } else {
-            env::var(name).unwrap_or_default()
-        }
-    } else {
-        value.to_string()
+    let resolved = match environment_reference(value) {
+        Some(name) => env::var(name).unwrap_or_default(),
+        None => value.to_string(),
     };
     (!resolved.is_empty()).then_some(resolved)
 }
 
 fn resolve_path_value(value: &str) -> Result<PathBuf> {
-    let resolved = if let Some(name) = value.strip_prefix('$') {
-        if !name.is_empty() && !name.contains(['/', ' ', '$']) {
-            env::var(name).map_err(|_| {
-                SymphonyError::config(
-                    "missing_path_env",
-                    format!("environment variable {name} referenced by path is missing"),
-                )
-            })?
-        } else {
-            value.to_string()
-        }
-    } else {
-        value.to_string()
+    let resolved = match environment_reference(value) {
+        Some(name) => env::var(name).map_err(|_| {
+            SymphonyError::config(
+                "missing_path_env",
+                format!("environment variable {name} referenced by path is missing"),
+            )
+        })?,
+        None => value.to_string(),
     };
     let expanded = if resolved == "~" {
         home_dir()?.to_string_lossy().to_string()
