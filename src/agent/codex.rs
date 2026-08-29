@@ -67,6 +67,7 @@ impl CodexClient for CodexAppServerClient {
             Ok(()) => Ok(Box::new(session)),
             Err(error) => {
                 session.emit("startup_failed", Some(error.to_string()), None, None);
+                session.shutdown().await;
                 Err(error)
             }
         }
@@ -181,7 +182,7 @@ impl<'a> CodexJsonlSession<'a> {
                 }),
             )
             .await?;
-        self.wait_for_response(id).await?;
+        self.wait_for_response(id, "initialize").await?;
         self.send_notification("initialized", Value::Null).await
     }
 
@@ -197,7 +198,7 @@ impl<'a> CodexJsonlSession<'a> {
         );
         insert_configured(&mut params, "sandbox", self.config.thread_sandbox.as_ref());
         let id = self.send_request("thread/start", params).await?;
-        let response = self.wait_for_response(id).await?;
+        let response = self.wait_for_response(id, "thread/start").await?;
         response
             .get("thread")
             .and_then(|thread| thread.get("id"))
@@ -225,7 +226,7 @@ impl<'a> CodexJsonlSession<'a> {
             self.config.turn_sandbox_policy.as_ref(),
         );
         let id = self.send_request("turn/start", params).await?;
-        let response = self.wait_for_response(id).await?;
+        let response = self.wait_for_response(id, "turn/start").await?;
         response
             .get("turn")
             .and_then(|turn| turn.get("id"))
@@ -353,11 +354,10 @@ impl<'a> CodexJsonlSession<'a> {
         self.emit("rate_limits", None, None, rate_limits);
     }
 
-    async fn wait_for_response(&mut self, id: i64) -> Result<Value> {
+    async fn wait_for_response(&mut self, id: i64, method: &str) -> Result<Value> {
+        let deadline = Instant::now() + self.response_timeout();
         loop {
-            let value = self
-                .read_message_with_timeout(self.config.read_timeout_ms)
-                .await?;
+            let value = self.read_response_before(deadline, method, id).await?;
             if let Some(message_id) = request_id_as_i64(value.get("id")) {
                 if value.get("method").and_then(Value::as_str).is_some() {
                     self.handle_server_request(
@@ -400,6 +400,46 @@ impl<'a> CodexJsonlSession<'a> {
                     "protocol_error",
                     "message missing id or method",
                 ));
+            }
+        }
+    }
+
+    fn response_timeout(&self) -> Duration {
+        let turn_timeout = Duration::from_millis(self.config.turn_timeout_ms.max(1));
+        match u64::try_from(self.config.stall_timeout_ms) {
+            Ok(stall_timeout_ms) if stall_timeout_ms > 0 => {
+                turn_timeout.min(Duration::from_millis(stall_timeout_ms))
+            }
+            _ => turn_timeout,
+        }
+    }
+
+    async fn read_response_before(
+        &mut self,
+        deadline: Instant,
+        method: &str,
+        id: i64,
+    ) -> Result<Value> {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(response_timeout_error(method, id));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let read_timeout = Duration::from_millis(self.config.read_timeout_ms.max(1));
+            match timeout(remaining.min(read_timeout), self.read_line()).await {
+                Ok(Ok(Some(line))) => return self.parse_line(&line),
+                Ok(Ok(None)) => {
+                    return Err(SymphonyError::codex(
+                        "process_exit",
+                        "codex app-server exited",
+                    ));
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) if Instant::now() >= deadline => {
+                    return Err(response_timeout_error(method, id));
+                }
+                Err(_) => continue,
             }
         }
     }
@@ -498,22 +538,6 @@ impl<'a> CodexJsonlSession<'a> {
             .flush()
             .await
             .map_err(|source| SymphonyError::io(None, source))
-    }
-
-    async fn read_message_with_timeout(&mut self, timeout_ms: u64) -> Result<Value> {
-        let timeout_ms = timeout_ms.max(1);
-        match timeout(Duration::from_millis(timeout_ms), self.read_line()).await {
-            Ok(Ok(Some(line))) => self.parse_line(&line),
-            Ok(Ok(None)) => Err(SymphonyError::codex(
-                "process_exit",
-                "codex app-server exited",
-            )),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(SymphonyError::codex(
-                "timeout",
-                "timed out waiting for codex response",
-            )),
-        }
     }
 
     async fn read_message_before(&mut self, deadline: Instant) -> Result<Value> {
@@ -758,6 +782,13 @@ fn request_id_as_i64(value: Option<&Value>) -> Option<i64> {
         Value::String(text) => text.parse().ok(),
         _ => None,
     }
+}
+
+fn response_timeout_error(method: &str, id: i64) -> SymphonyError {
+    SymphonyError::codex(
+        "timeout",
+        format!("timed out waiting for {method} response {id}"),
+    )
 }
 
 fn turn_error_message(turn: &Value) -> Option<String> {

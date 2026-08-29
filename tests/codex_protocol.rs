@@ -8,7 +8,7 @@ use symphony::agent::codex::{CodexAppServerClient, CodexClient};
 use symphony::config::CodexConfig;
 use symphony::domain::CodexEvent;
 use tempfile::TempDir;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, Instant, sleep, timeout};
 
 const FAKE_CODEX: &str = r#"#!/usr/bin/env python3
 import json
@@ -40,6 +40,17 @@ init = recv()
 if scenario == "startup_timeout":
     log({"startup_request_received": True})
     time.sleep(10)
+    raise SystemExit(0)
+if scenario == "startup_unrelated_messages":
+    log({"startup_request_received": True})
+    request_id = 1000
+    while True:
+        send({"id": request_id, "method": "item/tool/call", "params": {"tool": "unknown"}})
+        response = recv()
+        if response is None:
+            break
+        log({"unrelated_response": response})
+        request_id += 1
     raise SystemExit(0)
 send({"id": init["id"], "result": {"codexHome": os.getcwd(), "authMode": "none"}})
 initialized = recv()
@@ -156,7 +167,7 @@ fn config(command: String) -> CodexConfig {
         approval_policy: Some(json!("never")),
         thread_sandbox: Some(json!("danger-full-access")),
         turn_sandbox_policy: Some(json!({ "type": "dangerFullAccess" })),
-        turn_timeout_ms: 300,
+        turn_timeout_ms: 5_000,
         read_timeout_ms: 5_000,
         stall_timeout_ms: 0,
     }
@@ -448,10 +459,11 @@ async fn startup_failures_emit_normalized_events() {
 }
 
 #[tokio::test]
-async fn startup_read_timeout_follows_a_received_initialize_request() {
+async fn startup_response_wait_uses_the_absolute_turn_deadline() {
     let harness = harness("startup_timeout");
     let mut codex_config = config(harness.command.clone());
-    codex_config.read_timeout_ms = 5_000;
+    codex_config.read_timeout_ms = 10_000;
+    codex_config.turn_timeout_ms = 5_000;
     let client = CodexAppServerClient::new(codex_config);
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&events);
@@ -463,24 +475,85 @@ async fn startup_read_timeout_follows_a_received_initialize_request() {
         .start_session(harness.workspace.path(), &mut on_event)
         .await
     {
-        Ok(_) => panic!("startup read must time out"),
+        Ok(_) => panic!("startup response must time out"),
         Err(error) => error.to_string(),
     };
 
-    assert!(error.contains("timeout"), "{error}");
+    assert!(error.contains("initialize response"), "{error}");
     assert!(
         log_entries(&harness.log_path)
             .iter()
             .any(|entry| entry.get("startup_request_received") == Some(&Value::Bool(true))),
-        "the fake app-server must receive initialize before the read timeout"
+        "the fake app-server must receive initialize before the response deadline"
     );
+    assert!(events.lock().expect("events mutex").iter().any(|event| {
+        event.event == "startup_failed"
+            && event
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("initialize response"))
+    }));
+}
+
+#[tokio::test]
+async fn unrelated_startup_messages_do_not_extend_the_response_deadline() {
+    let harness = harness("startup_unrelated_messages");
+    let mut codex_config = config(harness.command.clone());
+    codex_config.turn_timeout_ms = 10_000;
+    codex_config.stall_timeout_ms = 5_000;
+    let deadline = Duration::from_millis(codex_config.stall_timeout_ms as u64);
+    let client = CodexAppServerClient::new(codex_config);
+    let workspace_path = fs::canonicalize(harness.workspace.path()).expect("canonical workspace");
+    let log_path = harness.log_path.clone();
+    let task = tokio::spawn(async move {
+        let mut on_event = |_| {};
+        match client.start_session(&workspace_path, &mut on_event).await {
+            Ok(mut session) => {
+                session.shutdown().await;
+                panic!("startup response must time out");
+            }
+            Err(error) => error.to_string(),
+        }
+    });
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if fs::read_to_string(&log_path)
+                .is_ok_and(|content| content.contains(r#""startup_request_received":true"#))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake app-server receives initialize");
+
+    let started = Instant::now();
+    let error = task.await.expect("startup task completes");
+    let elapsed = started.elapsed();
+
+    assert!(error.contains("initialize response"), "{error}");
     assert!(
-        events
-            .lock()
-            .expect("events mutex")
-            .iter()
-            .any(|event| event.event == "startup_failed")
+        elapsed <= deadline + Duration::from_millis(800),
+        "startup took {elapsed:?}, exceeding the {deadline:?} response deadline"
     );
+    let log = log_entries(&harness.log_path);
+    assert!(
+        log.iter()
+            .any(|entry| entry.get("unrelated_response").is_some()),
+        "the client must keep handling server requests while awaiting initialize"
+    );
+    let pid = log
+        .iter()
+        .find_map(|entry| entry.get("pid").and_then(Value::as_u64))
+        .expect("fake app-server pid");
+    for _ in 0..100 {
+        if !process_is_alive(pid) {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("app-server process {pid} remained alive after startup timeout");
 }
 
 #[tokio::test]
