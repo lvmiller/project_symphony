@@ -33,11 +33,19 @@ workspace:
   root: ./.symphony-workspaces
   cleanup:
     after_success: committed
+  # Omit population (or use kind: none) to retain empty-directory behavior.
+  # Population runs before lifecycle hooks. `git` clones only newly created workspaces.
+  population:
+    kind: git
+    repository_url: https://github.com/your-org-or-user/your-repo.git
+    branch: main # Or use `ref` for a specific commit or tag; do not set both.
+    depth: 1
+    # On reuse, fetch and merge only when the current checkout can fast-forward.
+    # Use `skip` (the default) to leave reused workspaces entirely unchanged.
+    reuse: fetch_ff_only
 
 hooks:
   timeout_ms: 120000
-  after_create: |
-    git clone --depth 1 https://github.com/your-org-or-user/your-repo.git .
 
 agent:
   max_concurrent_agents: 1

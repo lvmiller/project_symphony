@@ -1,7 +1,11 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
-use symphony::config::{HooksConfig, WorkspaceCleanupConfig, WorkspaceConfig};
+use symphony::config::{
+    HooksConfig, WorkspaceCleanupConfig, WorkspaceConfig, WorkspacePopulationConfig,
+    WorkspacePopulationKind, WorkspacePopulationReusePolicy,
+};
 use symphony::error::SymphonyError;
 use symphony::workspace::{WorkspaceManager, sanitize_workspace_key, source_workspace_key};
 use tempfile::TempDir;
@@ -14,14 +18,86 @@ fn hooks_with_timeout(timeout_ms: u64) -> HooksConfig {
 }
 
 fn manager(root: &Path, hooks: HooksConfig) -> WorkspaceManager {
+    manager_with_population(root, hooks, WorkspacePopulationConfig::default())
+}
+
+fn manager_with_population(
+    root: &Path,
+    hooks: HooksConfig,
+    population: WorkspacePopulationConfig,
+) -> WorkspaceManager {
     WorkspaceManager::new(
         &WorkspaceConfig {
             root: root.to_path_buf(),
             cleanup: WorkspaceCleanupConfig::default(),
+            population,
         },
         hooks,
     )
     .expect("workspace manager should build")
+}
+
+fn git_population(repository: &Path) -> WorkspacePopulationConfig {
+    WorkspacePopulationConfig {
+        kind: WorkspacePopulationKind::Git,
+        repository_url: Some(repository.display().to_string()),
+        reference: None,
+        branch: None,
+        depth: None,
+        reuse: WorkspacePopulationReusePolicy::Skip,
+    }
+}
+
+fn git(path: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(path)
+        .output()
+        .expect("git command should start");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        arguments,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn read_repository_text(path: &Path) -> String {
+    fs::read_to_string(path)
+        .expect("repository text file")
+        .replace("\r\n", "\n")
+}
+
+fn remote_repository() -> (TempDir, TempDir, TempDir) {
+    let temp = TempDir::new().expect("tempdir");
+    let source = TempDir::new_in(temp.path()).expect("source tempdir");
+    let remote = TempDir::new_in(temp.path()).expect("remote tempdir");
+    git(source.path(), &["init"]);
+    git(
+        source.path(),
+        &["config", "user.email", "symphony@example.test"],
+    );
+    git(source.path(), &["config", "user.name", "Symphony Test"]);
+    fs::write(source.path().join("README.md"), "initial\n").expect("initial repository file");
+    git(source.path(), &["add", "."]);
+    git(source.path(), &["commit", "-m", "initial"]);
+    git(source.path(), &["branch", "-M", "main"]);
+    git(remote.path(), &["init", "--bare"]);
+    git(
+        remote.path(),
+        &["--git-dir=.", "symbolic-ref", "HEAD", "refs/heads/main"],
+    );
+    git(
+        source.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.path().to_str().expect("remote path"),
+        ],
+    );
+    git(source.path(), &["push", "-u", "origin", "HEAD"]);
+    (temp, source, remote)
 }
 
 fn assert_hook_error(error: SymphonyError, hook: &'static str, message_contains: &str) {
@@ -341,4 +417,160 @@ async fn fatal_hook_timeout_returns_error() {
         .await
         .expect_err("timeout should be fatal");
     assert_hook_error(error, "before_run", "timeout after 10 ms");
+}
+
+#[tokio::test]
+async fn git_population_clones_before_after_create_hook() {
+    let (_repository_root, _source, remote) = remote_repository();
+    let workspaces = TempDir::new().expect("workspace root");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.after_create = Some("test -d .git && printf ran > after_create_marker".to_string());
+    let manager = manager_with_population(workspaces.path(), hooks, git_population(remote.path()));
+
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("git population should clone a new workspace");
+
+    assert!(workspace.created_now);
+    assert_eq!(
+        read_repository_text(&workspace.path.join("README.md")),
+        "initial\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("after_create_marker")).expect("hook marker"),
+        "ran"
+    );
+}
+
+#[tokio::test]
+async fn git_population_reuse_skip_preserves_existing_workspace() {
+    let (_repository_root, source, remote) = remote_repository();
+    let workspaces = TempDir::new().expect("workspace root");
+    let manager = manager_with_population(
+        workspaces.path(),
+        hooks_with_timeout(1_000),
+        git_population(remote.path()),
+    );
+
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("initial clone should succeed");
+    fs::write(workspace.path.join("local-sentinel"), "keep me").expect("local sentinel");
+    fs::write(source.path().join("README.md"), "remote update\n").expect("remote update");
+    git(source.path(), &["add", "README.md"]);
+    git(source.path(), &["commit", "-m", "remote update"]);
+    git(source.path(), &["push"]);
+
+    let reused = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("reuse skip should succeed");
+
+    assert!(!reused.created_now);
+    assert_eq!(
+        read_repository_text(&reused.path.join("README.md")),
+        "initial\n"
+    );
+    assert_eq!(
+        fs::read_to_string(reused.path.join("local-sentinel")).expect("sentinel"),
+        "keep me"
+    );
+}
+
+#[tokio::test]
+async fn git_population_fast_forward_syncs_reused_checkout() {
+    let (_repository_root, source, remote) = remote_repository();
+    let workspaces = TempDir::new().expect("workspace root");
+    let mut population = git_population(remote.path());
+    population.reuse = WorkspacePopulationReusePolicy::FetchFfOnly;
+    let manager = manager_with_population(workspaces.path(), hooks_with_timeout(1_000), population);
+
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("initial clone should succeed");
+    fs::write(source.path().join("README.md"), "remote update\n").expect("remote update");
+    git(source.path(), &["add", "README.md"]);
+    git(source.path(), &["commit", "-m", "remote update"]);
+    git(source.path(), &["push"]);
+
+    manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("fast-forward sync should succeed");
+    assert_eq!(
+        read_repository_text(&workspace.path.join("README.md")),
+        "remote update\n"
+    );
+}
+
+#[tokio::test]
+async fn git_population_fast_forward_rejects_divergence_without_removing_workspace() {
+    let (_repository_root, source, remote) = remote_repository();
+    let workspaces = TempDir::new().expect("workspace root");
+    let mut population = git_population(remote.path());
+    population.reuse = WorkspacePopulationReusePolicy::FetchFfOnly;
+    let manager = manager_with_population(workspaces.path(), hooks_with_timeout(1_000), population);
+
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("initial clone should succeed");
+    fs::write(source.path().join("README.md"), "remote update\n").expect("remote update");
+    git(source.path(), &["add", "README.md"]);
+    git(source.path(), &["commit", "-m", "remote update"]);
+    git(source.path(), &["push"]);
+
+    git(
+        &workspace.path,
+        &["config", "user.email", "symphony@example.test"],
+    );
+    git(&workspace.path, &["config", "user.name", "Symphony Test"]);
+    fs::write(workspace.path.join("local-sentinel"), "keep me").expect("local change");
+    git(&workspace.path, &["add", "local-sentinel"]);
+    git(&workspace.path, &["commit", "-m", "local change"]);
+
+    let error = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect_err("divergent checkout must not be reset");
+
+    assert_workspace_error(error, "fast-forward sync");
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("local-sentinel")).expect("local file preserved"),
+        "keep me"
+    );
+    assert!(workspace.path.is_dir(), "reused workspace must remain");
+}
+
+#[tokio::test]
+async fn failed_new_git_population_cleans_partial_workspace_and_redacts_credentials() {
+    let workspaces = TempDir::new().expect("workspace root");
+    let population = WorkspacePopulationConfig {
+        kind: WorkspacePopulationKind::Git,
+        repository_url: Some("https://user:super-secret@127.0.0.1:1/not-a-repo".to_string()),
+        reference: None,
+        branch: None,
+        depth: None,
+        reuse: WorkspacePopulationReusePolicy::Skip,
+    };
+    let manager = manager_with_population(workspaces.path(), hooks_with_timeout(1_000), population);
+    let (_, workspace_path) = manager
+        .workspace_path_for_identifier("issue-1")
+        .expect("contained workspace path");
+
+    let error = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect_err("failed clone should fail workspace creation");
+
+    let message = error.to_string();
+    assert_workspace_error(error, "git clone failed");
+    assert!(!message.contains("super-secret"));
+    assert!(
+        !workspace_path.exists(),
+        "new partial workspace must be removed"
+    );
 }

@@ -4,21 +4,31 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
-use crate::config::{DEFAULT_SOURCE_ID, HooksConfig, WorkspaceConfig, normalize_absolute_path};
+use crate::config::{
+    DEFAULT_SOURCE_ID, HooksConfig, WorkspaceConfig, WorkspacePopulationConfig,
+    normalize_absolute_path,
+};
 use crate::domain::{Issue, Workspace};
 use crate::error::{Result, SymphonyError};
-use crate::hooks::{HookKind, run_hook_best_effort_with_source, run_hook_with_source};
+use crate::hooks::{
+    HookKind, populate_workspace, run_hook_best_effort_with_source, run_hook_with_source,
+};
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceManager {
     root: PathBuf,
+    population: WorkspacePopulationConfig,
     hooks: HooksConfig,
 }
 
 impl WorkspaceManager {
     pub fn new(config: &WorkspaceConfig, hooks: HooksConfig) -> Result<Self> {
         let root = canonicalize_if_exists(&normalize_absolute_path(&config.root)?)?;
-        Ok(Self { root, hooks })
+        Ok(Self {
+            root,
+            population: config.population.clone(),
+            hooks,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -105,6 +115,13 @@ impl WorkspaceManager {
             workspace_key,
             created_now,
         };
+        if let Err(error) = populate_workspace(&self.population, &verified_path, created_now).await
+        {
+            if created_now {
+                remove_new_workspace(&canonical_root, &verified_path);
+            }
+            return Err(error);
+        }
         if created_now
             && let Err(error) = run_hook_with_source(
                 HookKind::AfterCreate,
@@ -114,7 +131,7 @@ impl WorkspaceManager {
             )
             .await
         {
-            let _ = fs::remove_dir_all(&verified_path);
+            remove_new_workspace(&canonical_root, &verified_path);
             return Err(error);
         }
         Ok(workspace)
@@ -340,6 +357,19 @@ fn ensure_canonical_contained(canonical_root: &Path, canonical_workspace: &Path)
             canonical_root.display(),
             canonical_workspace.display()
         )))
+    }
+}
+
+fn remove_new_workspace(canonical_root: &Path, workspace: &Path) {
+    match verify_workspace_dir(canonical_root, workspace) {
+        Ok(workspace) => {
+            if let Err(error) = fs::remove_dir_all(&workspace) {
+                warn!(workspace = %workspace.display(), error = %error, "failed to clean new partial workspace");
+            }
+        }
+        Err(error) => {
+            warn!(error = %error, "new partial workspace cleanup skipped invalid workspace path");
+        }
     }
 }
 
