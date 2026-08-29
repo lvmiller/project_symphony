@@ -251,7 +251,7 @@ mutation SymphonyUpdateProjectStatus(
 #[derive(Clone)]
 pub struct GitHubGraphqlExecutor {
     http: reqwest::Client,
-    endpoint: String,
+    endpoint: reqwest::Url,
     token: String,
 }
 
@@ -277,14 +277,16 @@ impl GitHubGraphqlExecutor {
             return Err(SymphonyError::MissingTrackerApiKey);
         }
         github.validate()?;
+        let endpoint = tracker.github_endpoint_url()?;
         let http = reqwest::Client::builder()
             .user_agent("symphony-rust-runtime")
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|err| tracker_error("github_transport", err.to_string()))?;
+            .map_err(|_| tracker_error("github_transport", "failed to build GitHub HTTP client"))?;
         Ok(Self {
             http,
-            endpoint: tracker.endpoint.clone(),
+            endpoint,
             token,
         })
     }
@@ -298,7 +300,7 @@ impl GitHubGraphqlExecutor {
         }
         let response = self
             .http
-            .post(&self.endpoint)
+            .post(self.endpoint.clone())
             .bearer_auth(&self.token)
             .header("Accept", "application/vnd.github+json")
             .json(&json!({ "query": query, "variables": variables }))

@@ -603,6 +603,77 @@ fn github_workflow_endpoint_is_taken_from_front_matter() {
 }
 
 #[test]
+fn github_endpoint_requires_https_except_for_explicit_numeric_loopback() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+
+    for endpoint in [
+        "http://github.example/graphql",
+        "http://localhost/graphql",
+        "http://192.168.1.10/graphql",
+        "http://[::ffff:127.0.0.1]/graphql",
+    ] {
+        let workflow = valid_workflow(None).replacen(
+            "kind: github",
+            &format!("kind: github\n  endpoint: {endpoint}"),
+            1,
+        );
+        assert_config_code(
+            write_workflow(temp.path(), &workflow),
+            "insecure_tracker_endpoint",
+        );
+    }
+
+    let loopback = valid_workflow(None).replacen(
+        "kind: github",
+        "kind: github\n  endpoint: http://127.0.0.1:8080/graphql\n  allow_insecure_loopback: true",
+        1,
+    );
+    let config = load_from_path(write_workflow(temp.path(), &loopback));
+    assert!(config.tracker.allow_insecure_loopback);
+
+    let loopback_v6 = valid_workflow(None).replacen(
+        "kind: github",
+        "kind: github\n  endpoint: http://[::1]:8080/graphql\n  allow_insecure_loopback: true",
+        1,
+    );
+    load_from_path(write_workflow(temp.path(), &loopback_v6));
+
+    let disabled = valid_workflow(None).replacen(
+        "kind: github",
+        "kind: github\n  endpoint: http://127.0.0.1:8080/graphql",
+        1,
+    );
+    assert_config_code(
+        write_workflow(temp.path(), &disabled),
+        "insecure_tracker_endpoint",
+    );
+}
+
+#[test]
+fn malformed_tracker_endpoints_do_not_disclose_credentials() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
+    let temp = tempfile::tempdir().unwrap();
+    let secret = "endpoint-token-must-not-leak";
+    let workflow = valid_workflow(None).replacen(
+        "kind: github",
+        &format!("kind: github\n  endpoint: https://{secret}@github.example/graphql"),
+        1,
+    );
+    let error = EffectiveConfig::load(Some(write_workflow(temp.path(), &workflow))).unwrap_err();
+    assert!(!error.to_string().contains(secret));
+    assert!(matches!(
+        error,
+        SymphonyError::ConfigValidation {
+            code: "invalid_tracker_endpoint",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn path_environment_and_home_expansion_are_applied_only_for_workspace_root() {
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe { env::set_var("GITHUB_TOKEN", "unit-token") };
@@ -774,6 +845,23 @@ fn raw_workflow_schema_is_static_extensible_and_documents_defaults() {
             .unwrap()
             .contains("$VAR_NAME")
     );
+    assert_eq!(
+        schema["properties"]["tracker"]["properties"]["allow_insecure_loopback"]["default"],
+        false
+    );
+    assert_eq!(
+        schema["properties"]["server"]["properties"]["refresh_cooldown_ms"]["default"],
+        1_000
+    );
+    assert_eq!(
+        schema["properties"]["server"]["properties"]["auth_token"]["writeOnly"],
+        true
+    );
+    assert!(
+        schema["properties"]["server"]["properties"]["auth_token"]
+            .get("default")
+            .is_none()
+    );
 
     let temp = tempfile::tempdir().unwrap();
     let config = load_from_path(write_workflow(
@@ -798,6 +886,8 @@ fn server_config_is_parsed_and_validated() {
         "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
     );
     assert_eq!(config.server.port, Some(0));
+    assert_eq!(config.server.refresh_cooldown_ms, 1_000);
+    assert!(config.server.auth_token.is_none());
 
     let invalid_host = write_workflow(
         temp.path(),
@@ -816,6 +906,52 @@ fn server_config_is_parsed_and_validated() {
         "---\ntracker:\n  kind: github\n  repository:\n    owner: octo\n    name: repo\n  project:\n    owner_login: octo\n    number: 7\nserver:\n  port: 65536\n---\nPrompt\n",
     );
     assert_config_code(invalid_large, "invalid_server_port");
+}
+
+#[test]
+fn server_auth_token_is_resolved_redacted_and_required_off_loopback() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        env::set_var("GITHUB_TOKEN", "unit-token");
+        env::set_var(
+            "SYMPHONY_SERVER_TEST_TOKEN",
+            "server-token-must-not-serialize",
+        );
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let configured = valid_workflow(None).replacen(
+        "---\n",
+        "---\nserver:\n  host: 0.0.0.0\n  port: 8080\n  auth_token: $SYMPHONY_SERVER_TEST_TOKEN\n  refresh_cooldown_ms: 250\n",
+        1,
+    );
+    let config = load_from_path(write_workflow(temp.path(), &configured));
+    assert_eq!(
+        config.server.auth_token.as_deref(),
+        Some("server-token-must-not-serialize")
+    );
+    assert_eq!(config.server.refresh_cooldown_ms, 250);
+    assert!(
+        !serde_json::to_string(&config)
+            .unwrap()
+            .contains("server-token-must-not-serialize")
+    );
+    assert!(!format!("{config:?}").contains("server-token-must-not-serialize"));
+
+    let missing_auth = valid_workflow(None).replacen(
+        "---\n",
+        "---\nserver:\n  host: 192.168.1.9\n  port: 8080\n",
+        1,
+    );
+    assert_config_code(
+        write_workflow(temp.path(), &missing_auth),
+        "missing_server_auth_token",
+    );
+    let zero_cooldown =
+        valid_workflow(None).replacen("---\n", "---\nserver:\n  refresh_cooldown_ms: 0\n", 1);
+    assert_config_code(
+        write_workflow(temp.path(), &zero_cooldown),
+        "invalid_server_refresh_cooldown_ms",
+    );
 }
 
 #[test]

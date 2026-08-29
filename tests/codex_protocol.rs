@@ -425,6 +425,7 @@ fn github_executor(endpoint: String) -> GitHubGraphqlExecutor {
         kind: "github".to_string(),
         endpoint,
         api_key: Some("test-token".to_string()),
+        allow_insecure_loopback: true,
         active_states: Vec::new(),
         terminal_states: Vec::new(),
         github: Some(GithubConfig {

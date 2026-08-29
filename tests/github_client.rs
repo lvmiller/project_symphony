@@ -76,6 +76,35 @@ async fn raw_graphql_executor_uses_configured_endpoint_auth_and_preserves_graphq
 }
 
 #[tokio::test]
+async fn graphql_redirects_are_not_followed_or_sent_bearer_credentials() {
+    let same_origin = TestServer::new(vec![
+        redirect("/graphql"),
+        ok(json!({"data": {"unexpected": true}})),
+    ]);
+    let error = raw_executor(same_origin.url())
+        .execute("query { viewer { login } }", json!({}))
+        .await
+        .unwrap_err();
+    assert_tracker_kind(error, "github_status");
+    let requests = same_origin.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("authorization: Bearer test-token"));
+
+    let redirect_target = TestServer::new(vec![ok(json!({"data": {"unexpected": true}}))]);
+    let redirect_source = TestServer::new(vec![redirect(&redirect_target.url())]);
+    let error = raw_executor(redirect_source.url())
+        .execute("query { viewer { login } }", json!({}))
+        .await
+        .unwrap_err();
+    assert_tracker_kind(error, "github_status");
+    assert_eq!(redirect_source.requests().len(), 1);
+    assert!(
+        redirect_target.requests().is_empty(),
+        "redirect targets must receive no request or credential"
+    );
+}
+
+#[tokio::test]
 async fn raw_graphql_executor_distinguishes_transport_status_and_malformed_responses() {
     let refused = TcpListener::bind("127.0.0.1:0").unwrap();
     let refused_url = format!("http://{}/graphql", refused.local_addr().unwrap());
@@ -1212,6 +1241,7 @@ fn client_with_repositories(
     let tracker = TrackerConfig {
         kind: "github".to_string(),
         endpoint,
+        allow_insecure_loopback: true,
         api_key: Some("test-token".to_string()),
         active_states: active_states.into_iter().map(str::to_string).collect(),
         terminal_states: vec!["Done".to_string()],
@@ -1245,6 +1275,7 @@ fn client_for_owner_type(
     let tracker = TrackerConfig {
         kind: "github".to_string(),
         endpoint,
+        allow_insecure_loopback: true,
         api_key: Some("test-token".to_string()),
         active_states: active_states.into_iter().map(str::to_string).collect(),
         terminal_states: vec!["Done".to_string()],
@@ -1448,10 +1479,19 @@ fn ok(body: Value) -> HttpResponse {
     response(200, body)
 }
 
+fn redirect(location: &str) -> HttpResponse {
+    HttpResponse {
+        status: 302,
+        body: String::new(),
+        headers: vec![("location".to_string(), location.to_string())],
+    }
+}
+
 fn response(status: u16, body: Value) -> HttpResponse {
     HttpResponse {
         status,
         body: body.to_string(),
+        headers: Vec::new(),
     }
 }
 
@@ -1459,6 +1499,7 @@ fn raw_response(status: u16, body: &str) -> HttpResponse {
     HttpResponse {
         status,
         body: body.to_string(),
+        headers: Vec::new(),
     }
 }
 
@@ -1476,6 +1517,7 @@ fn request_body(request: &str) -> &str {
 struct HttpResponse {
     status: u16,
     body: String,
+    headers: Vec<(String, String)>,
 }
 
 struct TestServer {
@@ -1584,8 +1626,13 @@ fn write_http_response(stream: &mut std::net::TcpStream, response: HttpResponse)
     } else {
         "Error"
     };
+    let headers = response
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
     let reply = format!(
-        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{}",
         response.status,
         reason,
         response.body.len(),

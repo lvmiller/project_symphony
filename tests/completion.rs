@@ -75,6 +75,26 @@ fn enabled_completion_requires_a_tracker_writer() {
     assert!(error.to_string().contains("completion_writer_unavailable"));
 }
 
+#[test]
+fn completion_rejects_insecure_tracker_transport_without_disclosing_token() {
+    let mut config = config();
+    config.tracker.endpoint = "http://github.example/graphql".to_string();
+    config.tracker.api_key = Some("completion-token-must-not-leak".to_string());
+    let writer: Arc<dyn TrackerWriter> = Arc::new(FakeWriter::default());
+
+    let error = DirectCommitCompletion::new(&config, Some(writer))
+        .err()
+        .expect("insecure tracker transport must be rejected");
+    assert!(!error.to_string().contains("completion-token-must-not-leak"));
+    assert!(matches!(
+        error,
+        SymphonyError::ConfigValidation {
+            code: "insecure_tracker_endpoint",
+            ..
+        }
+    ));
+}
+
 #[tokio::test]
 async fn started_state_transition_uses_tracker_writer() {
     let writer = Arc::new(FakeWriter::default());
@@ -434,6 +454,7 @@ fn config() -> EffectiveConfig {
         tracker: TrackerConfig {
             kind: "github".to_string(),
             endpoint: "https://api.github.test/graphql".to_string(),
+            allow_insecure_loopback: false,
             api_key: Some("test-token".to_string()),
             active_states: vec!["Ready".to_string()],
             terminal_states: vec!["Done".to_string()],

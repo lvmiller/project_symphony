@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -33,6 +34,54 @@ use crate::workspace::source_workspace_namespace;
 pub const DEFAULT_GITHUB_ENDPOINT: &str = "https://api.github.com/graphql";
 pub const DEFAULT_PROMPT: &str = "You are working on an issue from GitHub.";
 
+/// Resolves and validates a credential-bearing GitHub endpoint without exposing its text in
+/// errors. Plain HTTP is deliberately limited to an explicit numeric-loopback development mode.
+pub fn resolve_github_endpoint(
+    endpoint: &str,
+    allow_insecure_loopback: bool,
+) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| {
+        SymphonyError::config(
+            "invalid_tracker_endpoint",
+            "tracker.endpoint must be an absolute HTTP(S) URL without credentials",
+        )
+    })?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(SymphonyError::config(
+            "invalid_tracker_endpoint",
+            "tracker.endpoint must be an absolute HTTP(S) URL without credentials",
+        ));
+    }
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if allow_insecure_loopback && is_numeric_loopback_host(url.host_str()) => Ok(url),
+        "http" => Err(SymphonyError::config(
+            "insecure_tracker_endpoint",
+            "tracker.endpoint must use HTTPS unless tracker.allow_insecure_loopback is true and the host is numeric IP loopback",
+        )),
+        _ => Err(SymphonyError::config(
+            "invalid_tracker_endpoint",
+            "tracker.endpoint must use HTTP or HTTPS",
+        )),
+    }
+}
+
+fn is_numeric_loopback_host(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let host = match host.strip_prefix('[') {
+        Some(host) => host.strip_suffix(']').unwrap_or_default(),
+        None => host,
+    };
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
 pub const DEFAULT_SOURCE_ID: &str = "default";
 
 /// A secret-safe result for one configuration diagnostic check.
@@ -243,9 +292,9 @@ pub fn raw_workflow_json_schema() -> serde_json::Value {
                 "description": "Issue tracker configuration. `kind`, credentials, repository, and project fields are required only for dispatch.",
                 "properties": {
                     "kind": { "type": "string", "enum": ["github"], "description": "Required for dispatch." },
-                    "endpoint": { "type": "string", "format": "uri", "default": DEFAULT_GITHUB_ENDPOINT, "description": "GitHub GraphQL endpoint when kind is github." },
+                    "endpoint": { "type": "string", "format": "uri", "default": DEFAULT_GITHUB_ENDPOINT, "description": "HTTPS GitHub GraphQL endpoint when kind is github. HTTP is allowed only for numeric IP loopback when tracker.allow_insecure_loopback is explicitly true." },
+                    "allow_insecure_loopback": { "type": "boolean", "default": false, "description": "Development-only exception permitting HTTP only for 127.0.0.0/8 or ::1. Hostnames and private or LAN addresses are never allowed over HTTP." },
                     "api_key": { "type": "string", "writeOnly": true, "description": "Literal credential or `$VAR_NAME`; `$GITHUB_TOKEN` is used by default for GitHub. No secret value is included in this schema." },
-                    "active_states": { "type": "array", "items": { "type": "string" }, "default": ["Todo", "In Progress"] },
                     "terminal_states": { "type": "array", "items": { "type": "string" }, "default": ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"] },
                     "repository": {
                         "type": "object",
@@ -418,7 +467,9 @@ pub fn raw_workflow_json_schema() -> serde_json::Value {
                 "description": "Changing listener settings may require restart.",
                 "properties": {
                     "host": { "type": "string", "default": "127.0.0.1", "description": "IP address." },
-                    "port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+                    "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+                    "auth_token": { "type": "string", "writeOnly": true, "description": "Optional literal credential or `$VAR_NAME`. Required when server.host is non-loopback. No secret value is included in this schema." },
+                    "refresh_cooldown_ms": { "type": "integer", "minimum": 1, "default": 1000, "description": "Minimum delay between accepted refresh requests." }
                 },
                 "additionalProperties": true
             }
@@ -431,10 +482,28 @@ pub struct SourceConfig {
     pub id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub host: IpAddr,
     pub port: Option<u16>,
+    #[serde(skip_serializing)]
+    pub auth_token: Option<String>,
+    pub refresh_cooldown_ms: u64,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("refresh_cooldown_ms", &self.refresh_cooldown_ms)
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -442,6 +511,8 @@ impl Default for ServerConfig {
         Self {
             host: IpAddr::from(Ipv4Addr::LOCALHOST),
             port: None,
+            auth_token: None,
+            refresh_cooldown_ms: 1_000,
         }
     }
 }
@@ -542,6 +613,7 @@ impl EffectiveConfig {
             .as_ref()
             .ok_or(SymphonyError::MissingGithubConfig { field: "github" })?;
         github.validate()?;
+        self.tracker.github_endpoint_url()?;
         if self.codex.command.trim().is_empty() {
             return Err(SymphonyError::config(
                 "missing_codex_command",
@@ -572,11 +644,18 @@ impl EffectiveConfig {
 pub struct TrackerConfig {
     pub kind: String,
     pub endpoint: String,
+    pub allow_insecure_loopback: bool,
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
     pub github: Option<GithubConfig>,
+}
+
+impl TrackerConfig {
+    pub fn github_endpoint_url(&self) -> Result<reqwest::Url> {
+        resolve_github_endpoint(&self.endpoint, self.allow_insecure_loopback)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1010,35 +1089,27 @@ fn validate_unique_source_ids(reloaders: &[ConfigReloader]) -> Result<()> {
             return Err(SymphonyError::config(
                 "duplicate_source_id",
                 format!(
-                    "source.id must be unique id={} first={} second={}",
-                    source_id,
+                    "source.id {source_id:?} is configured by both {} and {}",
                     previous_path.display(),
                     workflow_path.display()
                 ),
             ));
         }
-
-        let segment = source_workspace_namespace(source_id);
-        if let Some((previous_source_id, previous_path)) = source_segments.insert(
-            segment.clone(),
-            (source_id.to_string(), workflow_path.clone()),
-        ) {
+        let source_segment = source_workspace_namespace(source_id);
+        if let Some(previous_path) =
+            source_segments.insert(source_segment.clone(), workflow_path.clone())
+        {
             return Err(SymphonyError::config(
-                "colliding_source_workspace_key",
+                "duplicate_source_workspace_namespace",
                 format!(
-                    "source.id values must produce unique workspace source segments segment={} first_id={} first={} second_id={} second={}",
-                    segment,
-                    previous_source_id,
-                    previous_path.display(),
-                    source_id,
-                    workflow_path.display()
+                    "source.id {source_id:?} shares workspace namespace {source_segment:?} with {}",
+                    previous_path.display()
                 ),
             ));
         }
     }
     Ok(())
 }
-
 fn modified_time(path: &Path) -> std::io::Result<SystemTime> {
     std::fs::metadata(path)?.modified()
 }
@@ -1063,13 +1134,19 @@ fn parse_tracker(config: &Mapping) -> Result<TrackerConfig> {
     let kind = get_string(tracker, "kind")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let endpoint = get_string(tracker, "endpoint").unwrap_or_else(|| {
+    let raw_endpoint = get_string(tracker, "endpoint").unwrap_or_else(|| {
         if kind == "github" {
             DEFAULT_GITHUB_ENDPOINT.to_string()
         } else {
             String::new()
         }
     });
+    let allow_insecure_loopback = get_bool(tracker, "allow_insecure_loopback").unwrap_or(false);
+    let endpoint = if kind == "github" {
+        resolve_github_endpoint(&raw_endpoint, allow_insecure_loopback)?.to_string()
+    } else {
+        raw_endpoint
+    };
     let raw_api_key = get_string(tracker, "api_key")
         .or_else(|| get_string(tracker, "token"))
         .or_else(|| (kind == "github").then(|| "$GITHUB_TOKEN".to_string()));
@@ -1093,6 +1170,7 @@ fn parse_tracker(config: &Mapping) -> Result<TrackerConfig> {
     Ok(TrackerConfig {
         kind,
         endpoint,
+        allow_insecure_loopback,
         api_key,
         active_states,
         terminal_states,
@@ -1646,6 +1724,7 @@ fn parse_completion(config: &Mapping) -> Result<CompletionConfig> {
         direct_commit: direct_commit_config,
     })
 }
+
 fn parse_server(config: &Mapping) -> Result<ServerConfig> {
     let Some(server) = get_map(config, "server") else {
         return Ok(ServerConfig::default());
@@ -1663,7 +1742,6 @@ fn parse_server(config: &Mapping) -> Result<ServerConfig> {
         }
         None => ServerConfig::default().host,
     };
-
     let port = match get_value(Some(server), "port") {
         Some(value) => {
             let Some(port) = value.as_i64() else {
@@ -1682,8 +1760,27 @@ fn parse_server(config: &Mapping) -> Result<ServerConfig> {
         }
         None => None,
     };
-
-    Ok(ServerConfig { host, port })
+    let auth_token =
+        get_string(Some(server), "auth_token").and_then(|value| resolve_secret(&value));
+    if !host.is_loopback() && auth_token.is_none() {
+        return Err(SymphonyError::config(
+            "missing_server_auth_token",
+            "server.auth_token is required when server.host is non-loopback",
+        ));
+    }
+    let refresh_cooldown_ms = positive_u64_or_default(
+        Some(server),
+        "refresh_cooldown_ms",
+        ServerConfig::default().refresh_cooldown_ms,
+        "invalid_server_refresh_cooldown_ms",
+        "server.refresh_cooldown_ms",
+    )?;
+    Ok(ServerConfig {
+        host,
+        port,
+        auth_token,
+        refresh_cooldown_ms,
+    })
 }
 
 fn tracker_api_key_diagnostic(config: &Mapping) -> TrackerApiKeyDiagnostic {

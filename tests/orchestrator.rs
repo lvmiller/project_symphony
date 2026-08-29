@@ -43,6 +43,7 @@ fn config(
             kind: "github".to_string(),
             endpoint: "https://api.github.com/graphql".to_string(),
             api_key: Some("token".to_string()),
+            allow_insecure_loopback: false,
             active_states: vec!["Todo".to_string(), "In Progress".to_string()],
             terminal_states: vec![
                 "Done".to_string(),

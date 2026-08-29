@@ -169,6 +169,7 @@ async fn runner_removes_workspace_after_successful_direct_commit_completion() {
 
     let mut config = config(temp.path(), 1, "{{ issue.identifier }}");
     config.tracker.endpoint = format!("{}/graphql", server.url());
+    config.tracker.allow_insecure_loopback = true;
     config.completion = CompletionConfig {
         direct_commit: DirectCommitCompletionConfig {
             enabled: true,
@@ -235,6 +236,7 @@ async fn runner_keeps_workspace_after_committed_completion_when_cleanup_policy_i
 
     let mut config = config(temp.path(), 1, "{{ issue.identifier }}");
     config.tracker.endpoint = format!("{}/graphql", server.url());
+    config.tracker.allow_insecure_loopback = true;
     config.workspace.cleanup.after_success = WorkspaceCleanupAfterSuccess::Never;
     config.completion = CompletionConfig {
         direct_commit: DirectCommitCompletionConfig {
@@ -479,6 +481,7 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
             kind: "github".to_string(),
             endpoint: "https://api.github.com/graphql".to_string(),
             api_key: Some("redacted".to_string()),
+            allow_insecure_loopback: false,
             active_states: vec!["active".to_string()],
             terminal_states: vec!["done".to_string()],
             github: Some(GithubConfig {

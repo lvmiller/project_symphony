@@ -254,6 +254,7 @@ impl DirectCommitCompletion {
                 "direct-commit completion requires a tracker writer",
             )
         })?;
+        config.tracker.github_endpoint_url()?;
         let token = config
             .tracker
             .api_key
