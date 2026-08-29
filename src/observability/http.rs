@@ -1,8 +1,10 @@
 //! Local HTTP observability and operator dashboard.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::extract::rejection::QueryRejection;
@@ -22,15 +24,76 @@ use tracing::warn;
 use crate::config::{
     EffectiveConfig, GithubProjectOwnerType, GithubRepositoryConfig, ServerConfig,
 };
-use crate::domain::{RecentEvent, RetrySnapshot, RunningSnapshot, RuntimeSnapshot, TokenTotals};
+use crate::domain::{
+    PollHealth, RecentEvent, RetrySnapshot, RunningSnapshot, RuntimeSnapshot, TokenTotals,
+};
 use crate::error::{Result, SymphonyError};
 use crate::orchestrator::OrchestratorState;
 use crate::time::{now_utc, system_monotonic_ms};
 use crate::workflow::load_workflow;
 
 #[derive(Clone, Debug)]
+pub struct PollHealthRegistry {
+    inner: Arc<StdRwLock<BTreeMap<String, Option<PollHealth>>>>,
+}
+
+impl PollHealthRegistry {
+    pub fn new(configs: &[EffectiveConfig]) -> Self {
+        let registry = Self {
+            inner: Arc::new(StdRwLock::new(BTreeMap::new())),
+        };
+        registry.sync_configured_sources(configs);
+        registry
+    }
+
+    /// Synchronizes the bounded registry with the sources currently configured
+    /// for polling, retaining health only for sources that remain configured.
+    pub fn sync_configured_sources(&self, configs: &[EffectiveConfig]) {
+        let configured: BTreeSet<_> = configs
+            .iter()
+            .map(|config| config.source.id.clone())
+            .collect();
+        let mut health = self.inner.write().expect("poll health lock poisoned");
+        health.retain(|source_id, _| configured.contains(source_id));
+        for source_id in configured {
+            health.entry(source_id).or_insert(None);
+        }
+    }
+
+    /// Records a completed tracker poll for a currently configured source.
+    ///
+    /// Stale completions cannot overwrite a newer poll result, and results for
+    /// removed sources are ignored so the registry remains bounded.
+    pub fn record_poll_result(&self, source_id: &str, success: bool, observed_at: DateTime<Utc>) {
+        let mut health = self.inner.write().expect("poll health lock poisoned");
+        let Some(current) = health.get_mut(source_id) else {
+            return;
+        };
+        if current
+            .as_ref()
+            .is_none_or(|current| observed_at >= current.observed_at)
+        {
+            *current = Some(PollHealth {
+                success,
+                observed_at,
+            });
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.inner
+            .read()
+            .expect("poll health lock poisoned")
+            .values()
+            .flatten()
+            .any(|health| health.success)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SharedStatus {
     inner: Arc<RwLock<StatusDocument>>,
+    poll_health: PollHealthRegistry,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,11 +194,17 @@ pub struct HttpServerHandle {
 #[derive(Clone)]
 struct AppState {
     shared_status: SharedStatus,
+    poll_health: PollHealthRegistry,
     refresh_tx: mpsc::UnboundedSender<()>,
     refresh_pending: Arc<AtomicBool>,
     auth_token: Option<Arc<str>>,
     refresh_cooldown_ms: u64,
     refresh_last_accepted_ms: Arc<AtomicU64>,
+}
+
+#[derive(Serialize)]
+struct ProbeResponse {
+    status: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -239,10 +308,16 @@ impl SharedStatus {
                 sources: source_summaries(configs),
                 issues: Vec::new(),
             })),
+            poll_health: PollHealthRegistry::new(configs),
         }
     }
 
+    pub fn poll_health_registry(&self) -> PollHealthRegistry {
+        self.poll_health.clone()
+    }
+
     pub async fn publish(&self, state: &OrchestratorState, configs: &[EffectiveConfig]) {
+        self.poll_health.sync_configured_sources(configs);
         let generated_at = now_utc();
         let observed_monotonic_ms = system_monotonic_ms();
         let snapshot = state.snapshot_at(generated_at, observed_monotonic_ms);
@@ -312,8 +387,10 @@ fn router(
     auth_token: Option<Arc<str>>,
     refresh_cooldown_ms: u64,
 ) -> Router {
+    let poll_health = shared_status.poll_health_registry();
     let state = AppState {
         shared_status,
+        poll_health,
         refresh_tx,
         refresh_pending,
         auth_token,
@@ -345,6 +422,8 @@ fn router(
         ));
     Router::new()
         .route("/", get(dashboard))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .nest("/api/v1", api)
         .with_state(state)
 }
@@ -356,6 +435,23 @@ async fn authenticate_api(State(state): State<AppState>, request: Request, next:
         return ApiError::unauthorized().into_response();
     }
     next.run(request).await
+}
+
+async fn healthz() -> Json<ProbeResponse> {
+    Json(ProbeResponse { status: "ok" })
+}
+
+async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ProbeResponse>) {
+    if state.poll_health.is_ready() {
+        (StatusCode::OK, Json(ProbeResponse { status: "ready" }))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProbeResponse {
+                status: "not_ready",
+            }),
+        )
+    }
 }
 
 async fn dashboard() -> Html<&'static str> {

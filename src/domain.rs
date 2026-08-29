@@ -229,6 +229,16 @@ pub enum IssueSnapshot {
     NotFound,
 }
 
+/// The latest completed tracker poll for one configured source.
+///
+/// This is intentionally limited to the readiness decision; it never retains
+/// tracker responses, errors, or credentials.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PollHealth {
+    pub success: bool,
+    pub observed_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CodexEvent {
     pub issue_id: String,

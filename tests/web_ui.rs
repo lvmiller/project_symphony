@@ -619,3 +619,109 @@ async fn unknown_issue_identifier_returns_json_not_found_envelope() {
     );
     server.task.abort();
 }
+
+async fn start_health_server(
+    configs: &[EffectiveConfig],
+    server_config: &ServerConfig,
+) -> (
+    String,
+    symphony::observability::http::HttpServerHandle,
+    SharedStatus,
+) {
+    let shared_status = SharedStatus::new(configs);
+    shared_status
+        .publish(&OrchestratorState::default(), configs)
+        .await;
+    let (refresh_tx, _refresh_rx) = mpsc::unbounded_channel();
+    let server = spawn_http_server(
+        "127.0.0.1:0".parse().unwrap(),
+        shared_status.clone(),
+        refresh_tx,
+        Arc::new(AtomicBool::new(false)),
+        server_config,
+    )
+    .await
+    .unwrap();
+    (
+        format!("http://{}", server.local_addr),
+        server,
+        shared_status,
+    )
+}
+
+async fn probe(base: &str, path: &str) -> (StatusCode, Value) {
+    let response = reqwest::get(format!("{base}{path}")).await.unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn health_probes_are_unauthenticated_minimal_and_follow_current_source_poll_health() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_workflow(temp.path());
+    let primary = EffectiveConfig::load(Some(path)).unwrap();
+    let mut secondary = primary.clone();
+    secondary.source.id = "secondary".to_string();
+    let configs = vec![primary, secondary];
+    let server_config = ServerConfig {
+        auth_token: Some("operator-secret".to_string()),
+        ..ServerConfig::default()
+    };
+    let (base, server, shared_status) = start_health_server(&configs, &server_config).await;
+    let poll_health = shared_status.poll_health_registry();
+
+    let (status, body) = probe(&base, "/healthz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"status": "ok"}));
+    assert_eq!(body.as_object().unwrap().len(), 1);
+
+    let api_response = reqwest::get(format!("{base}/api/v1/state")).await.unwrap();
+    assert_eq!(api_response.status(), StatusCode::UNAUTHORIZED);
+
+    let (status, body) = probe(&base, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"status": "not_ready"}));
+    assert_eq!(body.as_object().unwrap().len(), 1);
+    assert!(!body.to_string().contains("operator-secret"));
+    assert!(!body.to_string().contains("super-secret"));
+
+    poll_health.record_poll_result("default", false, Utc::now());
+    let (status, body) = probe(&base, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"status": "not_ready"}));
+
+    poll_health.record_poll_result("secondary", true, Utc::now());
+    let (status, body) = probe(&base, "/readyz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"status": "ready"}));
+
+    shared_status
+        .publish(&OrchestratorState::default(), &configs[..1])
+        .await;
+    let (status, body) = probe(&base, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"status": "not_ready"}));
+
+    poll_health.record_poll_result("default", true, Utc::now());
+    assert_eq!(probe(&base, "/readyz").await.0, StatusCode::OK);
+    poll_health.record_poll_result("default", false, Utc::now());
+    let (status, body) = probe(&base, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"status": "not_ready"}));
+
+    server.task.abort();
+}
+
+#[test]
+fn compose_healthcheck_uses_the_runtime_node_command() {
+    let compose: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../docker-compose.example.yml")).unwrap();
+    let command = compose["x-symphony-common"]["healthcheck"]["test"]
+        .as_sequence()
+        .unwrap();
+    assert_eq!(command[0].as_str(), Some("CMD-SHELL"));
+    let command = command[1].as_str().unwrap();
+    assert!(command.starts_with("node -e "));
+    assert!(command.contains("http://127.0.0.1:8080/healthz"));
+    assert!(include_str!("../Dockerfile").contains("FROM node:"));
+}
