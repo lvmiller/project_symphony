@@ -416,9 +416,19 @@ async fn state_refresh_uses_only_the_configured_project_status() {
         "projectItems".to_string(),
         json!({"nodes": [
             issue_project_item(
-                "ITEM_unrelated",
+                "ITEM_wrong_owner",
                 project("Organization", "other-org", 7),
                 vec![single_select("Status", "Done")],
+            ),
+            issue_project_item(
+                "ITEM_wrong_owner_type",
+                project("User", "octo-org", 7),
+                vec![single_select("Status", "In Progress")],
+            ),
+            issue_project_item(
+                "ITEM_wrong_number",
+                project("Organization", "octo-org", 8),
+                vec![single_select("Status", "Review")],
             ),
             issue_project_item(
                 "ITEM_configured",
@@ -475,7 +485,7 @@ async fn state_refresh_matches_user_owned_configured_project() {
 }
 
 #[tokio::test]
-async fn state_refresh_rejects_missing_configured_project_membership_or_status() {
+async fn state_refresh_treats_absence_from_configured_project_as_missing_state() {
     let mut not_a_member = issue_node("I_not_a_member", 57, &["Bug"]);
     not_a_member.as_object_mut().unwrap().insert(
         "projectItems".to_string(),
@@ -489,15 +499,17 @@ async fn state_refresh_rejects_missing_configured_project_membership_or_status()
         "data": {"nodes": [not_a_member]}
     }))]);
     let not_member_client = client(server.url(), vec!["Todo"], BTreeMap::new());
-    let err = not_member_client
+
+    let issues = not_member_client
         .fetch_issue_states_by_ids(&["I_not_a_member".to_string()])
         .await
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("issue is not a member of the configured GitHub project")
-    );
+        .unwrap();
 
+    assert!(issues.is_empty());
+}
+
+#[tokio::test]
+async fn state_refresh_rejects_configured_project_item_missing_status() {
     let mut no_status = issue_node("I_missing_status", 58, &["Bug"]);
     no_status.as_object_mut().unwrap().insert(
         "projectItems".to_string(),

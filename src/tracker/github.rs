@@ -463,11 +463,14 @@ impl GitHubTrackerClient {
             .map_err(|err| tracker_error("github_malformed", err.to_string()))
     }
 
-    async fn complete_issue_state_node(&self, issue: &mut Value) -> Result<()> {
+    async fn complete_issue_state_node(&self, issue: &mut Value) -> Result<bool> {
         self.append_issue_labels(issue).await?;
         self.append_issue_project_items(issue).await?;
-        self.retain_configured_project_items(issue)?;
-        self.append_issue_project_item_field_values(issue).await
+        if !self.retain_configured_project_items(issue)? {
+            return Ok(false);
+        }
+        self.append_issue_project_item_field_values(issue).await?;
+        Ok(true)
     }
 
     async fn append_issue_project_items(&self, issue: &mut Value) -> Result<()> {
@@ -530,7 +533,7 @@ impl GitHubTrackerClient {
         ))
     }
 
-    fn retain_configured_project_items(&self, issue: &mut Value) -> Result<()> {
+    fn retain_configured_project_items(&self, issue: &mut Value) -> Result<bool> {
         let project_items = issue
             .get_mut("projectItems")
             .and_then(|project_items| project_items.get_mut("nodes"))
@@ -542,14 +545,9 @@ impl GitHubTrackerClient {
                 configured_items.push(project_item);
             }
         }
-        if configured_items.is_empty() {
-            return Err(tracker_error(
-                "github_malformed",
-                "issue is not a member of the configured GitHub project",
-            ));
-        }
+        let is_member = !configured_items.is_empty();
         *project_items = configured_items;
-        Ok(())
+        Ok(is_member)
     }
 
     async fn append_issue_project_item_field_values(&self, issue: &mut Value) -> Result<()> {
@@ -652,7 +650,9 @@ impl TrackerClient for GitHubTrackerClient {
                 continue;
             }
             let mut node = node.clone();
-            self.complete_issue_state_node(&mut node).await?;
+            if !self.complete_issue_state_node(&mut node).await? {
+                continue;
+            }
             let issue_node: IssueNode = serde_json::from_value(node.clone())
                 .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
             let mut values = Vec::new();
