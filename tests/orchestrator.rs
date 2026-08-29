@@ -64,6 +64,7 @@ fn config(
         workspace: WorkspaceConfig {
             root: PathBuf::from("work"),
             cleanup: WorkspaceCleanupConfig::default(),
+            population: Default::default(),
         },
         hooks: HooksConfig::default(),
         agent: AgentConfig {

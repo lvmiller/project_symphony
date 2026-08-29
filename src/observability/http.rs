@@ -701,3 +701,152 @@ loadAll();
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::{SharedStatus, spawn_http_server};
+    use crate::domain::{CodexEvent, Issue, TokenTotals};
+    use crate::orchestrator::OrchestratorState;
+    use crate::time::now_utc;
+
+    fn issue(id: &str, identifier: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            identifier: identifier.to_string(),
+            title: "HTTP status test".to_string(),
+            description: None,
+            priority: None,
+            state: "In Progress".to_string(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_ephemeral_listener_serves_published_state() {
+        let shared_status = SharedStatus::new(&[]);
+        let mut state = OrchestratorState::default();
+        let running = issue("running-id", "RUN-1");
+        let retrying = issue("retry-id", "RETRY-1");
+        state.claim_running(running.clone(), None, now_utc());
+        state.apply_codex_event(CodexEvent {
+            issue_id: running.id.clone(),
+            event: "turn_started".to_string(),
+            timestamp: now_utc(),
+            session_id: Some("session-1".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            codex_app_server_pid: None,
+            message: Some("working".to_string()),
+            absolute_token_totals: Some(TokenTotals {
+                input_tokens: 12,
+                output_tokens: 8,
+                total_tokens: 20,
+            }),
+            rate_limits: Some(json!({"remaining": 42})),
+        });
+        state.schedule_retry_now(&retrying, 2, Some("transient failure".to_string()));
+        shared_status.publish(&state, &[]).await;
+
+        let (refresh_tx, _refresh_rx) = mpsc::unbounded_channel();
+        let server = spawn_http_server(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            shared_status,
+            refresh_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert!(server.local_addr.ip().is_loopback());
+        assert_ne!(server.local_addr.port(), 0);
+
+        let response = reqwest::get(format!("http://{}/api/v1/state", server.local_addr))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["generated_at"].is_string());
+        assert_eq!(body["counts"]["running"], 1);
+        assert_eq!(body["counts"]["retrying"], 1);
+        assert_eq!(body["running"][0]["issue_identifier"], "RUN-1");
+        assert_eq!(body["retrying"][0]["issue_identifier"], "RETRY-1");
+        assert_eq!(body["codex_totals"]["total_tokens"], 20);
+        assert_eq!(body["rate_limits"]["remaining"], 42);
+
+        server.task.abort();
+        let _ = server.task.await;
+    }
+
+    #[tokio::test]
+    async fn refresh_coalesces_and_api_errors_are_json() {
+        let shared_status = SharedStatus::new(&[]);
+        let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+        let server = spawn_http_server(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            shared_status,
+            refresh_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let endpoint = format!("http://{}", server.local_addr);
+
+        let first: serde_json::Value = client
+            .post(format!("{endpoint}/api/v1/refresh"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let second: serde_json::Value = client
+            .post(format!("{endpoint}/api/v1/refresh"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(first["queued"], true);
+        assert_eq!(first["coalesced"], false);
+        assert_eq!(second["coalesced"], true);
+        assert!(refresh_rx.try_recv().is_ok());
+        assert!(refresh_rx.try_recv().is_err());
+
+        let method_error = client
+            .post(format!("{endpoint}/api/v1/state"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            method_error.status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        );
+        let method_body: serde_json::Value = method_error.json().await.unwrap();
+        assert_eq!(method_body["error"]["code"], "method_not_allowed");
+
+        let unknown_error = client
+            .get(format!("{endpoint}/api/v1/not/a/route"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown_error.status(), reqwest::StatusCode::NOT_FOUND);
+        let unknown_body: serde_json::Value = unknown_error.json().await.unwrap();
+        assert_eq!(unknown_body["error"]["code"], "route_not_found");
+
+        server.task.abort();
+        let _ = server.task.await;
+    }
+}
