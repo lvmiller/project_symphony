@@ -292,13 +292,12 @@ pub async fn run_multi_source_service_until_shutdown(
     let mut workers = WorkerRegistry::default();
     let mut state = OrchestratorState::default();
     let initial_configs = reloaders.current_cloned();
-    let shared_status = SharedStatus::new(&initial_configs);
-    let poll_health = shared_status.poll_health_registry();
-    let mut tracker_runtimes = SourceTrackerRuntimes::default();
     let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel::<()>();
     let refresh_pending = Arc::new(AtomicBool::new(false));
     let (control_tx, mut control_rx) = mpsc::channel(32);
-    let http_server = if let Some(bind_addr) = server_bind {
+    let (shared_status, poll_health, http_server) = if let Some(bind_addr) = server_bind {
+        let shared_status = SharedStatus::new(&initial_configs);
+        let poll_health = shared_status.poll_health_registry();
         let server_config = server_config_for_http(&initial_configs);
         let server = spawn_http_server(
             bind_addr,
@@ -310,17 +309,20 @@ pub async fn run_multi_source_service_until_shutdown(
         )
         .await?;
         info!(bind_addr = %server.local_addr, "http_server_started");
-        Some(server)
+        (Some(shared_status), Some(poll_health), Some(server))
     } else {
-        None
+        (None, None, None)
     };
+    let mut tracker_runtimes = SourceTrackerRuntimes::default();
 
     for config in reloaders.current() {
         startup_terminal_cleanup(config).await;
     }
-    shared_status
-        .publish(&state, &reloaders.current_cloned())
-        .await;
+    if let Some(shared_status) = shared_status.as_ref() {
+        shared_status
+            .publish(&state, &reloaders.current_cloned())
+            .await;
+    }
     tokio::pin!(shutdown);
     let mut startup_retention_pending = true;
 
@@ -350,7 +352,9 @@ pub async fn run_multi_source_service_until_shutdown(
         }
         let configs = reloaders.current_cloned();
         let draining = state.draining;
-        poll_health.sync_configured_sources(&configs);
+        if let Some(poll_health) = &poll_health {
+            poll_health.sync_configured_sources(&configs);
+        }
         tracker_runtimes.synchronize(&configs);
         tick(
             &mut state,
@@ -376,9 +380,7 @@ pub async fn run_multi_source_service_until_shutdown(
             }
             startup_retention_pending = false;
         }
-        shared_status
-            .publish(&state, &reloaders.current_cloned())
-            .await;
+        publish_status(shared_status.as_ref(), &state, &configs).await;
 
         let poll_delay = Duration::from_millis(reloaders.poll_interval_ms());
         let retry_delay = next_retry_delay(&state);
@@ -395,17 +397,13 @@ pub async fn run_multi_source_service_until_shutdown(
                         &mut workers,
                         &reloaders.current_cloned(),
                     ).await;
-                    shared_status
-                        .publish(&state, &reloaders.current_cloned())
-                        .await;
+                    publish_status(shared_status.as_ref(), &state, &configs).await;
                 }
             }
             event = event_rx.recv() => {
                 if let Some(event) = event {
                     apply_worker_event(&mut state, &workers, event);
-                    shared_status
-                        .publish(&state, &reloaders.current_cloned())
-                        .await;
+                    publish_status(shared_status.as_ref(), &state, &configs).await;
                 }
             }
             outcome = outcome_rx.recv() => {
@@ -417,9 +415,7 @@ pub async fn run_multi_source_service_until_shutdown(
                         outcome,
                     )
                     .await;
-                    shared_status
-                        .publish(&state, &reloaders.current_cloned())
-                        .await;
+                    publish_status(shared_status.as_ref(), &state, &configs).await;
                 }
             }
             refresh = refresh_rx.recv() => {
@@ -434,14 +430,14 @@ pub async fn run_multi_source_service_until_shutdown(
     };
     state.draining = true;
     let shutdown_configs = reloaders.current_cloned();
-    shared_status.publish(&state, &shutdown_configs).await;
+    publish_status(shared_status.as_ref(), &state, &shutdown_configs).await;
     graceful_shutdown_workers(
         &mut state,
         &mut workers,
         &shutdown_configs,
         &mut event_rx,
         &mut outcome_rx,
-        &shared_status,
+        shared_status.as_ref(),
         Duration::from_millis(server_config_for_http(&shutdown_configs).drain_timeout_ms),
     )
     .await;
@@ -466,6 +462,18 @@ fn next_retry_delay(state: &OrchestratorState) -> Duration {
         .next_retry_due_at_ms()
         .map(|due_at_ms| Duration::from_millis(due_at_ms.saturating_sub(system_monotonic_ms())))
         .unwrap_or(Duration::from_secs(24 * 60 * 60))
+}
+
+async fn publish_status(
+    shared_status: Option<&SharedStatus>,
+    state: &OrchestratorState,
+    configs: &[EffectiveConfig],
+) -> bool {
+    let Some(shared_status) = shared_status else {
+        return false;
+    };
+    shared_status.publish(state, configs).await;
+    true
 }
 
 async fn startup_terminal_cleanup(config: &EffectiveConfig) {
@@ -578,7 +586,7 @@ async fn tick(
     tracker_runtimes: &mut SourceTrackerRuntimes,
     configs: Vec<EffectiveConfig>,
     channels: WorkerChannels,
-    poll_health: PollHealthRegistry,
+    poll_health: Option<PollHealthRegistry>,
     draining: bool,
 ) {
     let mut plans = Vec::with_capacity(configs.len());
@@ -588,7 +596,9 @@ async fn tick(
             Ok(tracker) => tracker,
             Err(error) => {
                 warn!(source_id = %config.source.id, error = %error, "tracker_create_failed");
-                poll_health.record_poll_result(&config.source.id, false, now_utc());
+                if let Some(poll_health) = &poll_health {
+                    poll_health.record_poll_result(&config.source.id, false, now_utc());
+                }
                 continue;
             }
         };
@@ -621,11 +631,13 @@ async fn tick(
                         .candidates
                         .as_ref()
                         .is_none_or(|candidates| candidates.is_ok());
-                poll_health.record_poll_result(
-                    &result.config.source.id,
-                    success,
-                    result.observed_at,
-                );
+                if let Some(poll_health) = &poll_health {
+                    poll_health.record_poll_result(
+                        &result.config.source.id,
+                        success,
+                        result.observed_at,
+                    );
+                }
                 results.insert(result.source_index, result);
             }
             Err(error) => warn!(error = %error, "source_poll_task_failed"),
@@ -1260,7 +1272,7 @@ async fn graceful_shutdown_workers(
     configs: &[EffectiveConfig],
     event_rx: &mut mpsc::UnboundedReceiver<WorkerEvent>,
     outcome_rx: &mut mpsc::UnboundedReceiver<WorkerResult>,
-    shared_status: &SharedStatus,
+    shared_status: Option<&SharedStatus>,
     timeout: Duration,
 ) {
     if workers.tasks.is_empty() {
@@ -1274,13 +1286,13 @@ async fn graceful_shutdown_workers(
             event = event_rx.recv() => {
                 if let Some(event) = event {
                     apply_worker_event(state, workers, event);
-                    shared_status.publish(state, configs).await;
+                    publish_status(shared_status, state, configs).await;
                 }
             }
             outcome = outcome_rx.recv() => {
                 if let Some(outcome) = outcome {
                     apply_worker_outcome(state, configs, workers, outcome).await;
-                    shared_status.publish(state, configs).await;
+                    publish_status(shared_status, state, configs).await;
                 }
             }
         }
@@ -1303,10 +1315,10 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{
-        ServiceControl, ServiceControlResult, SourceTrackerRuntimes, WorkerEvent, WorkerRegistry,
-        WorkerResult, abort_worker, apply_service_control, apply_worker_event,
+        ServiceControl, ServiceControlResult, SourceTrackerRuntimes, WorkerChannels, WorkerEvent,
+        WorkerRegistry, WorkerResult, abort_worker, apply_service_control, apply_worker_event,
         apply_worker_outcome, await_worker, graceful_shutdown_workers, next_retry_delay,
-        select_execution_target, shutdown_workers, worker_dispatch_permitted,
+        publish_status, select_execution_target, shutdown_workers, tick, worker_dispatch_permitted,
     };
     use crate::agent::runner::WorkerOutcome;
     use crate::config::{
@@ -1754,6 +1766,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_status_publisher_skips_tick_event_outcome_and_control() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = config(temporary.path());
+        let mut state = OrchestratorState::default();
+        let mut workers = WorkerRegistry::default();
+        let mut tracker_runtimes = SourceTrackerRuntimes::default();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (outcome_tx, _outcome_rx) = mpsc::unbounded_channel();
+
+        tick(
+            &mut state,
+            &mut workers,
+            &mut tracker_runtimes,
+            Vec::new(),
+            WorkerChannels {
+                event_tx,
+                outcome_tx,
+            },
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            !publish_status(None, &state, std::slice::from_ref(&config)).await,
+            "without a listener, ticking must not materialize a status document"
+        );
+
+        let issue = issue("disabled-status");
+        state.claim_running(issue.clone(), None, now_utc());
+        workers.insert(
+            issue.id.clone(),
+            1,
+            ExecutionTarget::Local,
+            tokio::spawn(async {}),
+        );
+        apply_worker_event(
+            &mut state,
+            &workers,
+            WorkerEvent {
+                issue_key: issue.id.clone(),
+                generation: 1,
+                event: event(&issue.id),
+            },
+        );
+        assert!(
+            !publish_status(None, &state, std::slice::from_ref(&config)).await,
+            "worker events must not materialize a status document without a listener"
+        );
+
+        let (response, receiver) = oneshot::channel();
+        apply_service_control(
+            ServiceControl::Drain { response },
+            &mut state,
+            &mut workers,
+            std::slice::from_ref(&config),
+        )
+        .await;
+        assert_eq!(
+            receiver.await.unwrap(),
+            ServiceControlResult::Applied { draining: true }
+        );
+        assert!(
+            !publish_status(None, &state, std::slice::from_ref(&config)).await,
+            "controls must not materialize a status document without a listener"
+        );
+
+        apply_worker_outcome(
+            &mut state,
+            std::slice::from_ref(&config),
+            &mut workers,
+            WorkerResult {
+                issue_key: issue.id.clone(),
+                generation: 1,
+                outcome: WorkerOutcome {
+                    issue_id: issue.id.clone(),
+                    reason: WorkerExitReason::Normal,
+                    terminal_state: None,
+                },
+            },
+        )
+        .await;
+        assert!(state.retry_attempts.contains_key(&issue.id));
+        assert!(
+            !publish_status(None, &state, std::slice::from_ref(&config)).await,
+            "worker outcomes must not materialize a status document without a listener"
+        );
+    }
+
+    #[tokio::test]
     async fn graceful_shutdown_drains_normal_completion_before_timeout() {
         let temporary = tempfile::tempdir().unwrap();
         let config = config(temporary.path());
@@ -1786,7 +1887,7 @@ mod tests {
             std::slice::from_ref(&config),
             &mut event_rx,
             &mut outcome_rx,
-            &shared_status,
+            Some(&shared_status),
             Duration::from_secs(1),
         )
         .await;
@@ -1818,7 +1919,7 @@ mod tests {
             std::slice::from_ref(&config),
             &mut event_rx,
             &mut outcome_rx,
-            &shared_status,
+            Some(&shared_status),
             Duration::from_millis(1),
         )
         .await;

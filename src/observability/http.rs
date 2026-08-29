@@ -1174,7 +1174,7 @@ mod tests {
         let (control_tx, _control_rx) = mpsc::channel(1);
         let server = spawn_http_server(
             SocketAddr::from(([127, 0, 0, 1], 0)),
-            shared_status,
+            shared_status.clone(),
             refresh_tx,
             Arc::new(AtomicBool::new(false)),
             control_tx,
@@ -1197,6 +1197,45 @@ mod tests {
         assert_eq!(body["retrying"][0]["issue_identifier"], "RETRY-1");
         assert_eq!(body["codex_totals"]["total_tokens"], 20);
         assert_eq!(body["rate_limits"]["remaining"], 42);
+
+        state.apply_codex_event(CodexEvent {
+            issue_id: running.id.clone(),
+            event: "turn_completed".to_string(),
+            timestamp: now_utc(),
+            session_id: Some("session-1".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            codex_app_server_pid: None,
+            message: Some("finished".to_string()),
+            absolute_token_totals: Some(TokenTotals {
+                input_tokens: 15,
+                output_tokens: 10,
+                total_tokens: 25,
+            }),
+            rate_limits: Some(json!({"remaining": 41})),
+        });
+        shared_status.publish(&state, &[]).await;
+
+        let updated_state: serde_json::Value =
+            reqwest::get(format!("http://{}/api/v1/state", server.local_addr))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(updated_state["codex_totals"]["total_tokens"], 25);
+        assert_eq!(updated_state["rate_limits"]["remaining"], 41);
+
+        let detail: serde_json::Value =
+            reqwest::get(format!("http://{}/api/v1/RUN-1", server.local_addr))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(detail["status"], "running");
+        assert_eq!(detail["recent_events"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["recent_events"][1]["message"], "finished");
 
         server.task.abort();
         let _ = server.task.await;
