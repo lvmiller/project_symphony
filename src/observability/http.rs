@@ -3,11 +3,12 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,7 +19,9 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::config::{EffectiveConfig, GithubProjectOwnerType, GithubRepositoryConfig};
+use crate::config::{
+    EffectiveConfig, GithubProjectOwnerType, GithubRepositoryConfig, ServerConfig,
+};
 use crate::domain::{RecentEvent, RetrySnapshot, RunningSnapshot, RuntimeSnapshot, TokenTotals};
 use crate::error::{Result, SymphonyError};
 use crate::orchestrator::OrchestratorState;
@@ -130,6 +133,9 @@ struct AppState {
     shared_status: SharedStatus,
     refresh_tx: mpsc::UnboundedSender<()>,
     refresh_pending: Arc<AtomicBool>,
+    auth_token: Option<Arc<str>>,
+    refresh_cooldown_ms: u64,
+    refresh_last_accepted_ms: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -207,6 +213,8 @@ struct SourceQuery {
 #[derive(Clone, Debug, Serialize)]
 struct ErrorEnvelope {
     error: ErrorBody,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -215,11 +223,11 @@ struct ErrorBody {
     message: String,
 }
 
-#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    retry_after_ms: Option<u64>,
 }
 
 impl SharedStatus {
@@ -259,7 +267,20 @@ pub async fn spawn_http_server(
     shared_status: SharedStatus,
     refresh_tx: mpsc::UnboundedSender<()>,
     refresh_pending: Arc<AtomicBool>,
+    server_config: &ServerConfig,
 ) -> Result<HttpServerHandle> {
+    let auth_token = server_config
+        .auth_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .map(Arc::<str>::from);
+    if !bind_addr.ip().is_loopback() && auth_token.is_none() {
+        return Err(SymphonyError::config(
+            "http_auth_required",
+            "server.auth_token is required when the HTTP server binds to a non-loopback address",
+        ));
+    }
+
     let listener = TcpListener::bind(bind_addr).await.map_err(|err| {
         SymphonyError::config(
             "http_bind_failed",
@@ -269,7 +290,13 @@ pub async fn spawn_http_server(
     let local_addr = listener
         .local_addr()
         .map_err(|err| SymphonyError::config("http_bind_failed", err.to_string()))?;
-    let app = router(shared_status, refresh_tx, refresh_pending);
+    let app = router(
+        shared_status,
+        refresh_tx,
+        refresh_pending,
+        auth_token,
+        server_config.refresh_cooldown_ms.max(1),
+    );
     let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             warn!(error = %error, "http_server_failed");
@@ -278,15 +305,20 @@ pub async fn spawn_http_server(
     Ok(HttpServerHandle { local_addr, task })
 }
 
-pub fn router(
+fn router(
     shared_status: SharedStatus,
     refresh_tx: mpsc::UnboundedSender<()>,
     refresh_pending: Arc<AtomicBool>,
+    auth_token: Option<Arc<str>>,
+    refresh_cooldown_ms: u64,
 ) -> Router {
     let state = AppState {
         shared_status,
         refresh_tx,
         refresh_pending,
+        auth_token,
+        refresh_cooldown_ms,
+        refresh_last_accepted_ms: Arc::new(AtomicU64::new(0)),
     };
     let api = Router::new()
         .route("/state", get(state_api).fallback(api_method_not_allowed))
@@ -306,11 +338,24 @@ pub fn router(
             "/{issue_identifier}",
             get(issue_detail_api).fallback(api_method_not_allowed),
         )
-        .fallback(api_not_found);
+        .fallback(api_not_found)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_api,
+        ));
     Router::new()
         .route("/", get(dashboard))
         .nest("/api/v1", api)
         .with_state(state)
+}
+
+async fn authenticate_api(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if let Some(token) = state.auth_token.as_deref()
+        && !bearer_token_matches(request.headers(), token)
+    {
+        return ApiError::unauthorized().into_response();
+    }
+    next.run(request).await
 }
 
 async fn dashboard() -> Html<&'static str> {
@@ -386,11 +431,25 @@ async fn repositories_api(
         .map(Json)
 }
 
-async fn refresh_api(State(state): State<AppState>) -> (StatusCode, Json<RefreshResponse>) {
+async fn refresh_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> std::result::Result<(StatusCode, Json<RefreshResponse>), ApiError> {
+    validate_refresh_request(&headers)?;
+
+    if state.refresh_pending.load(Ordering::Acquire) {
+        return Ok(refresh_response(true));
+    }
+
+    claim_refresh_cooldown(&state)?;
     let coalesced = state.refresh_pending.swap(true, Ordering::AcqRel);
     if !coalesced {
         let _ = state.refresh_tx.send(());
     }
+    Ok(refresh_response(coalesced))
+}
+
+fn refresh_response(coalesced: bool) -> (StatusCode, Json<RefreshResponse>) {
     (
         StatusCode::ACCEPTED,
         Json(RefreshResponse {
@@ -400,6 +459,90 @@ async fn refresh_api(State(state): State<AppState>) -> (StatusCode, Json<Refresh
             operations: ["poll", "reconcile"],
         }),
     )
+}
+
+fn validate_refresh_request(headers: &HeaderMap) -> std::result::Result<(), ApiError> {
+    let content_type = single_header_value(headers, "content-type");
+    let is_json = content_type.is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    });
+    if !is_json {
+        return Err(ApiError::invalid_refresh_request());
+    }
+
+    let Some(host) = single_header_value(headers, "host") else {
+        return Err(ApiError::invalid_refresh_request());
+    };
+    let Some(origin) = single_header_value(headers, "origin") else {
+        return Err(ApiError::invalid_refresh_request());
+    };
+    let Some(origin_host) = origin.strip_prefix("http://") else {
+        return Err(ApiError::invalid_refresh_request());
+    };
+    if host.is_empty()
+        || host.contains(['/', '?', '#', '@'])
+        || origin_host != host
+        || origin_host.contains(['/', '?', '#', '@'])
+    {
+        return Err(ApiError::invalid_refresh_request());
+    }
+    Ok(())
+}
+
+fn single_header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+fn claim_refresh_cooldown(state: &AppState) -> std::result::Result<(), ApiError> {
+    let now = system_monotonic_ms();
+    let now_encoded = now.saturating_add(1);
+    loop {
+        let last_encoded = state.refresh_last_accepted_ms.load(Ordering::Acquire);
+        if last_encoded != 0 {
+            let elapsed = now.saturating_sub(last_encoded - 1);
+            if elapsed < state.refresh_cooldown_ms {
+                return Err(ApiError::refresh_rate_limited(
+                    state.refresh_cooldown_ms - elapsed,
+                ));
+            }
+        }
+        if state
+            .refresh_last_accepted_ms
+            .compare_exchange(
+                last_encoded,
+                now_encoded,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn bearer_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(value) = single_header_value(headers, "authorization") else {
+        return false;
+    };
+    let Some(actual) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    !actual.is_empty() && constant_time_eq(expected.as_bytes(), actual.as_bytes())
+}
+
+fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
+    let mut difference = expected.len() ^ actual.len();
+    for index in 0..expected.len().max(actual.len()) {
+        difference |= usize::from(expected.get(index).copied().unwrap_or_default())
+            ^ usize::from(actual.get(index).copied().unwrap_or_default());
+    }
+    difference == 0
 }
 
 async fn issue_detail_api(
@@ -604,6 +747,32 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            retry_after_ms: None,
+        }
+    }
+
+    fn unauthorized() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "authentication_required",
+            "HTTP authentication is required",
+        )
+    }
+
+    fn invalid_refresh_request() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "invalid_refresh_request",
+            "refresh requests must use same-origin JSON",
+        )
+    }
+
+    fn refresh_rate_limited(retry_after_ms: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "refresh_rate_limited",
+            message: "refresh is temporarily rate limited".to_string(),
+            retry_after_ms: Some(retry_after_ms),
         }
     }
 
@@ -626,16 +795,27 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry_after_ms = self.retry_after_ms;
+        let mut response = (
             self.status,
             Json(ErrorEnvelope {
                 error: ErrorBody {
                     code: self.code,
                     message: self.message,
                 },
+                retry_after_ms,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(retry_after_ms) = retry_after_ms {
+            let retry_after_seconds = retry_after_ms.div_ceil(1_000);
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&retry_after_seconds.to_string())
+                    .expect("a numeric Retry-After value is a valid HTTP header"),
+            );
+        }
+        response
     }
 }
 
@@ -673,7 +853,7 @@ function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function renderSources(sources){$('sources-body').innerHTML=sources.map(s=>`<tr><td>${esc(s.source_id)}</td><td>${esc(s.repositories.map(r=>r.owner+'/'+r.name).join(', '))}</td><td>${esc(s.workflow_path)}</td><td>${esc(s.project_owner_login)} #${esc(s.project_number)}</td><td>Active: ${esc(s.active_states.join(', '))}<br>Terminal: ${esc(s.terminal_states.join(', '))}</td><td>${esc(s.workspace_root)}</td></tr>`).join('');}
 function renderIssues(state){const running=state.running.map(i=>({source_id:i.source_id,identifier:i.issue_identifier,status:i.state,session:i.session_id||'',error:''}));const retrying=state.retrying.map(i=>({source_id:i.source_id,identifier:i.issue_identifier,status:'retrying',session:'',error:i.error||''}));$('issues-body').innerHTML=running.concat(retrying).map(i=>`<tr><td>${esc(i.source_id)}</td><td><a href="/api/v1/${encodeURIComponent(i.identifier)}">${esc(i.identifier)}</a></td><td>${esc(i.status)}</td><td>${esc(i.session)}</td><td>${esc(i.error)}</td></tr>`).join('');}
 async function loadAll(){try{const [state,sourceDoc]=await Promise.all([api('/api/v1/state'),api('/api/v1/sources')]);$('generated').textContent='Generated '+state.generated_at;$('sources-count').textContent=state.counts.sources;$('running-count').textContent=state.counts.running;$('retrying-count').textContent=state.counts.retrying;$('tokens-count').textContent=state.codex_totals.total_tokens;$('seconds-running').textContent=Math.round(state.codex_totals.seconds_running);renderSources(sourceDoc.sources);renderIssues(state);banner('Loaded','ok');}catch(err){banner(err.message,'error');}}
-$('refresh').onclick=async()=>{try{const res=await api('/api/v1/refresh',{method:'POST'});banner('Refresh queued; coalesced='+res.coalesced,'ok');}catch(err){banner(err.message,'error');}};
+$('refresh').onclick=async()=>{try{const res=await api('/api/v1/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});banner('Refresh queued; coalesced='+res.coalesced,'ok');}catch(err){banner(err.message,'error');}};
 loadAll();
 </script>
 </body>
@@ -690,6 +870,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{SharedStatus, spawn_http_server};
+    use crate::config::ServerConfig;
     use crate::domain::{CodexEvent, Issue, TokenTotals};
     use crate::orchestrator::OrchestratorState;
     use crate::time::now_utc;
@@ -743,6 +924,7 @@ mod tests {
             shared_status,
             refresh_tx,
             Arc::new(AtomicBool::new(false)),
+            &ServerConfig::default(),
         )
         .await
         .unwrap();
@@ -775,6 +957,7 @@ mod tests {
             shared_status,
             refresh_tx,
             Arc::new(AtomicBool::new(false)),
+            &ServerConfig::default(),
         )
         .await
         .unwrap();
@@ -783,6 +966,9 @@ mod tests {
 
         let first: serde_json::Value = client
             .post(format!("{endpoint}/api/v1/refresh"))
+            .header("content-type", "application/json")
+            .header("origin", &endpoint)
+            .body("{}")
             .send()
             .await
             .unwrap()
@@ -791,6 +977,9 @@ mod tests {
             .unwrap();
         let second: serde_json::Value = client
             .post(format!("{endpoint}/api/v1/refresh"))
+            .header("content-type", "application/json")
+            .header("origin", &endpoint)
+            .body("{}")
             .send()
             .await
             .unwrap()

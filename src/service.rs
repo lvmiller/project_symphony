@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use crate::agent::codex::CodexAppServerClient;
 use crate::agent::runner::{AgentRunner, SymphonyAgentRunner, WorkerOutcome};
 use crate::config::{
-    ConfigReloader, ConfigSetReloader, EffectiveConfig, config_reload_error_class,
+    ConfigReloader, ConfigSetReloader, EffectiveConfig, ServerConfig, config_reload_error_class,
 };
 use crate::domain::{CodexEvent, ExecutionTarget, Issue, WorkerExitReason};
 use crate::error::Result;
@@ -170,11 +170,13 @@ pub async fn run_multi_source_service_until_shutdown(
     let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel::<()>();
     let refresh_pending = Arc::new(AtomicBool::new(false));
     let http_server = if let Some(bind_addr) = server_bind {
+        let server_config = server_config_for_http(&initial_configs);
         let server = spawn_http_server(
             bind_addr,
             shared_status.clone(),
             refresh_tx.clone(),
             refresh_pending.clone(),
+            &server_config,
         )
         .await?;
         info!(bind_addr = %server.local_addr, "http_server_started");
@@ -281,6 +283,15 @@ pub async fn run_multi_source_service_until_shutdown(
         let _ = server.task.await;
     }
     result
+}
+
+fn server_config_for_http(configs: &[EffectiveConfig]) -> ServerConfig {
+    configs
+        .iter()
+        .find(|config| config.server.port.is_some())
+        .or_else(|| configs.first())
+        .map(|config| config.server.clone())
+        .unwrap_or_default()
 }
 
 fn next_retry_delay(state: &OrchestratorState) -> Duration {

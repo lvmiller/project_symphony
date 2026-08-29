@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use chrono::{TimeZone, Utc};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
-use symphony::config::EffectiveConfig;
+use symphony::config::{EffectiveConfig, ServerConfig};
 use symphony::domain::{CodexEvent, ExecutionTarget, Issue, RetryEntry, TokenTotals};
 use symphony::observability::http::{SharedStatus, spawn_http_server};
 use symphony::orchestrator::state::{OrchestratorState, RECENT_EVENT_MESSAGE_LIMIT_BYTES};
@@ -97,6 +97,21 @@ async fn start_server(
     symphony::observability::http::HttpServerHandle,
     mpsc::UnboundedReceiver<()>,
 ) {
+    let server_config = EffectiveConfig::load(Some(path.to_path_buf()))
+        .unwrap()
+        .server;
+    start_server_with_config(path, state, server_config).await
+}
+
+async fn start_server_with_config(
+    path: &Path,
+    state: OrchestratorState,
+    server_config: symphony::config::ServerConfig,
+) -> (
+    String,
+    symphony::observability::http::HttpServerHandle,
+    mpsc::UnboundedReceiver<()>,
+) {
     let config = EffectiveConfig::load(Some(path.to_path_buf())).unwrap();
     let shared_status = SharedStatus::new(std::slice::from_ref(&config));
     shared_status.publish(&state, &[config]).await;
@@ -106,6 +121,7 @@ async fn start_server(
         shared_status,
         refresh_tx,
         Arc::new(AtomicBool::new(false)),
+        &server_config,
     )
     .await
     .unwrap();
@@ -408,6 +424,9 @@ async fn refresh_route_returns_documented_payload_and_coalesces() {
 
     let first = client
         .post(format!("{base}/api/v1/refresh"))
+        .header("content-type", "application/json")
+        .header("origin", &base)
+        .body("{}")
         .send()
         .await
         .unwrap();
@@ -428,6 +447,9 @@ async fn refresh_route_returns_documented_payload_and_coalesces() {
 
     let second = client
         .post(format!("{base}/api/v1/refresh"))
+        .header("content-type", "application/json")
+        .header("origin", &base)
+        .body("{}")
         .send()
         .await
         .unwrap();
@@ -439,6 +461,148 @@ async fn refresh_route_returns_documented_payload_and_coalesces() {
     assert_eq!(second["operations"], json!(["poll", "reconcile"]));
     assert!(refresh_rx.try_recv().is_err());
     server.task.abort();
+}
+
+#[tokio::test]
+async fn authenticated_refresh_rejects_csrf_and_enforces_cooldown_without_leaking_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_workflow(temp.path());
+    let config = EffectiveConfig::load(Some(path)).unwrap();
+    let shared_status = SharedStatus::new(std::slice::from_ref(&config));
+    shared_status.publish(&populated_state(), &[config]).await;
+    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+    let refresh_pending = Arc::new(AtomicBool::new(false));
+    let server_config = ServerConfig {
+        auth_token: Some("operator-secret".to_string()),
+        refresh_cooldown_ms: 60_000,
+        ..ServerConfig::default()
+    };
+    let server = spawn_http_server(
+        "127.0.0.1:0".parse().unwrap(),
+        shared_status,
+        refresh_tx,
+        refresh_pending.clone(),
+        &server_config,
+    )
+    .await
+    .unwrap();
+    let base = format!("http://{}", server.local_addr);
+    let client = reqwest::Client::new();
+
+    for request in [
+        client.get(format!("{base}/api/v1/state")),
+        client
+            .get(format!("{base}/api/v1/state"))
+            .header("authorization", "Basic malformed"),
+    ] {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "authentication_required");
+        assert!(body.get("counts").is_none());
+        assert!(!body.to_string().contains("operator-secret"));
+    }
+
+    let simple_form = client
+        .post(format!("{base}/api/v1/refresh"))
+        .header("authorization", "Bearer operator-secret")
+        .header("origin", &base)
+        .form(&[("refresh", "now")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(simple_form.status(), StatusCode::FORBIDDEN);
+    let simple_body = simple_form.json::<Value>().await.unwrap();
+    assert_eq!(simple_body["error"]["code"], "invalid_refresh_request");
+    assert!(simple_body.get("counts").is_none());
+    assert!(!simple_body.to_string().contains("operator-secret"));
+    assert!(refresh_rx.try_recv().is_err());
+    let missing_origin = client
+        .post(format!("{base}/api/v1/refresh"))
+        .header("authorization", "Bearer operator-secret")
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        missing_origin.json::<Value>().await.unwrap()["error"]["code"],
+        "invalid_refresh_request"
+    );
+    assert!(refresh_rx.try_recv().is_err());
+
+    let cross_origin = client
+        .post(format!("{base}/api/v1/refresh"))
+        .header("authorization", "Bearer operator-secret")
+        .header("content-type", "application/json")
+        .header("origin", "http://attacker.invalid")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        cross_origin.json::<Value>().await.unwrap()["error"]["code"],
+        "invalid_refresh_request"
+    );
+    assert!(refresh_rx.try_recv().is_err());
+
+    let accepted = client
+        .post(format!("{base}/api/v1/refresh"))
+        .header("authorization", "Bearer operator-secret")
+        .header("content-type", "application/json")
+        .header("origin", &base)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    assert_eq!(refresh_rx.recv().await, Some(()));
+    assert!(refresh_rx.try_recv().is_err());
+
+    refresh_pending.store(false, std::sync::atomic::Ordering::Release);
+    let rate_limited = client
+        .post(format!("{base}/api/v1/refresh"))
+        .header("authorization", "Bearer operator-secret")
+        .header("content-type", "application/json")
+        .header("origin", &base)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rate_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let rate_limited: Value = rate_limited.json().await.unwrap();
+    assert_eq!(rate_limited["error"]["code"], "refresh_rate_limited");
+    assert!(
+        rate_limited["retry_after_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms > 0)
+    );
+    assert!(refresh_rx.try_recv().is_err());
+
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn non_loopback_server_startup_requires_authentication() {
+    let (refresh_tx, _refresh_rx) = mpsc::unbounded_channel();
+    let result = spawn_http_server(
+        "0.0.0.0:0".parse().unwrap(),
+        SharedStatus::new(&[]),
+        refresh_tx,
+        Arc::new(AtomicBool::new(false)),
+        &ServerConfig::default(),
+    )
+    .await;
+    let error = match result {
+        Ok(server) => {
+            server.task.abort();
+            panic!("non-loopback server started without authentication");
+        }
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("http_auth_required"));
 }
 
 #[tokio::test]
