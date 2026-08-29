@@ -84,6 +84,160 @@ pub struct DirectCommitCompletion {
     direct_commit: DirectCommitCompletionConfig,
     token: String,
     writer: Arc<dyn TrackerWriter>,
+    test_authenticated_remote_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedGithubRepository {
+    owner: String,
+    name: String,
+    issue_id: Option<String>,
+    issue_identifier: Option<String>,
+    issue_url: Option<String>,
+}
+
+impl ExpectedGithubRepository {
+    pub fn from_configured_issue(config: &EffectiveConfig, issue: &Issue) -> Result<Self> {
+        let github = config.tracker.github.as_ref().ok_or_else(|| {
+            completion_error(
+                "completion_repository_unavailable",
+                "direct-commit completion requires GitHub repository configuration",
+            )
+        })?;
+        let mut repository = Self::from_issue_identifier(&issue.identifier)?;
+        if !github.issue_matches_configured_repository(&repository.owner, &repository.name) {
+            return Err(completion_error(
+                "completion_repository_untrusted",
+                format!(
+                    "issue repository {}/{} is not configured for this source",
+                    repository.owner, repository.name
+                ),
+            ));
+        }
+        if let Some(url) = issue.url.as_deref() {
+            let url_repository = Self::from_issue_url(url)?;
+            if !repository.same_identity(&url_repository) {
+                return Err(completion_error(
+                    "completion_repository_mismatch",
+                    "issue URL and identifier refer to different repositories",
+                ));
+            }
+        }
+        repository.issue_id = Some(issue.id.clone());
+        repository.issue_identifier = Some(issue.identifier.clone());
+        repository.issue_url = issue.url.clone();
+        Ok(repository)
+    }
+
+    fn from_issue_identifier(identifier: &str) -> Result<Self> {
+        let Some((repository, number)) = identifier.rsplit_once('#') else {
+            return Err(completion_error(
+                "completion_repository_invalid_issue",
+                "issue identifier must include an owner/repository prefix",
+            ));
+        };
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(completion_error(
+                "completion_repository_invalid_issue",
+                "issue identifier must end with a numeric issue number",
+            ));
+        }
+        Self::from_owner_name(repository)
+    }
+
+    fn from_issue_url(url: &str) -> Result<Self> {
+        let Some(rest) = url.strip_prefix("https://") else {
+            return Err(completion_error(
+                "completion_repository_invalid_issue_url",
+                "issue URL must be an HTTPS GitHub URL",
+            ));
+        };
+        let Some((host, path)) = rest.split_once('/') else {
+            return Err(completion_error(
+                "completion_repository_invalid_issue_url",
+                "issue URL must include a GitHub repository path",
+            ));
+        };
+        if !host.eq_ignore_ascii_case("github.com") || host.contains('@') {
+            return Err(completion_error(
+                "completion_repository_invalid_issue_url",
+                "issue URL must use github.com without userinfo",
+            ));
+        }
+        let mut segments = path.split('/');
+        let (Some(owner), Some(name), Some(issues), Some(number)) = (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) else {
+            return Err(completion_error(
+                "completion_repository_invalid_issue_url",
+                "issue URL must include owner, repository, and issue number",
+            ));
+        };
+        if issues != "issues"
+            || number.is_empty()
+            || !number.bytes().all(|byte| byte.is_ascii_digit())
+            || segments.next().is_some()
+        {
+            return Err(completion_error(
+                "completion_repository_invalid_issue_url",
+                "issue URL is not a canonical GitHub issue URL",
+            ));
+        }
+        Self::from_owner_name(&format!("{owner}/{name}"))
+    }
+
+    fn from_owner_name(repository: &str) -> Result<Self> {
+        let Some((owner, name)) = repository.split_once('/') else {
+            return Err(completion_error(
+                "completion_repository_invalid_issue",
+                "issue repository must be owner/name",
+            ));
+        };
+        if repository.matches('/').count() != 1
+            || !is_github_repository_component(owner)
+            || !is_github_repository_component(name)
+        {
+            return Err(completion_error(
+                "completion_repository_invalid_issue",
+                "issue repository contains an invalid owner or name",
+            ));
+        }
+        Ok(Self {
+            owner: owner.to_ascii_lowercase(),
+            name: name.to_ascii_lowercase(),
+            issue_id: None,
+            issue_identifier: None,
+            issue_url: None,
+        })
+    }
+
+    fn pinned_https_url(&self) -> String {
+        format!("https://github.com/{}/{}.git", self.owner, self.name)
+    }
+
+    pub fn matches_remote_url(&self, remote: &str) -> bool {
+        normalize_github_remote(remote).is_some_and(|repository| self.same_identity(&repository))
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.name == other.name
+    }
+
+    fn ensure_for_issue(&self, issue: &Issue) -> Result<()> {
+        if self.issue_id.as_deref() == Some(issue.id.as_str())
+            && self.issue_identifier.as_deref() == Some(issue.identifier.as_str())
+            && self.issue_url.as_deref() == issue.url.as_deref()
+        {
+            return Ok(());
+        }
+        Err(completion_error(
+            "completion_repository_mismatch",
+            "expected repository is not bound to the current issue",
+        ))
+    }
 }
 
 impl DirectCommitCompletion {
@@ -110,14 +264,30 @@ impl DirectCommitCompletion {
             direct_commit: config.completion.direct_commit.clone(),
             token,
             writer,
+            test_authenticated_remote_url: None,
         }))
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_test_authenticated_remote_url(
+        config: &EffectiveConfig,
+        writer: Option<Arc<dyn TrackerWriter>>,
+        remote_url: String,
+    ) -> Result<Option<Self>> {
+        let Some(mut completion) = Self::new(config, writer)? else {
+            return Ok(None);
+        };
+        completion.test_authenticated_remote_url = Some(remote_url);
+        Ok(Some(completion))
     }
 
     pub async fn complete_issue(
         &self,
         issue: &Issue,
         workspace: &Path,
+        expected_repository: &ExpectedGithubRepository,
     ) -> Result<CompletionResult> {
+        expected_repository.ensure_for_issue(issue)?;
         let severity = Severity::from_issue(issue)?;
         let detected_changes = git_worktree_changes(workspace).await?;
         let has_workspace_changes = !detected_changes.is_empty();
@@ -149,10 +319,19 @@ impl DirectCommitCompletion {
             return Ok(CompletionResult::skipped("no workspace changes"));
         }
         ensure_on_base_branch(workspace, &self.direct_commit.base_branch).await?;
+        ensure_workspace_matches_expected_repository(workspace, expected_repository).await?;
+        ensure_no_local_url_rewrite(workspace, &expected_repository.pinned_https_url()).await?;
         if has_workspace_changes {
             git_commit_all(workspace, issue, &self.direct_commit).await?;
         }
-        git_fetch_base_branch(workspace, &self.direct_commit.base_branch, &self.token).await?;
+        let authenticated_remote_url = self.authenticated_remote_url(expected_repository);
+        git_fetch_base_branch(
+            workspace,
+            &self.direct_commit.base_branch,
+            &self.token,
+            authenticated_remote_url.as_str(),
+        )
+        .await?;
         let has_unpushed_commits =
             git_has_unpushed_commits(workspace, &self.direct_commit.base_branch).await?;
         if !has_unpushed_commits {
@@ -168,7 +347,13 @@ impl DirectCommitCompletion {
         .await?;
 
         let commit_sha = git_commit_sha(workspace).await?;
-        git_push_base_branch(workspace, &self.direct_commit.base_branch, &self.token).await?;
+        git_push_base_branch(
+            workspace,
+            &self.direct_commit.base_branch,
+            &self.token,
+            authenticated_remote_url.as_str(),
+        )
+        .await?;
         if let Err(error) = self.writer.move_issue_to_state(issue, &target_state).await {
             let message = error.to_string();
             warn!(
@@ -209,6 +394,12 @@ impl DirectCommitCompletion {
             plan: None,
             partial_failure: None,
         })
+    }
+
+    fn authenticated_remote_url(&self, repository: &ExpectedGithubRepository) -> String {
+        self.test_authenticated_remote_url
+            .clone()
+            .unwrap_or_else(|| repository.pinned_https_url())
     }
 
     async fn dry_run_plan(
@@ -354,13 +545,17 @@ async fn git_status_has_unpushed_commits(workspace: &Path) -> Result<bool> {
         .is_some_and(|line| line.contains("[ahead ")))
 }
 
-async fn git_fetch_base_branch(workspace: &Path, base_branch: &str, token: &str) -> Result<()> {
-    let remote_url = git_remote_url(workspace).await?;
+async fn git_fetch_base_branch(
+    workspace: &Path,
+    base_branch: &str,
+    token: &str,
+    remote_url: &str,
+) -> Result<()> {
     let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
     let authorization = GitAuthorization::new(token);
     git_output(
         workspace,
-        &["fetch", remote_url.as_str(), refspec.as_str()],
+        &["fetch", remote_url, refspec.as_str()],
         Some(&authorization),
     )
     .await
@@ -377,10 +572,58 @@ async fn git_has_unpushed_commits(workspace: &Path, base_branch: &str) -> Result
     Ok(count > 0)
 }
 
+async fn ensure_workspace_matches_expected_repository(
+    workspace: &Path,
+    expected_repository: &ExpectedGithubRepository,
+) -> Result<()> {
+    let remote_url = git_remote_url(workspace).await?;
+    if expected_repository.matches_remote_url(&remote_url) {
+        return Ok(());
+    }
+    Err(completion_error(
+        "completion_repository_mismatch",
+        format!(
+            "workspace origin does not match expected GitHub repository {}/{}",
+            expected_repository.owner, expected_repository.name
+        ),
+    ))
+}
+
 async fn git_remote_url(workspace: &Path) -> Result<String> {
-    git_output(workspace, &["remote", "get-url", "origin"], None)
+    git_output(workspace, &["config", "--get", "remote.origin.url"], None)
         .await
         .map(|url| url.trim().to_string())
+}
+
+async fn ensure_no_local_url_rewrite(workspace: &Path, pinned_url: &str) -> Result<()> {
+    let config = git_output(
+        workspace,
+        &["config", "--includes", "--show-scope", "--list"],
+        None,
+    )
+    .await?;
+    for line in config.lines() {
+        let Some((scope, entry)) = line.split_once('\t') else {
+            continue;
+        };
+        if !matches!(scope, "local" | "worktree") {
+            continue;
+        }
+        let Some((key, replacement)) = entry.split_once('=') else {
+            continue;
+        };
+        if key.starts_with("url.")
+            && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"))
+            && !replacement.is_empty()
+            && pinned_url.starts_with(replacement)
+        {
+            return Err(completion_error(
+                "completion_repository_rewrite",
+                "workspace URL rewrite could redirect the pinned GitHub repository",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn git_rebase_required(workspace: &Path, base_branch: &str) -> Result<bool> {
@@ -536,19 +779,65 @@ async fn git_commit_sha(workspace: &Path) -> Result<String> {
         .map(|sha| sha.trim().to_string())
 }
 
-async fn git_push_base_branch(workspace: &Path, base_branch: &str, token: &str) -> Result<()> {
-    let remote_url = git_remote_url(workspace).await?;
+async fn git_push_base_branch(
+    workspace: &Path,
+    base_branch: &str,
+    token: &str,
+    remote_url: &str,
+) -> Result<()> {
     let refspec = format!("HEAD:refs/heads/{base_branch}");
     let authorization = GitAuthorization::new(token);
     git_output(
         workspace,
-        &["push", remote_url.as_str(), refspec.as_str()],
+        &["push", remote_url, refspec.as_str()],
         Some(&authorization),
     )
     .await
     .map(|_| ())
 }
 
+fn is_github_repository_component(component: &str) -> bool {
+    !component.is_empty()
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn normalize_github_remote(remote: &str) -> Option<ExpectedGithubRepository> {
+    let remote = remote.trim();
+    let path = if let Some(rest) = strip_ascii_prefix(remote, "https://") {
+        let (authority, path) = rest.split_once('/')?;
+        if !authority.eq_ignore_ascii_case("github.com") || authority.contains('@') {
+            return None;
+        }
+        path
+    } else if let Some(rest) = strip_ascii_prefix(remote, "ssh://") {
+        let (authority, path) = rest.split_once('/')?;
+        if !authority.eq_ignore_ascii_case("git@github.com") {
+            return None;
+        }
+        path
+    } else {
+        strip_ascii_prefix(remote, "git@github.com:")?
+    };
+    let path = strip_ascii_suffix(path, ".git").unwrap_or(path);
+    ExpectedGithubRepository::from_owner_name(path).ok()
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn strip_ascii_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+    let start = value.len().checked_sub(suffix.len())?;
+    value
+        .get(start..)
+        .filter(|candidate| candidate.eq_ignore_ascii_case(suffix))
+        .map(|_| &value[..start])
+}
 struct GitAuthorization {
     header: String,
     redactions: Vec<String>,

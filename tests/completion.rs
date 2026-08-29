@@ -1,11 +1,14 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use symphony::completion::{CompletionMutation, DirectCommitCompletion};
+use symphony::completion::{
+    CompletionMutation, CompletionResult, DirectCommitCompletion, ExpectedGithubRepository,
+};
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
     GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig,
@@ -16,7 +19,7 @@ use symphony::error::{Result, SymphonyError};
 use symphony::tracker::TrackerWriter;
 
 #[tokio::test]
-async fn completion_push_ignores_repository_and_configured_hooks_and_moves_done() {
+async fn completion_pushes_to_pinned_repository_without_repository_hooks() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote.git");
     let work = create_working_repo(temp.path(), &remote);
@@ -45,9 +48,10 @@ async fn completion_push_ignores_repository_and_configured_hooks_and_moves_done(
     );
 
     let writer = Arc::new(FakeWriter::default());
-    let client = completion(&config(), writer.clone());
+    let config = config();
+    let client = completion(&config, writer.clone(), Some(&remote));
     let issue = issue("[Medium] Fix allocator");
-    let result = client.complete_issue(&issue, &work).await.unwrap();
+    let result = complete(&client, &config, &issue, &work).await.unwrap();
 
     assert_eq!(result.moved_to_state.as_deref(), Some("Done"));
     assert_eq!(writer.moves(), vec![(issue.id, "Done".to_string())]);
@@ -73,7 +77,7 @@ fn enabled_completion_requires_a_tracker_writer() {
 #[tokio::test]
 async fn started_state_transition_uses_tracker_writer() {
     let writer = Arc::new(FakeWriter::default());
-    let client = completion(&config(), writer.clone());
+    let client = completion(&config(), writer.clone(), None);
     let issue = issue("[Medium] Fix allocator");
 
     let moved = client.mark_issue_started(&issue).await.unwrap();
@@ -89,10 +93,11 @@ async fn high_severity_completion_moves_review_through_writer() {
     let work = create_working_repo(temp.path(), &remote);
     std::fs::write(work.join("README.md"), "initial\nhigh risk fix\n").unwrap();
     let writer = Arc::new(FakeWriter::default());
-    let client = completion(&config(), writer.clone());
+    let config = config();
+    let client = completion(&config, writer.clone(), Some(&remote));
     let issue = issue("[High] Fix allocator");
 
-    let result = client.complete_issue(&issue, &work).await.unwrap();
+    let result = complete(&client, &config, &issue, &work).await.unwrap();
 
     assert_eq!(result.moved_to_state.as_deref(), Some("In review"));
     assert_eq!(writer.moves(), vec![(issue.id, "In review".to_string())]);
@@ -109,10 +114,9 @@ async fn dry_run_is_read_only_and_does_not_write_tracker() {
     config.completion.direct_commit.dry_run = true;
     let writer = Arc::new(FakeWriter::default());
 
-    let result = completion(&config, writer.clone())
-        .complete_issue(&issue("[Medium] Fix allocator"), &work)
-        .await
-        .unwrap();
+    let issue = issue("[Medium] Fix allocator");
+    let client = completion(&config, writer.clone(), Some(&remote));
+    let result = complete(&client, &config, &issue, &work).await.unwrap();
 
     let plan = result.plan.expect("dry run returns a plan");
     assert_eq!(plan.target_state, "Done");
@@ -154,10 +158,16 @@ async fn status_handoff_failure_after_push_is_partial_failure() {
     std::fs::write(work.join("README.md"), "initial\npushed change\n").unwrap();
     let writer = Arc::new(FakeWriter::failing("handoff unavailable"));
 
-    let result = completion(&config(), writer)
-        .complete_issue(&issue("[Medium] Fix allocator"), &work)
-        .await
-        .unwrap();
+    let config = config();
+    let issue = issue("[Medium] Fix allocator");
+    let result = complete(
+        &completion(&config, writer, Some(&remote)),
+        &config,
+        &issue,
+        &work,
+    )
+    .await
+    .unwrap();
 
     let partial = result
         .partial_failure
@@ -182,14 +192,21 @@ async fn precommitted_changes_rebase_before_push_and_move_state() {
     std::fs::write(other.join("REMOTE.md"), "remote change\n").expect("write remote change");
     commit_all(&other, "remote main advanced");
     run_git(&other, &["push", "origin", "main"]);
+    configure_pinned_origin(&worker);
     std::fs::write(worker.join("WORKER.md"), "worker change\n").expect("write worker change");
     commit_all(&worker, "worker change");
     let writer = Arc::new(FakeWriter::default());
 
-    let result = completion(&config(), writer.clone())
-        .complete_issue(&issue("[Medium] Fix allocator"), &worker)
-        .await
-        .unwrap();
+    let config = config();
+    let issue = issue("[Medium] Fix allocator");
+    let result = complete(
+        &completion(&config, writer.clone(), Some(&remote)),
+        &config,
+        &issue,
+        &worker,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.moved_to_state.as_deref(), Some("Done"));
     assert_eq!(
@@ -211,12 +228,137 @@ async fn missing_severity_fails_before_commit_or_state_write() {
     std::fs::write(work.join("README.md"), "initial\nchanged\n").unwrap();
     let writer = Arc::new(FakeWriter::default());
 
-    let error = completion(&config(), writer.clone())
-        .complete_issue(&issue("Fix allocator"), &work)
-        .await
-        .unwrap_err();
+    let config = config();
+    let issue = issue("Fix allocator");
+    let error = complete(
+        &completion(&config, writer.clone(), Some(&remote)),
+        &config,
+        &issue,
+        &work,
+    )
+    .await
+    .unwrap_err();
 
     assert!(error.to_string().contains("missing_issue_severity"));
+    assert_eq!(git_show(&remote, "refs/heads/main:README.md"), "initial\n");
+    assert!(writer.moves().is_empty());
+}
+
+#[test]
+fn expected_repository_normalizes_only_exact_github_remote_forms() {
+    let config = config();
+    let issue = issue("[Medium] Fix allocator");
+    let expected = ExpectedGithubRepository::from_configured_issue(&config, &issue).unwrap();
+
+    for remote in [
+        "https://github.com/lvmiller/project_symphony",
+        "https://GitHub.Com/LVMILLER/PROJECT_SYMPHONY.GIT",
+        "git@github.com:lvmiller/project_symphony.git",
+        "ssh://git@GitHub.Com/lvmiller/project_symphony.Git",
+    ] {
+        assert!(expected.matches_remote_url(remote), "{remote} must match");
+    }
+    for remote in [
+        "https://github.com/lvmiller/other.git",
+        "https://github.com.evil/lvmiller/project_symphony.git",
+        "https://token@github.com/lvmiller/project_symphony.git",
+        "ssh://other@github.com/lvmiller/project_symphony.git",
+        "git@github.com:lvmiller/project_symphony.git?redirect=evil",
+    ] {
+        assert!(
+            !expected.matches_remote_url(remote),
+            "{remote} must not match"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wrong_host_repository_and_userinfo_fail_before_authenticated_operations() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    let work = create_working_repo(temp.path(), &remote);
+    std::fs::write(work.join("README.md"), "initial\nchanged\n").unwrap();
+    let config = config();
+    let issue = issue("[Medium] Fix allocator");
+    let writer = Arc::new(FakeWriter::default());
+    let client = completion(&config, writer.clone(), Some(&remote));
+
+    for origin in [
+        "https://github.com/lvmiller/other.git",
+        "https://github.com.evil/lvmiller/project_symphony.git",
+        "https://token@github.com/lvmiller/project_symphony.git",
+    ] {
+        run_git(&work, &["remote", "set-url", "origin", origin]);
+        let error = complete(&client, &config, &issue, &work).await.unwrap_err();
+        assert!(error.to_string().contains("completion_repository_mismatch"));
+        assert!(!error.to_string().contains("test-token"));
+        assert_eq!(git_show(&remote, "refs/heads/main:README.md"), "initial\n");
+        assert!(writer.moves().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn allowed_multiple_repositories_still_bind_to_the_current_issue() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    let work = create_working_repo(temp.path(), &remote);
+    std::fs::write(work.join("README.md"), "initial\nchanged\n").unwrap();
+    let mut config = config();
+    config
+        .tracker
+        .github
+        .as_mut()
+        .unwrap()
+        .repositories
+        .push(GithubRepositoryConfig {
+            owner: "other".to_string(),
+            name: "repository".to_string(),
+        });
+    let mut issue = issue("[Medium] Fix allocator");
+    issue.identifier = "other/repository#2".to_string();
+    issue.url = Some("https://github.com/other/repository/issues/2".to_string());
+    let writer = Arc::new(FakeWriter::default());
+
+    let error = complete(
+        &completion(&config, writer.clone(), Some(&remote)),
+        &config,
+        &issue,
+        &work,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("completion_repository_mismatch"));
+    assert_eq!(git_show(&remote, "refs/heads/main:README.md"), "initial\n");
+    assert!(writer.moves().is_empty());
+}
+
+#[tokio::test]
+async fn local_url_rewrite_is_rejected_before_authenticated_operations() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    let work = create_working_repo(temp.path(), &remote);
+    std::fs::write(work.join("README.md"), "initial\nchanged\n").unwrap();
+    append_url_rewrite(
+        &work,
+        "https://attacker.invalid/",
+        "https://github.com/lvmiller/project_symphony.git",
+    );
+    let config = config();
+    let issue = issue("[Medium] Fix allocator");
+    let writer = Arc::new(FakeWriter::default());
+
+    let error = complete(
+        &completion(&config, writer.clone(), Some(&remote)),
+        &config,
+        &issue,
+        &work,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("completion_repository_rewrite"));
+    assert!(!error.to_string().contains("test-token"));
     assert_eq!(git_show(&remote, "refs/heads/main:README.md"), "initial\n");
     assert!(writer.moves().is_empty());
 }
@@ -253,11 +395,31 @@ impl TrackerWriter for FakeWriter {
     }
 }
 
-fn completion(config: &EffectiveConfig, writer: Arc<FakeWriter>) -> DirectCommitCompletion {
+fn completion(
+    config: &EffectiveConfig,
+    writer: Arc<FakeWriter>,
+    authenticated_remote: Option<&Path>,
+) -> DirectCommitCompletion {
     let writer: Arc<dyn TrackerWriter> = writer;
-    DirectCommitCompletion::new(config, Some(writer))
-        .unwrap()
-        .unwrap()
+    let completion = match authenticated_remote {
+        Some(remote) => DirectCommitCompletion::new_with_test_authenticated_remote_url(
+            config,
+            Some(writer),
+            local_file_url(remote),
+        ),
+        None => DirectCommitCompletion::new(config, Some(writer)),
+    };
+    completion.unwrap().unwrap()
+}
+
+async fn complete(
+    client: &DirectCommitCompletion,
+    config: &EffectiveConfig,
+    issue: &Issue,
+    workspace: &Path,
+) -> Result<CompletionResult> {
+    let expected = ExpectedGithubRepository::from_configured_issue(config, issue)?;
+    client.complete_issue(issue, workspace, &expected).await
 }
 
 fn config() -> EffectiveConfig {
@@ -296,6 +458,7 @@ fn config() -> EffectiveConfig {
             root: "workspaces".into(),
             cleanup: WorkspaceCleanupConfig::default(),
             population: Default::default(),
+            retention: Default::default(),
         },
         hooks: HooksConfig::default(),
         agent: AgentConfig {
@@ -359,6 +522,7 @@ fn create_working_repo(root: &Path, remote: &Path) -> std::path::PathBuf {
         &["remote", "add", "origin", remote.to_str().unwrap()],
     );
     run_git(&work, &["push", "origin", "main"]);
+    configure_pinned_origin(&work);
     work
 }
 fn clone_main(root: &Path, remote: &Path, work: &Path) {
@@ -372,6 +536,37 @@ fn clone_main(root: &Path, remote: &Path, work: &Path) {
             work.to_str().unwrap(),
         ],
     );
+}
+
+fn configure_pinned_origin(work: &Path) {
+    run_git(
+        work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/lvmiller/project_symphony.git",
+        ],
+    );
+}
+
+fn local_file_url(remote: &Path) -> String {
+    let remote_path = remote.canonicalize().unwrap();
+    let remote_path = remote_path.to_string_lossy().replace('\\', "/");
+    let remote_path = remote_path.strip_prefix("//?/").unwrap_or(&remote_path);
+    if remote_path.starts_with('/') {
+        format!("file://{remote_path}")
+    } else {
+        format!("file:///{remote_path}")
+    }
+}
+
+fn append_url_rewrite(work: &Path, replacement: &str, prefix: &str) {
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(work.join(".git/config"))
+        .unwrap();
+    writeln!(config, "\n[url \"{replacement}\"]\n\tinsteadOf = {prefix}").unwrap();
 }
 fn commit_all(work: &Path, message: &str) {
     run_git(work, &["add", "-A"]);
