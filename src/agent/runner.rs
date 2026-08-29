@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use crate::agent::codex::CodexClient;
-use crate::completion::DirectCommitCompletion;
+use crate::completion::{DirectCommitCompletion, ExpectedGithubRepository};
 use crate::config::EffectiveConfig;
 use crate::domain::{CodexEvent, Issue, WorkerExitReason};
 use crate::error::Result;
@@ -39,6 +39,7 @@ pub struct SymphonyAgentRunner {
     tracker: Arc<dyn TrackerClient>,
     writer: Option<Arc<dyn TrackerWriter>>,
     codex: Arc<dyn CodexClient>,
+    test_authenticated_remote_url: Option<String>,
 }
 
 impl SymphonyAgentRunner {
@@ -55,7 +56,22 @@ impl SymphonyAgentRunner {
             tracker,
             writer,
             codex,
+            test_authenticated_remote_url: None,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_test_authenticated_remote_url(
+        config: EffectiveConfig,
+        workspace: WorkspaceManager,
+        tracker: Arc<dyn TrackerClient>,
+        writer: Option<Arc<dyn TrackerWriter>>,
+        codex: Arc<dyn CodexClient>,
+        remote_url: String,
+    ) -> Self {
+        let mut runner = Self::new(config, workspace, tracker, writer, codex);
+        runner.test_authenticated_remote_url = Some(remote_url);
+        runner
     }
 
     async fn run_inner(
@@ -138,8 +154,15 @@ impl SymphonyAgentRunner {
         issue: &Issue,
         workspace_path: &std::path::Path,
     ) -> Result<bool> {
-        let Some(completion) = DirectCommitCompletion::new(&self.config, self.writer.clone())?
-        else {
+        let completion = match self.test_authenticated_remote_url.as_ref() {
+            Some(remote_url) => DirectCommitCompletion::new_with_test_authenticated_remote_url(
+                &self.config,
+                self.writer.clone(),
+                remote_url.clone(),
+            )?,
+            None => DirectCommitCompletion::new(&self.config, self.writer.clone())?,
+        };
+        let Some(completion) = completion else {
             return Ok(false);
         };
         let refreshed = self
@@ -161,7 +184,11 @@ impl SymphonyAgentRunner {
             );
             return Ok(false);
         }
-        let result = completion.complete_issue(current, workspace_path).await?;
+        let expected_repository =
+            ExpectedGithubRepository::from_configured_issue(&self.config, current)?;
+        let result = completion
+            .complete_issue(current, workspace_path, &expected_repository)
+            .await?;
         if let Some(partial_failure) = result.partial_failure {
             return Err(crate::error::SymphonyError::tracker(
                 "completion_partial_failure",

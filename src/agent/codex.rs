@@ -13,6 +13,7 @@ use tokio::time::{Instant, timeout};
 use crate::config::CodexConfig;
 use crate::domain::{CodexEvent, TokenTotals};
 use crate::error::{Result, SymphonyError};
+use crate::tracker::github::GitHubGraphqlExecutor;
 
 const MAX_JSONL_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 const METHOD_INITIALIZE: &str = "initialize";
@@ -49,6 +50,8 @@ struct ThreadStartParams {
     approval_policy: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sandbox: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_tools: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -138,11 +141,22 @@ pub trait CodexSession: Send {
 #[derive(Clone, Debug)]
 pub struct CodexAppServerClient {
     pub config: CodexConfig,
+    github_graphql: Option<GitHubGraphqlExecutor>,
 }
 
 impl CodexAppServerClient {
     pub fn new(config: CodexConfig) -> Self {
-        Self { config }
+        Self::with_github_graphql(config, None)
+    }
+
+    pub fn with_github_graphql(
+        config: CodexConfig,
+        github_graphql: Option<GitHubGraphqlExecutor>,
+    ) -> Self {
+        Self {
+            config,
+            github_graphql,
+        }
     }
 }
 
@@ -153,7 +167,13 @@ impl CodexClient for CodexAppServerClient {
         workspace: &Path,
         on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
     ) -> Result<Box<dyn CodexSession + 'a>> {
-        let mut session = CodexJsonlSession::spawn(&self.config, workspace, on_event).await?;
+        let mut session = CodexJsonlSession::spawn(
+            &self.config,
+            self.github_graphql.as_ref(),
+            workspace,
+            on_event,
+        )
+        .await?;
         let startup: Result<()> = async {
             session.initialize().await?;
             let thread_id = session.start_thread().await?;
@@ -189,6 +209,7 @@ fn emit_startup_failed(on_event: &mut (dyn FnMut(CodexEvent) + Send), error: &Sy
 
 struct CodexJsonlSession<'a> {
     config: &'a CodexConfig,
+    github_graphql: Option<&'a GitHubGraphqlExecutor>,
     workspace: PathBuf,
     child: Child,
     stdin: ChildStdin,
@@ -203,6 +224,7 @@ struct CodexJsonlSession<'a> {
 impl<'a> CodexJsonlSession<'a> {
     async fn spawn(
         config: &'a CodexConfig,
+        github_graphql: Option<&'a GitHubGraphqlExecutor>,
         workspace: &Path,
         on_event: &'a mut (dyn FnMut(CodexEvent) + Send),
     ) -> Result<Self> {
@@ -259,6 +281,7 @@ impl<'a> CodexJsonlSession<'a> {
         };
         Ok(Self {
             config,
+            github_graphql,
             workspace: workspace.to_path_buf(),
             child,
             stdin,
@@ -280,7 +303,11 @@ impl<'a> CodexJsonlSession<'a> {
                         name: "symphony",
                         version: env!("CARGO_PKG_VERSION"),
                     },
-                    capabilities: Value::Null,
+                    capabilities: if self.github_graphql.is_some() {
+                        json!({ "experimentalApi": true })
+                    } else {
+                        Value::Null
+                    },
                 },
             )
             .await?;
@@ -299,6 +326,10 @@ impl<'a> CodexJsonlSession<'a> {
                     ephemeral: true,
                     approval_policy: self.config.approval_policy.clone(),
                     sandbox: self.config.thread_sandbox.clone(),
+                    dynamic_tools: self
+                        .github_graphql
+                        .as_ref()
+                        .map(|_| github_graphql_dynamic_tools()),
                 },
             )
             .await?;
@@ -532,19 +563,20 @@ impl<'a> CodexJsonlSession<'a> {
             METHOD_TOOL_CALL => {
                 let params =
                     validate_request_fields(value, &["threadId", "turnId", "tool", "callId"])?;
-                if !params.get("arguments").is_some_and(Value::is_object) {
-                    return Err(protocol_error(
-                        "item/tool/call request missing object arguments",
-                    ));
-                }
-                self.send_response(
-                    id.into_value(),
-                    json!({ "success": false, "contentItems": [] }),
-                )
-                .await?;
-                self.emit("unsupported_tool_call", None, None, None);
-                Ok(())
+                let namespace = params.get("namespace").and_then(Value::as_str);
+                let tool = params.get("tool").and_then(Value::as_str);
+                let result = match (namespace, tool) {
+                    (Some("github_graphql"), Some("query")) => {
+                        self.handle_github_graphql_tool(params).await
+                    }
+                    _ => {
+                        self.emit("unsupported_tool_call", None, None, None);
+                        github_graphql_failure("unsupported_tool")
+                    }
+                };
+                self.send_response(id.into_value(), result).await
             }
+
             METHOD_USER_INPUT => {
                 let params = validate_request_fields(value, &["itemId", "threadId", "turnId"])?;
                 if !params.get("questions").is_some_and(Value::is_array) {
@@ -571,6 +603,34 @@ impl<'a> CodexJsonlSession<'a> {
                 self.emit("other_message", Some(method.to_string()), None, None);
                 Ok(())
             }
+        }
+    }
+    async fn handle_github_graphql_tool(
+        &mut self,
+        params: &serde_json::Map<String, Value>,
+    ) -> Value {
+        let Some(arguments) = params.get("arguments").and_then(Value::as_object) else {
+            return github_graphql_failure("invalid_arguments");
+        };
+        let Some(query) = arguments.get("query").and_then(Value::as_str) else {
+            return github_graphql_failure("invalid_query");
+        };
+        if query.trim().is_empty() || !is_single_graphql_operation(query) {
+            return github_graphql_failure("invalid_query");
+        }
+        let variables = match arguments.get("variables") {
+            Some(variables) if variables.is_object() => variables.clone(),
+            Some(_) => return github_graphql_failure("invalid_variables"),
+            None => json!({}),
+        };
+        let Some(executor) = self.github_graphql else {
+            return github_graphql_failure("github_graphql_unavailable");
+        };
+
+        match timeout(self.response_timeout(), executor.execute(query, variables)).await {
+            Ok(Ok(body)) => github_graphql_response(body),
+            Ok(Err(_)) => github_graphql_failure("github_graphql_request_failed"),
+            Err(_) => github_graphql_failure("github_graphql_request_timed_out"),
         }
     }
 
@@ -810,6 +870,146 @@ impl CodexSession for CodexJsonlSession<'_> {
     async fn shutdown(&mut self) {
         CodexJsonlSession::shutdown(self).await;
     }
+}
+
+fn github_graphql_dynamic_tools() -> Value {
+    json!([{
+        "type": "namespace",
+        "name": "github_graphql",
+        "description": "Execute one GraphQL operation using configured GitHub authentication.",
+        "tools": [{
+            "type": "function",
+            "name": "query",
+            "description": "Execute one GitHub GraphQL query or mutation.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "query": { "type": "string", "minLength": 1 },
+                    "variables": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
+                },
+                "required": ["query"]
+            }
+        }]
+    }])
+}
+
+fn github_graphql_response(body: Value) -> Value {
+    let success = !body
+        .get("errors")
+        .is_some_and(|errors| !errors.is_null() && !errors.as_array().is_some_and(Vec::is_empty));
+    json!({
+        "success": success,
+        "contentItems": [{
+            "type": "inputText",
+            "text": body.to_string()
+        }]
+    })
+}
+
+fn github_graphql_failure(code: &str) -> Value {
+    json!({
+        "success": false,
+        "contentItems": [{
+            "type": "inputText",
+            "text": json!({ "error": code }).to_string()
+        }]
+    })
+}
+
+fn is_single_graphql_operation(query: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Definition {
+        None,
+        Operation,
+        Fragment,
+    }
+
+    let bytes = query.as_bytes();
+    let mut index = 0;
+    let mut brace_depth = 0;
+    let mut operations = 0;
+    let mut definition = Definition::None;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'#' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\n' && bytes[index] != b'\r' {
+                    index += 1;
+                }
+            }
+            b'"' if bytes[index..].starts_with(b"\"\"\"") => {
+                index += 3;
+                while index < bytes.len() && !bytes[index..].starts_with(b"\"\"\"") {
+                    index += 1;
+                }
+                if index == bytes.len() {
+                    return false;
+                }
+                index += 3;
+            }
+            b'"' => {
+                index += 1;
+                let mut escaped = false;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if byte == b'"' && !escaped {
+                        break;
+                    }
+                    escaped = byte == b'\\' && !escaped;
+                    if byte != b'\\' {
+                        escaped = false;
+                    }
+                }
+                if index == bytes.len() && bytes.last() != Some(&b'"') {
+                    return false;
+                }
+            }
+            b'{' => {
+                if brace_depth == 0 && definition == Definition::None {
+                    operations += 1;
+                    definition = Definition::Operation;
+                }
+                brace_depth += 1;
+                index += 1;
+            }
+            b'}' => {
+                if brace_depth == 0 {
+                    return false;
+                }
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    definition = Definition::None;
+                }
+                index += 1;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                if brace_depth == 0 {
+                    match &query[start..index] {
+                        "query" | "mutation" | "subscription" => {
+                            operations += 1;
+                            definition = Definition::Operation;
+                        }
+                        "fragment" => definition = Definition::Fragment,
+                        _ => {}
+                    }
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    brace_depth == 0 && operations == 1
 }
 
 fn bash_command_in_workspace(workspace: &Path, command: &str) -> Result<String> {

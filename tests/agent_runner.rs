@@ -105,6 +105,7 @@ async fn runner_treats_direct_completion_without_changes_as_normal_skip() {
     let temp = TempDir::new().unwrap();
     let mut issue = issue("ISS-4", "active");
     issue.title = "[Medium] Fix allocator".to_string();
+    configure_trusted_issue(&mut issue, 4);
 
     let mut config = config(temp.path(), 1, "{{ issue.identifier }}");
     config.hooks = HooksConfig {
@@ -164,6 +165,7 @@ async fn runner_removes_workspace_after_successful_direct_commit_completion() {
     ]);
     let mut issue = issue("ISS-5", "active");
     issue.title = "[Medium] Fix allocator".to_string();
+    configure_trusted_issue(&mut issue, 5);
 
     let mut config = config(temp.path(), 1, "{{ issue.identifier }}");
     config.tracker.endpoint = format!("{}/graphql", server.url());
@@ -188,7 +190,14 @@ async fn runner_removes_workspace_after_successful_direct_commit_completion() {
     init_workspace_repo(&prepared.path, &remote, "initial\n");
     let codex = Arc::new(FakeCodex::writing("README.md", "initial\nchanged\n"));
     let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker.clone(), Some(tracker), codex);
+    let runner = SymphonyAgentRunner::new_with_test_authenticated_remote_url(
+        config,
+        workspace,
+        tracker.clone(),
+        Some(tracker),
+        codex,
+        authenticated_file_url(&remote),
+    );
 
     let outcome = runner
         .run(issue.clone(), None, Box::new(|_| {}))
@@ -222,6 +231,7 @@ async fn runner_keeps_workspace_after_committed_completion_when_cleanup_policy_i
     ]);
     let mut issue = issue("ISS-6", "active");
     issue.title = "[Medium] Fix allocator".to_string();
+    configure_trusted_issue(&mut issue, 6);
 
     let mut config = config(temp.path(), 1, "{{ issue.identifier }}");
     config.tracker.endpoint = format!("{}/graphql", server.url());
@@ -247,7 +257,14 @@ async fn runner_keeps_workspace_after_committed_completion_when_cleanup_policy_i
     init_workspace_repo(&prepared.path, &remote, "initial\n");
     let codex = Arc::new(FakeCodex::writing("README.md", "initial\nchanged\n"));
     let tracker = Arc::new(FakeTracker::new(vec![issue.clone(), issue.clone()]));
-    let runner = SymphonyAgentRunner::new(config, workspace, tracker.clone(), Some(tracker), codex);
+    let runner = SymphonyAgentRunner::new_with_test_authenticated_remote_url(
+        config,
+        workspace,
+        tracker.clone(),
+        Some(tracker),
+        codex,
+        authenticated_file_url(&remote),
+    );
 
     let outcome = runner
         .run(issue.clone(), None, Box::new(|_| {}))
@@ -439,6 +456,11 @@ fn issue(id: &str, state: &str) -> Issue {
     }
 }
 
+fn configure_trusted_issue(issue: &mut Issue, number: u32) {
+    issue.identifier = format!("owner/repo#{number}");
+    issue.url = Some(format!("https://github.com/owner/repo/issues/{number}"));
+}
+
 fn issue_with_state(id: &str, state: &str) -> Issue {
     let mut issue = issue(id, state);
     issue.state = state.to_string();
@@ -483,6 +505,7 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
             root: root.join("workspaces"),
             cleanup: WorkspaceCleanupConfig::default(),
             population: Default::default(),
+            retention: Default::default(),
         },
         hooks: HooksConfig::default(),
         agent: AgentConfig {
@@ -535,6 +558,24 @@ fn init_workspace_repo(workspace: &Path, remote: &Path, initial_readme: &str) {
         &["remote", "add", "origin", remote.to_str().unwrap()],
     );
     run_git(workspace, &["push", "origin", "main"]);
+    run_git(
+        workspace,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+}
+
+fn authenticated_file_url(remote: &Path) -> String {
+    let path = remote.to_string_lossy().replace('\\', "/");
+    if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        format!("file:///{path}")
+    }
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {

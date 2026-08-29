@@ -1,12 +1,18 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use serde_json::{Value, json};
 use symphony::agent::codex::{CodexAppServerClient, CodexClient};
-use symphony::config::CodexConfig;
+use symphony::config::{
+    CodexConfig, GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, TrackerConfig,
+};
 use symphony::domain::CodexEvent;
+use symphony::tracker::github::GitHubGraphqlExecutor;
 use tempfile::TempDir;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
@@ -118,8 +124,30 @@ while True:
         completed = fresh_fixture("turn", "completed_notification")
         completed["params"]["turn"]["id"] = turn_id
         send(completed)
-    elif scenario == "dynamic":
-        tool_call = fresh_fixture("server_requests", "tool_call")
+    elif scenario.startswith("tool_"):
+        if scenario == "tool_unknown":
+            tool_call = fresh_fixture("server_requests", "tool_call")
+        else:
+            arguments = {
+                "query": "query($owner: String!) { viewer { login } }",
+                "variables": {"owner": "octo-org"},
+            }
+            if scenario == "tool_invalid":
+                arguments = {"query": "query First { viewer { login } } query Second { viewer { login } }"}
+            elif scenario == "tool_invalid_variables":
+                arguments = {"query": "query { viewer { login } }", "variables": []}
+            tool_call = {
+                "id": "tool-1",
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": turn_id,
+                    "namespace": "github_graphql",
+                    "tool": "query",
+                    "callId": "call-1",
+                    "arguments": arguments,
+                },
+            }
         tool_call["params"]["turnId"] = turn_id
         send(tool_call)
         log({"tool_response": recv()})
@@ -246,8 +274,16 @@ fn config(command: String) -> CodexConfig {
 }
 
 async fn run_scenario(scenario: &str) -> (Harness, symphony::Result<Vec<CodexEvent>>) {
+    run_scenario_with_github_graphql(scenario, None).await
+}
+
+async fn run_scenario_with_github_graphql(
+    scenario: &str,
+    github_graphql: Option<GitHubGraphqlExecutor>,
+) -> (Harness, symphony::Result<Vec<CodexEvent>>) {
     let harness = harness(scenario);
-    let client = CodexAppServerClient::new(config(harness.command.clone()));
+    let client =
+        CodexAppServerClient::with_github_graphql(config(harness.command.clone()), github_graphql);
     let workspace_path = fs::canonicalize(harness.workspace.path()).expect("canonical workspace");
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&events);
@@ -272,6 +308,112 @@ fn log_entries(path: &Path) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("json log line"))
         .collect()
+}
+
+struct ToolServer {
+    url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ToolServer {
+    fn new(status: u16, body: Value) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tool server");
+        let url = format!("http://{}/graphql", listener.local_addr().expect("address"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept GraphQL request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("read GraphQL request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4);
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .expect("content length");
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            request_log
+                .lock()
+                .expect("requests mutex")
+                .push(String::from_utf8(request).expect("utf8 request"));
+            let body = body.to_string();
+            let reason = if status == 200 { "OK" } else { "Bad Gateway" };
+            write!(
+                stream,
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write GraphQL response");
+        });
+        Self {
+            url,
+            requests,
+            handle: Some(handle),
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("requests mutex").clone()
+    }
+}
+
+impl Drop for ToolServer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("tool server exits");
+        }
+    }
+}
+
+fn github_executor(endpoint: String) -> GitHubGraphqlExecutor {
+    GitHubGraphqlExecutor::from_tracker_config(&TrackerConfig {
+        kind: "github".to_string(),
+        endpoint,
+        api_key: Some("test-token".to_string()),
+        active_states: Vec::new(),
+        terminal_states: Vec::new(),
+        github: Some(GithubConfig {
+            repository_owner: "octo-org".to_string(),
+            repository_name: "octo-repo".to_string(),
+            repositories: vec![GithubRepositoryConfig {
+                owner: "octo-org".to_string(),
+                name: "octo-repo".to_string(),
+            }],
+            project_owner_type: GithubProjectOwnerType::Organization,
+            project_owner_login: "octo-org".to_string(),
+            project_number: 1,
+            status_field_name: "Status".to_string(),
+            priority_field_name: None,
+            blocker_field_name: None,
+            blocker_label_prefix: None,
+            priority_labels: Default::default(),
+        }),
+    })
+    .expect("configured GraphQL executor")
+}
+
+fn tool_response(harness: &Harness) -> Value {
+    log_entries(&harness.log_path)
+        .into_iter()
+        .find_map(|entry| entry.get("tool_response").cloned())
+        .expect("tool response")
 }
 
 async fn assert_child_reaped(harness: &Harness) {
@@ -490,22 +632,175 @@ async fn auto_approves_command_and_file_requests_for_session() {
 
 #[tokio::test]
 async fn unsupported_dynamic_tool_calls_return_unsuccessful_response() {
-    let (harness, result) = run_scenario("dynamic").await;
+    let (harness, result) = run_scenario("tool_unknown").await;
     let events = result.expect("run completes");
-    let fixture = compatibility_fixture();
-    let log = log_entries(&harness.log_path);
-    let response = log
-        .iter()
-        .find_map(|entry| entry.get("tool_response"))
-        .expect("tool response");
+    let response = tool_response(&harness);
+    assert_eq!(response["result"]["success"], false);
     assert_eq!(
-        response["result"],
-        fixture["server_requests"]["tool_result"]
+        response["result"]["contentItems"][0]["text"],
+        json!({ "error": "unsupported_tool" }).to_string()
     );
     assert!(
         events
             .iter()
             .any(|event| event.event == "unsupported_tool_call")
+    );
+}
+
+fn tool_failure_code(response: &Value) -> String {
+    serde_json::from_str::<Value>(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("tool failure text"),
+    )
+    .expect("structured failure")
+    .get("error")
+    .and_then(Value::as_str)
+    .expect("failure code")
+    .to_string()
+}
+
+#[tokio::test]
+async fn github_graphql_advertises_the_v2_namespace_and_returns_the_full_success_body() {
+    let body = json!({ "data": { "viewer": { "login": "octo" } } });
+    let server = ToolServer::new(200, body.clone());
+    let (harness, result) =
+        run_scenario_with_github_graphql("tool_success", Some(github_executor(server.url.clone())))
+            .await;
+    result.expect("tool call completes without stalling");
+
+    let received: Vec<Value> = log_entries(&harness.log_path)
+        .into_iter()
+        .filter_map(|entry| entry.get("received").cloned())
+        .collect();
+    assert_eq!(
+        received[0]["params"]["capabilities"],
+        json!({ "experimentalApi": true })
+    );
+    assert_eq!(
+        received[2]["params"]["dynamicTools"],
+        json!([{
+            "type": "namespace",
+            "name": "github_graphql",
+            "description": "Execute one GraphQL operation using configured GitHub authentication.",
+            "tools": [{
+                "type": "function",
+                "name": "query",
+                "description": "Execute one GitHub GraphQL query or mutation.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "query": { "type": "string", "minLength": 1 },
+                        "variables": { "type": "object", "additionalProperties": true }
+                    },
+                    "required": ["query"]
+                }
+            }]
+        }])
+    );
+    let response = tool_response(&harness);
+    assert_eq!(response["result"]["success"], true);
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("success body")
+        )
+        .expect("JSON success body"),
+        body
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("authorization: Bearer test-token"));
+    let request_body = requests[0]
+        .split_once("\r\n\r\n")
+        .expect("HTTP request body")
+        .1;
+    let request: Value = serde_json::from_str(request_body).expect("GraphQL request");
+    assert_eq!(
+        request["query"],
+        "query($owner: String!) { viewer { login } }"
+    );
+    assert_eq!(request["variables"], json!({ "owner": "octo-org" }));
+}
+
+#[tokio::test]
+async fn github_graphql_errors_preserve_the_response_body_but_fail_the_tool() {
+    let body = json!({ "data": null, "errors": [{ "message": "not authorized" }] });
+    let server = ToolServer::new(200, body.clone());
+    let (harness, result) =
+        run_scenario_with_github_graphql("tool_success", Some(github_executor(server.url.clone())))
+            .await;
+    result.expect("GraphQL errors do not stall the turn");
+    let response = tool_response(&harness);
+    assert_eq!(response["result"]["success"], false);
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("GraphQL body")
+        )
+        .expect("JSON GraphQL body"),
+        body
+    );
+}
+
+#[tokio::test]
+async fn github_graphql_invalid_arguments_and_missing_configuration_fail_without_stalling() {
+    for scenario in ["tool_invalid", "tool_invalid_variables"] {
+        let result = timeout(Duration::from_secs(1), run_scenario(scenario))
+            .await
+            .expect("invalid tool call must not hang");
+        let (harness, result) = result;
+        result.expect("invalid tool call does not fail the turn");
+        assert!(
+            ["invalid_query", "invalid_variables"]
+                .contains(&tool_failure_code(&tool_response(&harness)).as_str())
+        );
+    }
+
+    let result = timeout(Duration::from_secs(1), run_scenario("tool_success"))
+        .await
+        .expect("unavailable tool must not hang");
+    let (harness, result) = result;
+    result.expect("unavailable tool does not fail the turn");
+    assert_eq!(
+        tool_failure_code(&tool_response(&harness)),
+        "github_graphql_unavailable"
+    );
+    let received: Vec<Value> = log_entries(&harness.log_path)
+        .into_iter()
+        .filter_map(|entry| entry.get("received").cloned())
+        .collect();
+    assert_eq!(received[0]["params"]["capabilities"], Value::Null);
+    assert!(received[2]["params"].get("dynamicTools").is_none());
+}
+
+#[tokio::test]
+async fn github_graphql_status_and_transport_failures_are_safe_and_secret_free() {
+    let server = ToolServer::new(502, json!({ "message": "Bearer test-token" }));
+    let (harness, result) =
+        run_scenario_with_github_graphql("tool_success", Some(github_executor(server.url.clone())))
+            .await;
+    result.expect("HTTP status failure does not stall the turn");
+    let response = tool_response(&harness);
+    assert_eq!(
+        tool_failure_code(&response),
+        "github_graphql_request_failed"
+    );
+    assert!(!response.to_string().contains("test-token"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve transport address");
+    let endpoint = format!("http://{}/graphql", listener.local_addr().expect("address"));
+    drop(listener);
+    let (harness, result) =
+        run_scenario_with_github_graphql("tool_success", Some(github_executor(endpoint))).await;
+    result.expect("transport failure does not stall the turn");
+    assert_eq!(
+        tool_failure_code(&tool_response(&harness)),
+        "github_graphql_request_failed"
     );
 }
 
