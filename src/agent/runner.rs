@@ -17,6 +17,10 @@ use crate::workspace::WorkspaceManager;
 pub struct WorkerOutcome {
     pub issue_id: String,
     pub reason: WorkerExitReason,
+    /// State returned by the post-turn refresh when it made this worker stop.
+    ///
+    /// A normal exit with no terminal state is a continuation candidate.
+    pub terminal_state: Option<String>,
 }
 
 #[async_trait]
@@ -56,26 +60,26 @@ impl SymphonyAgentRunner {
         issue: &Issue,
         attempt: Option<u32>,
         on_event: &mut (dyn FnMut(CodexEvent) + Send),
-    ) -> WorkerExitReason {
+    ) -> (WorkerExitReason, Option<String>) {
         let workspace = match self
             .workspace
             .create_for_source_issue(&self.config.source.id, issue)
             .await
         {
             Ok(workspace) => workspace,
-            Err(error) => return WorkerExitReason::Failed(error.to_string()),
+            Err(error) => return (WorkerExitReason::Failed(error.to_string()), None),
         };
         let mut working_issue = issue.clone();
         if let Err(error) = self.mark_started_if_configured(&mut working_issue).await {
-            return WorkerExitReason::Failed(error.to_string());
+            return (WorkerExitReason::Failed(error.to_string()), None);
         }
 
-        let mut reason = match self
+        let (mut reason, mut terminal_state) = match self
             .run_in_workspace(&working_issue, attempt, on_event, &workspace.path)
             .await
         {
-            Ok(reason) => reason,
-            Err(error) => WorkerExitReason::Failed(error.to_string()),
+            Ok(outcome) => outcome,
+            Err(error) => (WorkerExitReason::Failed(error.to_string()), None),
         };
 
         self.workspace
@@ -104,10 +108,11 @@ impl SymphonyAgentRunner {
                 Ok(false) => {}
                 Err(error) => {
                     reason = WorkerExitReason::Failed(error.to_string());
+                    terminal_state = None;
                 }
             }
         }
-        reason
+        (reason, terminal_state)
     }
 
     async fn mark_started_if_configured(&self, issue: &mut Issue) -> Result<()> {
@@ -148,7 +153,18 @@ impl SymphonyAgentRunner {
             return Ok(false);
         }
         let result = completion.complete_issue(current, workspace_path).await?;
-        Ok(result.commit_sha.is_some()
+        if let Some(partial_failure) = result.partial_failure {
+            return Err(crate::error::SymphonyError::tracker(
+                "completion_partial_failure",
+                format!(
+                    "pushed_commit_sha={} target_state={} message={}",
+                    partial_failure.pushed_commit_sha,
+                    partial_failure.target_state,
+                    partial_failure.message
+                ),
+            ));
+        }
+        Ok(result.is_committed_success()
             && self
                 .config
                 .workspace
@@ -162,7 +178,7 @@ impl SymphonyAgentRunner {
         attempt: Option<u32>,
         on_event: &mut (dyn FnMut(CodexEvent) + Send),
         workspace_path: &std::path::Path,
-    ) -> Result<WorkerExitReason> {
+    ) -> Result<(WorkerExitReason, Option<String>)> {
         info!(
             source_id = %self.config.source.id,
             issue_id = %issue.id,
@@ -225,7 +241,7 @@ impl SymphonyAgentRunner {
                             state = %current.state,
                             "worker_issue_terminal"
                         );
-                        return Ok(WorkerExitReason::Normal);
+                        return Ok((WorkerExitReason::Normal, Some(current.state.clone())));
                     }
                     if !self.config.is_active_state(&current.state) {
                         warn!(
@@ -234,12 +250,12 @@ impl SymphonyAgentRunner {
                             state = %current.state,
                             "worker_issue_no_longer_active"
                         );
-                        return Ok(WorkerExitReason::CanceledByReconciliation);
+                        return Ok((WorkerExitReason::CanceledByReconciliation, None));
                     }
                 }
             }
 
-            Ok(WorkerExitReason::Normal)
+            Ok((WorkerExitReason::Normal, None))
         }
         .await;
         session.shutdown().await;
@@ -257,7 +273,7 @@ impl AgentRunner for SymphonyAgentRunner {
     ) -> Result<WorkerOutcome> {
         let issue_id = issue.id.clone();
         let issue_identifier = issue.identifier.clone();
-        let reason = self.run_inner(&issue, attempt, &mut *on_event).await;
+        let (reason, terminal_state) = self.run_inner(&issue, attempt, &mut *on_event).await;
         if reason.is_normal() {
             info!(issue_id = %issue_id, issue_identifier = %issue_identifier, "worker_completed");
         } else {
@@ -268,6 +284,10 @@ impl AgentRunner for SymphonyAgentRunner {
                 "worker_failed"
             );
         }
-        Ok(WorkerOutcome { issue_id, reason })
+        Ok(WorkerOutcome {
+            issue_id,
+            reason,
+            terminal_state,
+        })
     }
 }

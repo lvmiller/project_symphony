@@ -183,6 +183,9 @@ pub async fn run_multi_source_service_until_shutdown(
                         outcome,
                     )
                     .await;
+                    shared_status
+                        .publish(&state, &reloaders.current_cloned())
+                        .await;
                 }
             }
             refresh = refresh_rx.recv() => {
@@ -198,6 +201,7 @@ pub async fn run_multi_source_service_until_shutdown(
     shutdown_workers(&mut workers).await;
     if let Some(server) = http_server {
         server.task.abort();
+        let _ = server.task.await;
     }
     result
 }
@@ -568,6 +572,7 @@ async fn dispatch_issue(
             .unwrap_or_else(|error| WorkerOutcome {
                 issue_id: raw_issue_id,
                 reason: WorkerExitReason::Failed(error.to_string()),
+                terminal_state: None,
             });
         outcome.issue_id = outcome_issue_key.clone();
         let _ = channels.outcome_tx.send(WorkerResult {
@@ -602,6 +607,17 @@ async fn apply_worker_outcome(
                 .find(|config| config.source.id == entry.source_id)
         })
         .cloned();
+    let terminal_issue = outcome
+        .outcome
+        .terminal_state
+        .as_ref()
+        .and_then(|terminal_state| {
+            state.running.get(&outcome.issue_key).map(|entry| {
+                let mut issue = entry.issue.clone();
+                issue.state.clone_from(terminal_state);
+                (entry.source_id.clone(), issue)
+            })
+        });
     if !await_worker(workers, &outcome.issue_key, outcome.generation).await {
         warn!(issue_key = %outcome.issue_key, generation = outcome.generation, "stale_worker_outcome_ignored");
         return;
@@ -610,6 +626,20 @@ async fn apply_worker_outcome(
         warn!(issue_key = %outcome.issue_key, "worker_outcome_without_running_entry");
         return;
     };
+    if let Some((source_id, issue)) = terminal_issue {
+        state.release_for_source(&source_id, &issue.id);
+        match WorkspaceManager::new(&config.workspace, config.hooks.clone()) {
+            Ok(workspace) => {
+                if let Err(error) = workspace.remove_for_source_issue(&source_id, &issue).await {
+                    warn!(source_id = %source_id, issue_id = %issue.id, issue_identifier = %issue.identifier, error = %error, "terminal_cleanup_failed");
+                }
+            }
+            Err(error) => {
+                warn!(source_id = %source_id, issue_id = %issue.id, issue_identifier = %issue.identifier, error = %error, "terminal_cleanup_workspace_unavailable");
+            }
+        }
+        return;
+    }
     state.worker_exit_by_key(
         &outcome.issue_key,
         outcome.outcome.reason,
@@ -652,23 +682,47 @@ async fn shutdown_workers(workers: &mut WorkerRegistry) {
 #[cfg(test)]
 mod tests {
     use std::future::pending;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use serde_yaml::{Mapping, Value};
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
 
     use super::{
-        WorkerEvent, WorkerRegistry, abort_worker, apply_worker_event, await_worker,
-        next_retry_delay, shutdown_workers, worker_dispatch_permitted,
+        WorkerEvent, WorkerRegistry, WorkerResult, abort_worker, apply_worker_event,
+        apply_worker_outcome, await_worker, next_retry_delay, shutdown_workers,
+        worker_dispatch_permitted,
     };
-    use crate::domain::{CodexEvent, Issue};
+    use crate::agent::runner::WorkerOutcome;
+    use crate::config::EffectiveConfig;
+    use crate::domain::{CodexEvent, Issue, WorkerExitReason, WorkflowDefinition};
     use crate::orchestrator::OrchestratorState;
+    use crate::orchestrator::state::source_workspace_key;
     use crate::time::{now_utc, system_monotonic_ms};
 
     struct TerminationProbe(Arc<AtomicBool>);
 
+    fn config(workspace_root: &Path) -> EffectiveConfig {
+        let mut workspace = Mapping::new();
+        workspace.insert(
+            Value::String("root".to_string()),
+            Value::String(workspace_root.display().to_string()),
+        );
+        let mut raw_config = Mapping::new();
+        raw_config.insert(
+            Value::String("workspace".to_string()),
+            Value::Mapping(workspace),
+        );
+        EffectiveConfig::from_workflow(WorkflowDefinition {
+            config: raw_config,
+            prompt_template: String::new(),
+            path: workspace_root.join("WORKFLOW.md"),
+        })
+        .unwrap()
+    }
     impl Drop for TerminationProbe {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
@@ -793,6 +847,73 @@ mod tests {
         assert!(workers.tasks.is_empty());
         assert!(first.load(Ordering::Acquire));
         assert!(second.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn terminal_outcome_releases_claim_and_removes_workspace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = config(temporary.path());
+        let mut state = OrchestratorState::default();
+        let issue = issue("terminal");
+        let workspace = temporary
+            .path()
+            .join(source_workspace_key("default", &issue.identifier));
+        std::fs::create_dir_all(&workspace).unwrap();
+        state.claim_running(issue.clone(), None, now_utc());
+        let mut workers = WorkerRegistry::default();
+        workers.insert(issue.id.clone(), 1, tokio::spawn(async {}));
+
+        apply_worker_outcome(
+            &mut state,
+            &[config],
+            &mut workers,
+            WorkerResult {
+                issue_key: issue.id.clone(),
+                generation: 1,
+                outcome: WorkerOutcome {
+                    issue_id: issue.id.clone(),
+                    reason: WorkerExitReason::Normal,
+                    terminal_state: Some("Done".to_string()),
+                },
+            },
+        )
+        .await;
+
+        assert!(!state.running.contains_key(&issue.id));
+        assert!(!state.retry_attempts.contains_key(&issue.id));
+        assert!(!state.claimed.contains(&issue.id));
+        assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn nonterminal_normal_outcome_keeps_continuation_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = config(temporary.path());
+        let mut state = OrchestratorState::default();
+        let issue = issue("continuing");
+        state.claim_running(issue.clone(), None, now_utc());
+        let mut workers = WorkerRegistry::default();
+        workers.insert(issue.id.clone(), 1, tokio::spawn(async {}));
+
+        apply_worker_outcome(
+            &mut state,
+            &[config],
+            &mut workers,
+            WorkerResult {
+                issue_key: issue.id.clone(),
+                generation: 1,
+                outcome: WorkerOutcome {
+                    issue_id: issue.id.clone(),
+                    reason: WorkerExitReason::Normal,
+                    terminal_state: None,
+                },
+            },
+        )
+        .await;
+
+        assert!(state.running.is_empty());
+        assert!(state.retry_attempts.contains_key(&issue.id));
+        assert!(state.claimed.contains(&issue.id));
     }
 
     #[test]

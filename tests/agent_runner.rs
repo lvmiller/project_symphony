@@ -43,6 +43,7 @@ async fn runner_uses_initial_prompt_then_continuation_and_refreshes_after_succes
 
     assert_eq!(outcome.issue_id, "ISS-1");
     assert_eq!(outcome.reason, WorkerExitReason::Normal);
+    assert_eq!(outcome.terminal_state, None);
     let prompts = codex.prompts();
     assert_eq!(prompts.len(), 2);
     assert!(prompts[0].contains("Original task: Fix allocator"));
@@ -62,7 +63,7 @@ async fn runner_uses_initial_prompt_then_continuation_and_refreshes_after_succes
 }
 
 #[tokio::test]
-async fn runner_runs_lifecycle_hooks_and_stops_on_terminal_state() {
+async fn runner_marks_terminal_refresh_on_normal_exit_and_runs_lifecycle_hooks() {
     let temp = TempDir::new().unwrap();
     let events = temp.path().join("events");
     let mut hooks = HooksConfig {
@@ -82,6 +83,7 @@ async fn runner_runs_lifecycle_hooks_and_stops_on_terminal_state() {
     let outcome = runner.run(issue, None, Box::new(|_| {})).await.unwrap();
 
     assert_eq!(outcome.reason, WorkerExitReason::Normal);
+    assert_eq!(outcome.terminal_state.as_deref(), Some("done"));
     assert_eq!(codex.prompts().len(), 1);
     assert_eq!(std::fs::read_to_string(events).unwrap(), "beforeafter");
 }
@@ -101,6 +103,7 @@ async fn runner_treats_direct_completion_without_changes_as_normal_skip() {
     config.completion = CompletionConfig {
         direct_commit: DirectCommitCompletionConfig {
             enabled: true,
+            dry_run: false,
             base_branch: "main".to_string(),
             high_review_state: "In review".to_string(),
             auto_approved_state: "Done".to_string(),
@@ -149,6 +152,7 @@ async fn runner_removes_workspace_after_successful_direct_commit_completion() {
     config.completion = CompletionConfig {
         direct_commit: DirectCommitCompletionConfig {
             enabled: true,
+            dry_run: false,
             base_branch: "main".to_string(),
             high_review_state: "In review".to_string(),
             auto_approved_state: "Done".to_string(),
@@ -204,6 +208,7 @@ async fn runner_keeps_workspace_after_committed_completion_when_cleanup_policy_i
     config.completion = CompletionConfig {
         direct_commit: DirectCommitCompletionConfig {
             enabled: true,
+            dry_run: false,
             base_branch: "main".to_string(),
             high_review_state: "In review".to_string(),
             auto_approved_state: "Done".to_string(),
@@ -446,6 +451,7 @@ fn config(root: &Path, max_turns: u32, prompt_template: &str) -> EffectiveConfig
         workspace: WorkspaceConfig {
             root: root.join("workspaces"),
             cleanup: WorkspaceCleanupConfig::default(),
+            population: Default::default(),
         },
         hooks: HooksConfig::default(),
         agent: AgentConfig {
