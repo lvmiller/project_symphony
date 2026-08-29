@@ -8,9 +8,10 @@ use std::time::Duration;
 use symphony::config::{
     GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, TrackerConfig,
 };
+use symphony::domain::Issue;
 use symphony::error::SymphonyError;
-use symphony::tracker::TrackerClient;
 use symphony::tracker::github::GitHubTrackerClient;
+use symphony::tracker::{TrackerClient, TrackerWriter};
 
 #[tokio::test]
 async fn sends_auth_query_and_project_variables() {
@@ -597,6 +598,237 @@ async fn maps_transport_status_graphql_malformed_and_pagination_errors() {
         let err = client.fetch_candidate_issues().await.unwrap_err();
         assert_tracker_kind(err, expected_kind);
     }
+}
+
+#[tokio::test]
+async fn tracker_writer_moves_configured_project_statuses_through_trait_object() {
+    let states = ["Started", "Auto Approved", "High Review"];
+    let mut responses = Vec::new();
+    for _ in states {
+        responses.push(ok(project_status_fields_page()));
+        responses.push(ok(issue_project_items_page_for_writer()));
+        responses.push(ok(json!({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTITEM"}}}})));
+    }
+    let server = TestServer::new(responses);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+    let writer: &dyn TrackerWriter = &client;
+
+    for state in states {
+        writer
+            .move_issue_to_state(&writer_issue(), state)
+            .await
+            .unwrap();
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 9);
+    for (index, state) in states.into_iter().enumerate() {
+        let status_lookup: Value =
+            serde_json::from_str(request_body(&requests[index * 3])).unwrap();
+        assert!(
+            status_lookup["query"]
+                .as_str()
+                .unwrap()
+                .contains("SymphonyProjectStatusFields")
+        );
+        assert_eq!(status_lookup["variables"]["projectOwnerLogin"], "octo-org");
+        assert_eq!(status_lookup["variables"]["projectNumber"], 7);
+
+        let item_lookup: Value =
+            serde_json::from_str(request_body(&requests[index * 3 + 1])).unwrap();
+        assert!(
+            item_lookup["query"]
+                .as_str()
+                .unwrap()
+                .contains("SymphonyIssueProjectItems")
+        );
+        assert_eq!(item_lookup["variables"]["id"], "ISSUE_1");
+
+        let mutation: Value = serde_json::from_str(request_body(&requests[index * 3 + 2])).unwrap();
+        assert!(
+            mutation["query"]
+                .as_str()
+                .unwrap()
+                .contains("SymphonyUpdateProjectStatus")
+        );
+        assert_eq!(mutation["variables"]["projectId"], "PVT_7");
+        assert_eq!(mutation["variables"]["itemId"], "PVTITEM_1");
+        assert_eq!(mutation["variables"]["fieldId"], "FIELD_STATUS");
+        assert_eq!(
+            mutation["variables"]["optionId"],
+            format!("OPTION_{}", state.replace(' ', "_").to_ascii_uppercase())
+        );
+    }
+}
+
+#[tokio::test]
+async fn tracker_writer_uses_tracker_error_surface() {
+    let refused = TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused_url = format!("http://{}/graphql", refused.local_addr().unwrap());
+    drop(refused);
+    let refused_client = client(refused_url, vec!["Todo"], BTreeMap::new());
+    let err = refused_client
+        .move_issue_to_state(&writer_issue(), "Started")
+        .await
+        .unwrap_err();
+    assert_tracker_kind(err, "github_transport");
+
+    let cases = vec![
+        (
+            vec![response(500, json!({"message":"nope"}))],
+            "github_status",
+        ),
+        (
+            vec![ok(
+                json!({"errors":[{"message":"bad query"}], "data": null}),
+            )],
+            "github_graphql",
+        ),
+        (
+            vec![ok(json!({"data": {"organization": {"projectV2": {}}}}))],
+            "github_malformed",
+        ),
+    ];
+    for (responses, expected_kind) in cases {
+        let server = TestServer::new(responses);
+        let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+        let err = client
+            .move_issue_to_state(&writer_issue(), "Started")
+            .await
+            .unwrap_err();
+        assert_tracker_kind(err, expected_kind);
+    }
+}
+
+#[tokio::test]
+async fn tracker_writer_pages_fields_and_issue_items_before_mutating_configured_project() {
+    let first_fields = json!({
+        "data": {
+            "organization": {
+                "projectV2": {
+                    "id": "PVT_7",
+                    "fields": {
+                        "pageInfo": { "hasNextPage": true, "endCursor": "field-cursor" },
+                        "nodes": [{
+                            "id": "FIELD_PRIORITY",
+                            "name": "Priority",
+                            "options": []
+                        }]
+                    }
+                }
+            }
+        }
+    });
+    let first_items = json!({
+        "data": {
+            "node": {
+                "projectItems": {
+                    "pageInfo": { "hasNextPage": true, "endCursor": "item-cursor" },
+                    "nodes": [{
+                        "id": "PVTITEM_OTHER",
+                        "project": {
+                            "id": "PVT_OTHER",
+                            "number": 7,
+                            "owner": { "__typename": "Organization", "login": "octo-org" }
+                        },
+                        "fieldValues": {
+                            "pageInfo": { "hasNextPage": false, "endCursor": null },
+                            "nodes": []
+                        }
+                    }]
+                }
+            }
+        }
+    });
+    let server = TestServer::new(vec![
+        ok(first_fields),
+        ok(project_status_fields_page()),
+        ok(first_items),
+        ok(issue_project_items_page_for_writer()),
+        ok(
+            json!({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTITEM_1"}}}}),
+        ),
+    ]);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    client
+        .move_issue_to_state(&writer_issue(), "Started")
+        .await
+        .unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 5);
+    let field_page: Value = serde_json::from_str(request_body(&requests[1])).unwrap();
+    assert_eq!(field_page["variables"]["after"], "field-cursor");
+    let item_page: Value = serde_json::from_str(request_body(&requests[3])).unwrap();
+    assert_eq!(item_page["variables"]["after"], "item-cursor");
+    let mutation: Value = serde_json::from_str(request_body(&requests[4])).unwrap();
+    assert_eq!(mutation["variables"]["itemId"], "PVTITEM_1");
+}
+
+fn writer_issue() -> Issue {
+    Issue {
+        id: "ISSUE_1".to_string(),
+        identifier: "octo-org/octo-repo#1".to_string(),
+        title: "Tracker writer test".to_string(),
+        description: None,
+        priority: None,
+        state: "Todo".to_string(),
+        branch_name: None,
+        url: None,
+        labels: Vec::new(),
+        blocked_by: Vec::new(),
+        created_at: None,
+        updated_at: None,
+    }
+}
+
+fn project_status_fields_page() -> Value {
+    json!({
+        "data": {
+            "organization": {
+                "projectV2": {
+                    "id": "PVT_7",
+                    "fields": {
+                        "pageInfo": { "hasNextPage": false, "endCursor": null },
+                        "nodes": [{
+                            "id": "FIELD_STATUS",
+                            "name": "Status",
+                            "options": [
+                                { "id": "OPTION_STARTED", "name": "Started" },
+                                { "id": "OPTION_AUTO_APPROVED", "name": "Auto Approved" },
+                                { "id": "OPTION_HIGH_REVIEW", "name": "High Review" }
+                            ]
+                        }]
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn issue_project_items_page_for_writer() -> Value {
+    json!({
+        "data": {
+            "node": {
+                "projectItems": {
+                    "pageInfo": { "hasNextPage": false, "endCursor": null },
+                    "nodes": [{
+                        "id": "PVTITEM_1",
+                        "project": {
+                            "id": "PVT_7",
+                            "number": 7,
+                            "owner": { "__typename": "Organization", "login": "octo-org" }
+                        },
+                        "fieldValues": {
+                            "pageInfo": { "hasNextPage": false, "endCursor": null },
+                            "nodes": []
+                        }
+                    }]
+                }
+            }
+        }
+    })
 }
 
 fn client(

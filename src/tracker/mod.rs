@@ -11,3 +11,8 @@ pub trait TrackerClient: Send + Sync {
     async fn fetch_issues_by_states(&self, state_names: &[String]) -> Result<Vec<Issue>>;
     async fn fetch_issue_states_by_ids(&self, issue_ids: &[String]) -> Result<Vec<Issue>>;
 }
+
+#[async_trait]
+pub trait TrackerWriter: Send + Sync {
+    async fn move_issue_to_state(&self, issue: &Issue, target_state: &str) -> Result<()>;
+}

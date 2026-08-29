@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::config::{EffectiveConfig, GithubConfig, GithubProjectOwnerType, TrackerConfig};
 use crate::domain::{BlockerRef, Issue};
 use crate::error::{Result, SymphonyError};
-use crate::tracker::TrackerClient;
+use crate::tracker::{TrackerClient, TrackerWriter};
 
 const PROJECT_ITEMS_QUERY: &str = r#"
 query SymphonyProjectItems(
@@ -159,6 +159,7 @@ query SymphonyIssueProjectItems($id: ID!, $after: String) {
         nodes {
           id
           project {
+            id
             number
             owner {
               __typename
@@ -178,6 +179,65 @@ query SymphonyIssueProjectItems($id: ID!, $after: String) {
         }
       }
     }
+  }
+}
+"#;
+
+const PROJECT_STATUS_FIELDS_QUERY: &str = r#"
+query SymphonyProjectStatusFields(
+  $projectOwnerLogin: String!
+  $projectNumber: Int!
+  $after: String
+  $isOrganization: Boolean!
+  $isUser: Boolean!
+) {
+  organization(login: $projectOwnerLogin) @include(if: $isOrganization) {
+    projectV2(number: $projectNumber) {
+      id
+      fields(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          ... on ProjectV2SingleSelectField {
+            id
+            name
+            options { id name }
+          }
+        }
+      }
+    }
+  }
+  user(login: $projectOwnerLogin) @include(if: $isUser) {
+    projectV2(number: $projectNumber) {
+      id
+      fields(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          ... on ProjectV2SingleSelectField {
+            id
+            name
+            options { id name }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+const UPDATE_PROJECT_STATUS_MUTATION: &str = r#"
+mutation SymphonyUpdateProjectStatus(
+  $projectId: ID!
+  $itemId: ID!
+  $fieldId: ID!
+  $optionId: String!
+) {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: $projectId
+    itemId: $itemId
+    fieldId: $fieldId
+    value: { singleSelectOptionId: $optionId }
+  }) {
+    projectV2Item { id }
   }
 }
 "#;
@@ -617,6 +677,118 @@ impl GitHubTrackerClient {
             "GitHub project item fieldValues pagination exceeded safety limit",
         ))
     }
+    async fn configured_project_status(
+        &self,
+        target_state: &str,
+    ) -> Result<(String, String, String)> {
+        let mut after: Option<String> = None;
+        for _ in 0..1_000 {
+            let data = self
+                .graphql(
+                    PROJECT_STATUS_FIELDS_QUERY,
+                    json!({
+                        "projectOwnerLogin": self.github.project_owner_login,
+                        "projectNumber": self.github.project_number,
+                        "after": after,
+                        "isOrganization": matches!(self.github.project_owner_type, GithubProjectOwnerType::Organization),
+                        "isUser": matches!(self.github.project_owner_type, GithubProjectOwnerType::User),
+                    }),
+                )
+                .await?;
+            let owner = match self.github.project_owner_type {
+                GithubProjectOwnerType::Organization => data.get("organization"),
+                GithubProjectOwnerType::User => data.get("user"),
+            }
+            .and_then(Value::as_object)
+            .ok_or_else(|| tracker_error("github_malformed", "missing GitHub project owner"))?;
+            let project = owner
+                .get("projectV2")
+                .and_then(Value::as_object)
+                .ok_or_else(|| tracker_error("github_malformed", "missing GitHub projectV2"))?;
+            let project_id = project
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| tracker_error("github_malformed", "missing GitHub project id"))?;
+            let fields = project.get("fields").ok_or_else(|| {
+                tracker_error("github_malformed", "missing GitHub project fields")
+            })?;
+            if let Some((field_id, option_id)) =
+                status_field_and_option(fields, &self.github.status_field_name, target_state)?
+            {
+                return Ok((project_id.to_string(), field_id, option_id));
+            }
+            let page_info: PageInfo = serde_json::from_value(
+                fields
+                    .get("pageInfo")
+                    .cloned()
+                    .unwrap_or_else(default_page_info_value),
+            )
+            .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
+            if !page_info.has_next_page {
+                return Err(tracker_error(
+                    "github_malformed",
+                    format!("missing Status field {}", self.github.status_field_name),
+                ));
+            }
+            let cursor = page_info.end_cursor.ok_or_else(|| {
+                tracker_error(
+                    "github_pagination",
+                    "GitHub returned hasNextPage=true without endCursor",
+                )
+            })?;
+            if after.as_deref() == Some(cursor.as_str()) {
+                return Err(tracker_error(
+                    "github_pagination",
+                    "GitHub returned the same pagination cursor twice",
+                ));
+            }
+            after = Some(cursor);
+        }
+        Err(tracker_error(
+            "github_pagination",
+            "GitHub project field pagination exceeded safety limit",
+        ))
+    }
+
+    async fn configured_project_item_id(&self, issue_id: &str, project_id: &str) -> Result<String> {
+        let mut after: Option<String> = None;
+        for _ in 0..1_000 {
+            let connection = self
+                .fetch_issue_project_items(issue_id, after.as_deref())
+                .await?;
+            for item in connection.nodes {
+                let Some(project) = item.project.as_ref() else {
+                    continue;
+                };
+                if project.get("id").and_then(Value::as_str) == Some(project_id) {
+                    return Ok(item.id);
+                }
+            }
+            if !connection.page_info.has_next_page {
+                return Err(tracker_error(
+                    "github_malformed",
+                    "issue is not in the configured Project v2",
+                ));
+            }
+            let cursor = connection.page_info.end_cursor.ok_or_else(|| {
+                tracker_error(
+                    "github_pagination",
+                    "GitHub returned hasNextPage=true without endCursor",
+                )
+            })?;
+            if after.as_deref() == Some(cursor.as_str()) {
+                return Err(tracker_error(
+                    "github_pagination",
+                    "GitHub returned the same pagination cursor twice",
+                ));
+            }
+            after = Some(cursor);
+        }
+        Err(tracker_error(
+            "github_pagination",
+            "GitHub issue project item pagination exceeded safety limit",
+        ))
+    }
 }
 
 #[async_trait]
@@ -681,6 +853,28 @@ impl TrackerClient for GitHubTrackerClient {
             issues.push(normalize_issue(&self.github, issue_node, &values, state)?);
         }
         Ok(issues)
+    }
+}
+
+#[async_trait]
+impl TrackerWriter for GitHubTrackerClient {
+    async fn move_issue_to_state(&self, issue: &Issue, target_state: &str) -> Result<()> {
+        let (project_id, field_id, option_id) =
+            self.configured_project_status(target_state).await?;
+        let item_id = self
+            .configured_project_item_id(&issue.id, &project_id)
+            .await?;
+        self.graphql(
+            UPDATE_PROJECT_STATUS_MUTATION,
+            json!({
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "optionId": option_id,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 }
 
@@ -821,6 +1015,49 @@ fn project_item_matches_configured_project(github: &GithubConfig, item: &Value) 
     Ok(number == github.project_number
         && owner_type == configured_owner_type
         && owner_login == github.project_owner_login)
+}
+
+fn status_field_and_option(
+    fields: &Value,
+    status_field_name: &str,
+    target_state: &str,
+) -> Result<Option<(String, String)>> {
+    let nodes = fields
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| tracker_error("github_malformed", "missing GitHub project fields"))?;
+    for field in nodes {
+        let Some(field_name) = field.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !field_name.eq_ignore_ascii_case(status_field_name) {
+            continue;
+        }
+        let field_id = field
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| tracker_error("github_malformed", "missing Status field id"))?;
+        let options = field
+            .get("options")
+            .and_then(Value::as_array)
+            .ok_or_else(|| tracker_error("github_malformed", "missing Status field options"))?;
+        for option in options {
+            let Some(option_name) = option.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if option_name.eq_ignore_ascii_case(target_state) {
+                let option_id = option.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    tracker_error("github_malformed", "missing target Status option id")
+                })?;
+                return Ok(Some((field_id.to_string(), option_id.to_string())));
+            }
+        }
+        return Err(tracker_error(
+            "github_malformed",
+            format!("missing target status option {target_state}"),
+        ));
+    }
+    Ok(None)
 }
 
 fn normalize_issue(
