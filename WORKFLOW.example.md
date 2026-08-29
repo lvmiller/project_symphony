@@ -33,6 +33,11 @@ workspace:
   root: ./.symphony-workspaces
   cleanup:
     after_success: committed
+  # Optional, startup-only pruning for stale orphan directories. Omit to disable
+  # scanning entirely. Running, claimed, retrying, and active issue workspaces
+  # are preserved; symlinks and malformed entries are skipped.
+  retention:
+    max_age_days: 14
   # Omit population (or use kind: none) to retain empty-directory behavior.
   # Population runs before lifecycle hooks. `git` clones only newly created workspaces.
   population:

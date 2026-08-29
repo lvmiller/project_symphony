@@ -117,6 +117,7 @@ fn github_defaults_and_default_token_indirection_are_applied() {
         config.workspace.cleanup.after_success,
         WorkspaceCleanupAfterSuccess::Committed
     );
+    assert_eq!(config.workspace.retention.max_age_days, None);
     assert!(!config.completion.direct_commit.enabled);
     assert!(!config.completion.direct_commit.dry_run);
     assert_eq!(config.completion.direct_commit.base_branch, "main");
@@ -153,6 +154,34 @@ fn workspace_cleanup_policy_is_parsed_and_validated() {
             assert_eq!(code, "invalid_workspace_cleanup_after_success");
         }
         other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn workspace_retention_is_optional_and_requires_positive_age() {
+    let temp = tempfile::tempdir().unwrap();
+    let enabled = write_workflow(
+        temp.path(),
+        "---\nworkspace:\n  retention:\n    max_age_days: 14\n---\nPrompt\n",
+    );
+    assert_eq!(
+        load_from_path(enabled).workspace.retention.max_age_days,
+        Some(14)
+    );
+
+    for workflow in [
+        "---\nworkspace:\n  retention:\n    max_age_days: 0\n---\nPrompt\n",
+        "---\nworkspace:\n  retention:\n    max_age_days: old\n---\nPrompt\n",
+        "---\nworkspace:\n  retention: 14\n---\nPrompt\n",
+    ] {
+        assert_config_code(
+            write_workflow(temp.path(), workflow),
+            if workflow.contains("retention: 14") {
+                "invalid_workspace_retention"
+            } else {
+                "invalid_workspace_retention_max_age_days"
+            },
+        );
     }
 }
 
@@ -657,6 +686,16 @@ fn raw_workflow_schema_is_static_extensible_and_documents_defaults() {
     assert_eq!(
         schema["properties"]["workspace"]["properties"]["population"]["properties"]["kind"]["default"],
         "none"
+    );
+    assert_eq!(
+        schema["properties"]["workspace"]["properties"]["retention"]["properties"]["max_age_days"]
+            ["minimum"],
+        1
+    );
+    assert!(
+        schema["properties"]["workspace"]["properties"]["retention"]["properties"]["max_age_days"]
+            .get("default")
+            .is_none()
     );
     assert!(
         schema["properties"]["tracker"]["properties"]["api_key"]

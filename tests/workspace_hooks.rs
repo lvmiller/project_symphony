@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use symphony::config::{
     HooksConfig, WorkspaceCleanupConfig, WorkspaceConfig, WorkspacePopulationConfig,
-    WorkspacePopulationKind, WorkspacePopulationReusePolicy,
+    WorkspacePopulationKind, WorkspacePopulationReusePolicy, WorkspaceRetentionConfig,
 };
 use symphony::domain::Issue;
 use symphony::error::SymphonyError;
@@ -49,6 +49,7 @@ fn manager_with_population(
         &WorkspaceConfig {
             root: root.to_path_buf(),
             cleanup: WorkspaceCleanupConfig::default(),
+            retention: WorkspaceRetentionConfig::default(),
             population,
         },
         hooks,

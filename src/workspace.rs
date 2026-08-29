@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use tracing::{info, warn};
 
@@ -247,6 +249,175 @@ impl WorkspaceManager {
         info!(workspace = %workspace.display(), "workspace removed");
         Ok(())
     }
+
+    /// Removes stale, unclaimed workspace directories in one source namespace.
+    ///
+    /// The caller decides when to invoke this; Symphony uses it only during startup.
+    pub async fn prune_orphaned_workspaces_for_source(
+        &self,
+        source_id: &str,
+        protected_workspace_keys: &BTreeSet<String>,
+        max_age_days: u64,
+    ) -> Result<()> {
+        self.prune_orphaned_workspaces_for_source_with_namespaces(
+            source_id,
+            protected_workspace_keys,
+            &BTreeSet::new(),
+            max_age_days,
+        )
+        .await
+    }
+
+    /// Removes stale, unclaimed workspace directories, excluding other configured source namespaces.
+    pub async fn prune_orphaned_workspaces_for_source_with_namespaces(
+        &self,
+        source_id: &str,
+        protected_workspace_keys: &BTreeSet<String>,
+        source_namespace_segments: &BTreeSet<String>,
+        max_age_days: u64,
+    ) -> Result<()> {
+        self.prune_orphaned_workspaces_for_source_at(
+            source_id,
+            protected_workspace_keys,
+            source_namespace_segments,
+            max_age_days,
+            SystemTime::now(),
+        )
+        .await
+    }
+    async fn prune_orphaned_workspaces_for_source_at(
+        &self,
+        source_id: &str,
+        protected_workspace_keys: &BTreeSet<String>,
+        source_namespace_segments: &BTreeSet<String>,
+        max_age_days: u64,
+        now: SystemTime,
+    ) -> Result<()> {
+        let canonical_root = match fs::symlink_metadata(&self.root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                warn!(workspace_root = %self.root.display(), "workspace retention skipped symlink root");
+                return Ok(());
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                warn!(workspace_root = %self.root.display(), "workspace retention skipped non-directory root");
+                return Ok(());
+            }
+            Ok(_) => canonicalize_dir(&self.root)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(SymphonyError::io(Some(self.root.clone()), error)),
+        };
+        let namespace = if source_id == DEFAULT_SOURCE_ID {
+            canonical_root.clone()
+        } else {
+            let source_key = sanitize_workspace_key(source_id);
+            let path = normalize_absolute_path(&canonical_root.join(&source_key))?;
+            ensure_contained(&canonical_root, &path)?;
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    warn!(workspace_namespace = %path.display(), "workspace retention skipped symlink namespace");
+                    return Ok(());
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    warn!(workspace_namespace = %path.display(), "workspace retention skipped non-directory namespace");
+                    return Ok(());
+                }
+                Ok(_) => match verify_workspace_dir(&canonical_root, &path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        warn!(workspace_namespace = %path.display(), error = %error, "workspace retention skipped invalid namespace");
+                        return Ok(());
+                    }
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(SymphonyError::io(Some(path), error)),
+            }
+        };
+        let max_age = Duration::from_secs(max_age_days.saturating_mul(24 * 60 * 60));
+        let entries = fs::read_dir(&namespace)
+            .map_err(|error| SymphonyError::io(Some(namespace.clone()), error))?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn!(workspace_namespace = %namespace.display(), error = %error, "workspace retention skipped unreadable entry");
+                    continue;
+                }
+            };
+            let entry_name = match entry.file_name().into_string() {
+                Ok(entry_name) if is_workspace_segment(&entry_name) => entry_name,
+                Ok(entry_name) => {
+                    warn!(workspace_namespace = %namespace.display(), entry = %entry_name, "workspace retention skipped malformed entry");
+                    continue;
+                }
+                Err(_) => {
+                    warn!(workspace_namespace = %namespace.display(), "workspace retention skipped non-utf8 entry");
+                    continue;
+                }
+            };
+            let workspace_key = source_workspace_key(source_id, &entry_name);
+            if source_id == DEFAULT_SOURCE_ID && source_namespace_segments.contains(&entry_name) {
+                continue;
+            }
+            if protected_workspace_keys.contains(&workspace_key) {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    warn!(workspace = %path.display(), "workspace retention skipped symlink entry");
+                    continue;
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    warn!(workspace = %path.display(), "workspace retention skipped non-directory entry");
+                    continue;
+                }
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warn!(workspace = %path.display(), error = %error, "workspace retention skipped unreadable entry");
+                    continue;
+                }
+            };
+            let modified = match metadata.modified() {
+                Ok(modified) => modified,
+                Err(error) => {
+                    warn!(workspace = %path.display(), error = %error, "workspace retention skipped entry without modification time");
+                    continue;
+                }
+            };
+            if !is_older_than(modified, now, max_age) {
+                continue;
+            }
+            let workspace = match verify_workspace_dir(&canonical_root, &path) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    warn!(workspace = %path.display(), error = %error, "workspace retention skipped invalid entry");
+                    continue;
+                }
+            };
+            run_hook_best_effort(
+                HookKind::BeforeRemove,
+                &self.hooks,
+                HookContext::new(&workspace, workspace_key, source_id, &entry_name),
+            )
+            .await;
+            match fs::remove_dir_all(&workspace) {
+                Ok(()) => info!(workspace = %workspace.display(), "stale workspace removed"),
+                Err(error) => {
+                    warn!(workspace = %workspace.display(), error = %error, "workspace retention removal failed")
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_workspace_segment(segment: &str) -> bool {
+    !segment.is_empty() && sanitize_workspace_key(segment) == segment
+}
+
+fn is_older_than(modified: SystemTime, now: SystemTime, max_age: Duration) -> bool {
+    now.duration_since(modified)
+        .is_ok_and(|elapsed| elapsed >= max_age)
 }
 
 pub fn sanitize_workspace_key(identifier: &str) -> String {
@@ -384,4 +555,170 @@ fn remove_new_workspace(canonical_root: &Path, workspace: &Path) {
 
 fn symlink_workspace_error(message: &str, path: &Path) -> SymphonyError {
     SymphonyError::Workspace(format!("{message} path={}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::TempDir;
+
+    fn manager(root: &Path, hooks: HooksConfig) -> WorkspaceManager {
+        WorkspaceManager::new(
+            &WorkspaceConfig {
+                root: root.to_path_buf(),
+                cleanup: Default::default(),
+                retention: Default::default(),
+                population: Default::default(),
+            },
+            hooks,
+        )
+        .expect("workspace manager")
+    }
+    #[tokio::test]
+    async fn retention_removes_only_old_unprotected_valid_orphans() {
+        let temp = TempDir::new().expect("tempdir");
+        let stale = temp.path().join("stale");
+        let protected = temp.path().join("protected");
+        let malformed = temp.path().join("bad name");
+        let regular_file = temp.path().join("not-a-directory");
+        fs::create_dir_all(&stale).expect("stale workspace");
+        fs::create_dir_all(&protected).expect("protected workspace");
+        fs::create_dir_all(&malformed).expect("malformed entry");
+        fs::write(&regular_file, "not a workspace").expect("regular entry");
+        let old = fs::metadata(&stale)
+            .expect("stale metadata")
+            .modified()
+            .expect("stale modification time")
+            + Duration::from_secs(2 * 24 * 60 * 60);
+        let mut protected_keys = BTreeSet::new();
+        protected_keys.insert("protected".to_string());
+
+        manager(temp.path(), HooksConfig::default())
+            .prune_orphaned_workspaces_for_source_at(
+                DEFAULT_SOURCE_ID,
+                &protected_keys,
+                &BTreeSet::new(),
+                1,
+                old,
+            )
+            .await
+            .expect("retention prune");
+
+        assert!(!stale.exists());
+        assert!(protected.exists());
+        assert!(malformed.exists());
+        assert!(regular_file.exists());
+    }
+
+    #[test]
+    fn retention_preserves_young_or_future_entries() {
+        let now = SystemTime::now();
+        assert!(!is_older_than(now, now, Duration::from_secs(24 * 60 * 60)));
+        assert!(!is_older_than(
+            now + Duration::from_secs(1),
+            now,
+            Duration::from_secs(24 * 60 * 60),
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_namespace_does_not_prune_configured_source_namespaces() {
+        let temp = TempDir::new().expect("tempdir");
+        let source_namespace = temp.path().join("api");
+        fs::create_dir_all(source_namespace.join("orphan")).expect("source workspace");
+        let modified = fs::metadata(&source_namespace)
+            .expect("namespace metadata")
+            .modified()
+            .expect("namespace modification time");
+        let mut source_namespaces = BTreeSet::new();
+        source_namespaces.insert("api".to_string());
+
+        manager(temp.path(), HooksConfig::default())
+            .prune_orphaned_workspaces_for_source_at(
+                DEFAULT_SOURCE_ID,
+                &BTreeSet::new(),
+                &source_namespaces,
+                1,
+                modified + Duration::from_secs(2 * 24 * 60 * 60),
+            )
+            .await
+            .expect("retention prune");
+
+        assert!(source_namespace.exists());
+    }
+    #[tokio::test]
+    async fn retention_skips_missing_root_without_creating_or_scanning_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("missing");
+        manager(&root, HooksConfig::default())
+            .prune_orphaned_workspaces_for_source(DEFAULT_SOURCE_ID, &BTreeSet::new(), 1)
+            .await
+            .expect("missing root is not an error");
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retention_skips_symlink_entries_without_touching_their_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside");
+        let link = temp.path().join("escaped");
+        symlink(outside.path(), &link).expect("workspace symlink");
+        let now = SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60);
+
+        manager(temp.path(), HooksConfig::default())
+            .prune_orphaned_workspaces_for_source_at(
+                DEFAULT_SOURCE_ID,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                1,
+                now,
+            )
+            .await
+            .expect("retention prune");
+
+        assert!(outside.path().exists());
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retention_runs_before_remove_hook_best_effort() {
+        let temp = TempDir::new().expect("tempdir");
+        let stale = temp.path().join("stale");
+        fs::create_dir_all(&stale).expect("stale workspace");
+        let modified = fs::metadata(&stale)
+            .expect("stale metadata")
+            .modified()
+            .expect("stale modification time");
+        let hooks = HooksConfig {
+            before_remove: Some("printf ran > ../retention_hook_marker; exit 7".to_string()),
+            ..HooksConfig::default()
+        };
+
+        manager(temp.path(), hooks)
+            .prune_orphaned_workspaces_for_source_at(
+                DEFAULT_SOURCE_ID,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                1,
+                modified + Duration::from_secs(2 * 24 * 60 * 60),
+            )
+            .await
+            .expect("hook failure is best effort");
+
+        assert!(!stale.exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("retention_hook_marker")).expect("hook marker"),
+            "ran"
+        );
+    }
 }

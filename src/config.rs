@@ -311,6 +311,14 @@ pub fn raw_workflow_json_schema() -> serde_json::Value {
                         },
                         "additionalProperties": true
                     },
+                    "retention": {
+                        "type": "object",
+                        "description": "Optional startup-only orphaned workspace pruning. Omit max_age_days to disable scanning.",
+                        "properties": {
+                            "max_age_days": { "type": "integer", "minimum": 1 }
+                        },
+                        "additionalProperties": true
+                    },
                     "population": {
                         "type": "object",
                         "description": "Built-in workspace population. Git requires a non-empty repository_url; `ref` and `branch` are mutually exclusive.",
@@ -637,6 +645,7 @@ pub struct PollingConfig {
 pub struct WorkspaceConfig {
     pub root: PathBuf,
     pub cleanup: WorkspaceCleanupConfig,
+    pub retention: WorkspaceRetentionConfig,
     pub population: WorkspacePopulationConfig,
 }
 
@@ -657,6 +666,11 @@ impl WorkspaceCleanupConfig {
     pub fn removes_after_committed_success(&self) -> bool {
         matches!(self.after_success, WorkspaceCleanupAfterSuccess::Committed)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRetentionConfig {
+    pub max_age_days: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1182,6 +1196,7 @@ fn parse_workspace(config: &Mapping, workflow_dir: &Path) -> Result<WorkspaceCon
     Ok(WorkspaceConfig {
         root: normalize_absolute_path(&expanded)?,
         cleanup: parse_workspace_cleanup(workspace)?,
+        retention: parse_workspace_retention(workspace)?,
         population: parse_workspace_population(workspace)?,
     })
 }
@@ -1312,6 +1327,36 @@ fn parse_workspace_population(workspace: Option<&Mapping>) -> Result<WorkspacePo
         branch,
         depth,
         reuse,
+    })
+}
+
+fn parse_workspace_retention(workspace: Option<&Mapping>) -> Result<WorkspaceRetentionConfig> {
+    let Some(retention_value) = get_value(workspace, "retention") else {
+        return Ok(WorkspaceRetentionConfig::default());
+    };
+    let retention = retention_value.as_mapping().ok_or_else(|| {
+        SymphonyError::config(
+            "invalid_workspace_retention",
+            "workspace.retention must be a mapping",
+        )
+    })?;
+    let Some(max_age_days) = get_value(Some(retention), "max_age_days") else {
+        return Ok(WorkspaceRetentionConfig::default());
+    };
+    let max_age_days = match max_age_days {
+        Value::Number(number) => number.as_u64(),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+    .filter(|value| *value > 0)
+    .ok_or_else(|| {
+        SymphonyError::config(
+            "invalid_workspace_retention_max_age_days",
+            "workspace.retention.max_age_days must be a positive integer",
+        )
+    })?;
+    Ok(WorkspaceRetentionConfig {
+        max_age_days: Some(max_age_days),
     })
 }
 

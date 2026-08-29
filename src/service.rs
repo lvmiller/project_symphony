@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -21,9 +21,9 @@ use crate::observability::http::{SharedStatus, spawn_http_server};
 use crate::orchestrator::state::{ReconcileDecision, source_issue_key};
 use crate::orchestrator::{OrchestratorState, is_dispatch_eligible_for_source};
 use crate::time::{ms_from_now, now_utc, system_monotonic_ms};
-use crate::tracker::github::GitHubTrackerClient;
+use crate::tracker::github::{GitHubGraphqlExecutor, GitHubTrackerClient};
 use crate::tracker::{TrackerClient, TrackerWriter};
-use crate::workspace::WorkspaceManager;
+use crate::workspace::{WorkspaceManager, sanitize_workspace_key, source_workspace_key};
 
 struct WorkerEvent {
     issue_key: String,
@@ -143,6 +143,7 @@ pub async fn run_multi_source_service_until_shutdown(
         .publish(&state, &reloaders.current_cloned())
         .await;
     tokio::pin!(shutdown);
+    let mut startup_retention_pending = true;
 
     let result = loop {
         for (source_id, workflow_path, result) in reloaders.reload_if_changed() {
@@ -168,13 +169,22 @@ pub async fn run_multi_source_service_until_shutdown(
                 }
             }
         }
-        tick(
-            &mut state,
-            &mut workers,
-            reloaders.current_cloned(),
-            channels.clone(),
-        )
-        .await;
+        let configs = reloaders.current_cloned();
+        tick(&mut state, &mut workers, configs.clone(), channels.clone()).await;
+        if startup_retention_pending {
+            for config in &configs {
+                let source_namespace_segments = configs
+                    .iter()
+                    .filter(|other| {
+                        other.workspace.root == config.workspace.root
+                            && other.source.id != crate::config::DEFAULT_SOURCE_ID
+                    })
+                    .map(|other| sanitize_workspace_key(&other.source.id))
+                    .collect();
+                startup_orphan_workspace_pruning(config, &state, &source_namespace_segments).await;
+            }
+            startup_retention_pending = false;
+        }
         shared_status
             .publish(&state, &reloaders.current_cloned())
             .await;
@@ -265,6 +275,75 @@ async fn startup_terminal_cleanup(config: &EffectiveConfig) {
         Err(error) => {
             warn!(source_id = %config.source.id, error = %error, "startup_cleanup_fetch_failed")
         }
+    }
+}
+
+async fn startup_orphan_workspace_pruning(
+    config: &EffectiveConfig,
+    state: &OrchestratorState,
+    source_namespace_segments: &BTreeSet<String>,
+) {
+    let Some(max_age_days) = config.workspace.retention.max_age_days else {
+        return;
+    };
+    let tracker = match GitHubTrackerClient::new(config) {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            warn!(source_id = %config.source.id, error = %error, "startup_retention_tracker_unavailable");
+            return;
+        }
+    };
+    let active_issues = match tracker
+        .fetch_issues_by_states(&config.tracker.active_states)
+        .await
+    {
+        Ok(issues) => issues,
+        Err(error) => {
+            warn!(source_id = %config.source.id, error = %error, "startup_retention_fetch_failed");
+            return;
+        }
+    };
+    let mut protected_workspace_keys: BTreeSet<String> = state
+        .claimed_workspace_keys
+        .iter()
+        .cloned()
+        .chain(
+            state
+                .running
+                .values()
+                .filter(|entry| entry.source_id == config.source.id)
+                .map(|entry| entry.workspace_key.clone()),
+        )
+        .chain(
+            state
+                .retry_attempts
+                .values()
+                .filter(|retry| retry.source_id == config.source.id)
+                .map(|retry| retry.workspace_key.clone()),
+        )
+        .collect();
+    protected_workspace_keys.extend(
+        active_issues
+            .iter()
+            .map(|issue| source_workspace_key(&config.source.id, &issue.identifier)),
+    );
+    let workspace = match WorkspaceManager::new(&config.workspace, config.hooks.clone()) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            warn!(source_id = %config.source.id, error = %error, "startup_retention_workspace_unavailable");
+            return;
+        }
+    };
+    if let Err(error) = workspace
+        .prune_orphaned_workspaces_for_source_with_namespaces(
+            &config.source.id,
+            &protected_workspace_keys,
+            source_namespace_segments,
+            max_age_days,
+        )
+        .await
+    {
+        warn!(source_id = %config.source.id, error = %error, "startup_retention_pruning_failed");
     }
 }
 
@@ -571,7 +650,11 @@ async fn dispatch_issue(
         let writer: Arc<dyn TrackerWriter> = tracker.clone();
         writer
     });
-    let codex = Arc::new(CodexAppServerClient::new(config.codex.clone()));
+    let github_graphql = GitHubGraphqlExecutor::from_tracker_config(&config.tracker).ok();
+    let codex = Arc::new(CodexAppServerClient::with_github_graphql(
+        config.codex.clone(),
+        github_graphql,
+    ));
     let runner = SymphonyAgentRunner::new(config, workspace, tracker, writer, codex);
     let worker_issue_key = issue_key.clone();
     let handle = tokio::spawn(async move {
