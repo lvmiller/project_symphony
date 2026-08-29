@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{
     DirectCommitCompletionConfig, EffectiveConfig, GithubConfig, GithubProjectOwnerType,
@@ -90,11 +90,41 @@ mutation SymphonyUpdateCompletionStatus(
 "#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionPlan {
+    pub severity: String,
+    pub target_state: String,
+    pub detected_changes: Vec<String>,
+    pub commit_title: String,
+    pub commit_body: String,
+    pub rebase_required: bool,
+    pub planned_mutations: Vec<CompletionMutation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompletionMutation {
+    StageAllChanges,
+    Commit { title: String, body: String },
+    FetchBaseBranch { base_branch: String },
+    RebaseOntoBaseBranch { base_branch: String },
+    PushBaseBranch { base_branch: String },
+    MoveIssueToState { target_state: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionPartialFailure {
+    pub pushed_commit_sha: String,
+    pub target_state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionResult {
     pub commit_sha: Option<String>,
     pub moved_to_state: Option<String>,
     pub severity: Option<String>,
     pub skipped_reason: Option<String>,
+    pub plan: Option<CompletionPlan>,
+    pub partial_failure: Option<CompletionPartialFailure>,
 }
 
 impl CompletionResult {
@@ -104,8 +134,22 @@ impl CompletionResult {
             moved_to_state: None,
             severity: None,
             skipped_reason: Some(reason.into()),
+            plan: None,
+            partial_failure: None,
         }
     }
+
+    pub fn is_committed_success(&self) -> bool {
+        self.commit_sha.is_some() && self.moved_to_state.is_some() && self.partial_failure.is_none()
+    }
+}
+
+struct DryRunPlanInput {
+    severity: Severity,
+    target_state: String,
+    detected_changes: Vec<String>,
+    has_workspace_changes: bool,
+    has_pending_local_commits: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -155,12 +199,31 @@ impl GitHubCompletionClient {
         workspace: &Path,
     ) -> Result<CompletionResult> {
         let severity = Severity::from_issue(issue)?;
-        let has_workspace_changes = git_has_changes(workspace).await?;
+        let detected_changes = git_worktree_changes(workspace).await?;
+        let has_workspace_changes = !detected_changes.is_empty();
         let has_pending_local_commits = if has_workspace_changes {
             true
         } else {
             git_status_has_unpushed_commits(workspace).await?
         };
+        let target_state = severity.target_state(&self.direct_commit).to_string();
+
+        if self.direct_commit.dry_run {
+            return self
+                .dry_run_plan(
+                    issue,
+                    workspace,
+                    DryRunPlanInput {
+                        severity,
+                        target_state,
+                        detected_changes,
+                        has_workspace_changes,
+                        has_pending_local_commits,
+                    },
+                )
+                .await;
+        }
+
         if !has_pending_local_commits {
             info!(issue_id = %issue.id, issue_identifier = %issue.identifier, "completion_skipped_no_changes");
             return Ok(CompletionResult::skipped("no workspace changes"));
@@ -186,14 +249,36 @@ impl GitHubCompletionClient {
 
         let commit_sha = git_commit_sha(workspace).await?;
         git_push_base_branch(workspace, &self.direct_commit.base_branch, &self.token).await?;
-        let target_state = severity.target_state(&self.direct_commit).to_string();
-        self.move_issue_to_state(issue, &target_state).await?;
+        if let Err(error) = self.move_issue_to_state(issue, &target_state).await {
+            let message = error.to_string();
+            warn!(
+                issue_id = %issue.id,
+                issue_identifier = %issue.identifier,
+                severity = %severity.as_str(),
+                commit_sha = %commit_sha,
+                target_state = %target_state,
+                error = %message,
+                "completion_direct_commit_partial_failure"
+            );
+            return Ok(CompletionResult {
+                commit_sha: Some(commit_sha.clone()),
+                moved_to_state: None,
+                severity: Some(severity.as_str().to_string()),
+                skipped_reason: None,
+                plan: None,
+                partial_failure: Some(CompletionPartialFailure {
+                    pushed_commit_sha: commit_sha,
+                    target_state,
+                    message,
+                }),
+            });
+        }
         info!(
             issue_id = %issue.id,
             issue_identifier = %issue.identifier,
             severity = %severity.as_str(),
             commit_sha = %commit_sha,
-            state = %target_state,
+            target_state = %target_state,
             "completion_direct_commit_ready"
         );
         Ok(CompletionResult {
@@ -201,6 +286,78 @@ impl GitHubCompletionClient {
             moved_to_state: Some(target_state),
             severity: Some(severity.as_str().to_string()),
             skipped_reason: None,
+            plan: None,
+            partial_failure: None,
+        })
+    }
+
+    async fn dry_run_plan(
+        &self,
+        issue: &Issue,
+        workspace: &Path,
+        input: DryRunPlanInput,
+    ) -> Result<CompletionResult> {
+        let DryRunPlanInput {
+            severity,
+            target_state,
+            detected_changes,
+            has_workspace_changes,
+            has_pending_local_commits,
+        } = input;
+        ensure_on_base_branch(workspace, &self.direct_commit.base_branch).await?;
+        let rebase_required = has_pending_local_commits
+            && git_rebase_required(workspace, &self.direct_commit.base_branch).await?;
+        let title = commit_title(issue);
+        let body = commit_body(issue);
+        let mut planned_mutations = Vec::new();
+        if has_workspace_changes {
+            planned_mutations.push(CompletionMutation::StageAllChanges);
+            planned_mutations.push(CompletionMutation::Commit {
+                title: title.clone(),
+                body: body.clone(),
+            });
+        }
+        if has_pending_local_commits {
+            planned_mutations.push(CompletionMutation::FetchBaseBranch {
+                base_branch: self.direct_commit.base_branch.clone(),
+            });
+            if rebase_required {
+                planned_mutations.push(CompletionMutation::RebaseOntoBaseBranch {
+                    base_branch: self.direct_commit.base_branch.clone(),
+                });
+            }
+            planned_mutations.push(CompletionMutation::PushBaseBranch {
+                base_branch: self.direct_commit.base_branch.clone(),
+            });
+            planned_mutations.push(CompletionMutation::MoveIssueToState {
+                target_state: target_state.clone(),
+            });
+        }
+        let plan = CompletionPlan {
+            severity: severity.as_str().to_string(),
+            target_state: target_state.clone(),
+            detected_changes,
+            commit_title: title,
+            commit_body: body,
+            rebase_required,
+            planned_mutations,
+        };
+        info!(
+            issue_id = %issue.id,
+            issue_identifier = %issue.identifier,
+            severity = %severity.as_str(),
+            target_state = %target_state,
+            rebase_required,
+            "completion_direct_commit_dry_run"
+        );
+        Ok(CompletionResult {
+            commit_sha: None,
+            moved_to_state: None,
+            severity: Some(severity.as_str().to_string()),
+            skipped_reason: (!has_pending_local_commits)
+                .then(|| "no workspace changes".to_string()),
+            plan: Some(plan),
+            partial_failure: None,
         })
     }
 
@@ -348,9 +505,13 @@ struct GraphqlError {
     message: Option<String>,
 }
 
-async fn git_has_changes(workspace: &Path) -> Result<bool> {
+async fn git_worktree_changes(workspace: &Path) -> Result<Vec<String>> {
     let output = git_output(workspace, &["status", "--porcelain=v1"], None).await?;
-    Ok(!output.trim().is_empty())
+    Ok(output.lines().map(str::to_owned).collect())
+}
+
+async fn git_has_changes(workspace: &Path) -> Result<bool> {
+    Ok(!git_worktree_changes(workspace).await?.is_empty())
 }
 
 async fn git_status_has_unpushed_commits(workspace: &Path) -> Result<bool> {
@@ -374,6 +535,16 @@ async fn git_fetch_base_branch(workspace: &Path, base_branch: &str, token: &str)
 
 async fn git_has_unpushed_commits(workspace: &Path, base_branch: &str) -> Result<bool> {
     let revision_range = format!("origin/{base_branch}..HEAD");
+    let output = git_output(workspace, &["rev-list", "--count", &revision_range], None).await?;
+    let count = output
+        .trim()
+        .parse::<u64>()
+        .map_err(|err| completion_error("git_output", err.to_string()))?;
+    Ok(count > 0)
+}
+
+async fn git_rebase_required(workspace: &Path, base_branch: &str) -> Result<bool> {
+    let revision_range = format!("HEAD..origin/{base_branch}");
     let output = git_output(workspace, &["rev-list", "--count", &revision_range], None).await?;
     let count = output
         .trim()

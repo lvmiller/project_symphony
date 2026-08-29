@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{Value, json};
-use symphony::completion::GitHubCompletionClient;
+use symphony::completion::{CompletionMutation, GitHubCompletionClient};
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
     GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig,
@@ -131,6 +131,142 @@ async fn high_issue_commits_to_main_and_moves_to_review() {
     assert_eq!(requests.len(), 2);
     let mutation_body: Value = serde_json::from_str(request_body(&requests[1])).unwrap();
     assert_eq!(mutation_body["variables"]["optionId"], "REVIEW_OPTION");
+}
+
+#[tokio::test]
+async fn dry_run_returns_read_only_plan_without_changing_worktree_remote_or_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    let work = create_working_repo(temp.path(), &remote);
+    std::fs::write(work.join("README.md"), "initial\ndry run change\n").unwrap();
+    let remote_head_before = git_rev_parse(&remote, "refs/heads/main");
+
+    let server = TestServer::new(Vec::new());
+    let mut config = config(format!("{}/graphql", server.url()));
+    config.completion.direct_commit.dry_run = true;
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+    let issue = issue("[Medium] Fix allocator");
+
+    let result = client.complete_issue(&issue, &work).await.unwrap();
+
+    assert_eq!(result.commit_sha, None);
+    assert_eq!(result.moved_to_state, None);
+    assert_eq!(result.severity.as_deref(), Some("Medium"));
+    assert!(result.partial_failure.is_none());
+    let plan = result.plan.as_ref().expect("dry run must return a plan");
+    assert_eq!(plan.severity, "Medium");
+    assert_eq!(plan.target_state, "Done");
+    assert_eq!(plan.detected_changes, vec![" M README.md"]);
+    assert_eq!(
+        plan.commit_title,
+        "lvmiller/project_symphony#1: [Medium] Fix allocator"
+    );
+    assert!(plan.commit_body.contains("Refs #1"));
+    assert!(!plan.rebase_required);
+    assert_eq!(
+        plan.planned_mutations,
+        vec![
+            CompletionMutation::StageAllChanges,
+            CompletionMutation::Commit {
+                title: "lvmiller/project_symphony#1: [Medium] Fix allocator".to_string(),
+                body: plan.commit_body.clone(),
+            },
+            CompletionMutation::FetchBaseBranch {
+                base_branch: "main".to_string(),
+            },
+            CompletionMutation::PushBaseBranch {
+                base_branch: "main".to_string(),
+            },
+            CompletionMutation::MoveIssueToState {
+                target_state: "Done".to_string(),
+            },
+        ]
+    );
+    assert_eq!(
+        String::from_utf8(
+            Command::new("git")
+                .args(["status", "--porcelain=v1"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout
+        )
+        .unwrap(),
+        " M README.md\n"
+    );
+    assert_eq!(
+        git_rev_parse(&remote, "refs/heads/main"),
+        remote_head_before
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn dry_run_missing_severity_fails_before_any_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    let work = create_working_repo(temp.path(), &remote);
+    std::fs::write(work.join("README.md"), "initial\ndry run change\n").unwrap();
+    let remote_head_before = git_rev_parse(&remote, "refs/heads/main");
+
+    let server = TestServer::new(Vec::new());
+    let mut config = config(format!("{}/graphql", server.url()));
+    config.completion.direct_commit.dry_run = true;
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+
+    let error = client
+        .complete_issue(&issue("Fix allocator"), &work)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("missing_issue_severity"));
+    assert_eq!(
+        git_rev_parse(&remote, "refs/heads/main"),
+        remote_head_before
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn status_handoff_failure_after_push_returns_partial_failure_details() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    let work = create_working_repo(temp.path(), &remote);
+    std::fs::write(work.join("README.md"), "initial\npushed change\n").unwrap();
+    let server = TestServer::new(vec![
+        ok(project_status_lookup(&[
+            ("Ready", "READY_OPTION"),
+            ("Done", "DONE_OPTION"),
+            ("In review", "REVIEW_OPTION"),
+        ])),
+        HttpResponse {
+            status: 500,
+            body: "{\"message\":\"status handoff unavailable\"}".to_string(),
+        },
+    ]);
+    let config = config(format!("{}/graphql", server.url()));
+    let client = GitHubCompletionClient::new(&config).unwrap().unwrap();
+    let issue = issue("[Medium] Fix allocator");
+
+    let result = client.complete_issue(&issue, &work).await.unwrap();
+
+    assert_eq!(result.moved_to_state, None);
+    assert_eq!(result.severity.as_deref(), Some("Medium"));
+    let partial = result
+        .partial_failure
+        .as_ref()
+        .expect("pushed status handoff failure must be reported");
+    assert_eq!(partial.target_state, "Done");
+    assert_eq!(
+        partial.pushed_commit_sha,
+        git_rev_parse(&remote, "refs/heads/main")
+    );
+    assert_eq!(
+        result.commit_sha.as_deref(),
+        Some(partial.pushed_commit_sha.as_str())
+    );
+    assert!(partial.message.contains("github_status"));
+    assert_eq!(server.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -533,6 +669,7 @@ fn config(endpoint: String) -> EffectiveConfig {
         workspace: WorkspaceConfig {
             root: "workspaces".into(),
             cleanup: WorkspaceCleanupConfig::default(),
+            population: Default::default(),
         },
         hooks: HooksConfig::default(),
         agent: AgentConfig {
@@ -553,6 +690,7 @@ fn config(endpoint: String) -> EffectiveConfig {
         completion: CompletionConfig {
             direct_commit: DirectCommitCompletionConfig {
                 enabled: true,
+                dry_run: false,
                 base_branch: "main".to_string(),
                 high_review_state: "In review".to_string(),
                 auto_approved_state: "Done".to_string(),
@@ -648,6 +786,23 @@ fn git_show(git_dir: &Path, spec: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn git_rev_parse(git_dir: &Path, revision: &str) -> String {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-parse", revision])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git rev-parse {:?} failed\nstdout={}\nstderr={}",
+        revision,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 #[cfg(unix)]
