@@ -46,7 +46,14 @@ workspace:
 
 hooks:
   timeout_ms: 120000
-
+  # Hooks run in the workspace directory with the host's trusted shell.
+  # Symphony provides SYMPHONY_HOOK_NAME, SYMPHONY_WORKSPACE_PATH,
+  # SYMPHONY_WORKSPACE_KEY, SYMPHONY_SOURCE_ID, SYMPHONY_SOURCE_KEY,
+  # SYMPHONY_ISSUE_IDENTIFIER, and SYMPHONY_ISSUE_KEY. The *_KEY values are
+  # sanitized identifiers suitable for paths. Failure diagnostics retain bounded,
+  # redacted stdout/stderr excerpts.
+  after_create: |
+    printf 'preparing %s for %s\n' "$SYMPHONY_WORKSPACE_PATH" "$SYMPHONY_ISSUE_IDENTIFIER"
 agent:
   max_concurrent_agents: 1
   max_turns: 1

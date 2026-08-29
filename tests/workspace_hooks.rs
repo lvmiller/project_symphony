@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use symphony::config::{
     HooksConfig, WorkspaceCleanupConfig, WorkspaceConfig, WorkspacePopulationConfig,
     WorkspacePopulationKind, WorkspacePopulationReusePolicy,
 };
+use symphony::domain::Issue;
 use symphony::error::SymphonyError;
 use symphony::workspace::{WorkspaceManager, sanitize_workspace_key, source_workspace_key};
 use tempfile::TempDir;
@@ -14,6 +16,23 @@ fn hooks_with_timeout(timeout_ms: u64) -> HooksConfig {
     HooksConfig {
         timeout_ms,
         ..HooksConfig::default()
+    }
+}
+
+fn issue(identifier: &str) -> Issue {
+    Issue {
+        id: format!("id-{identifier}"),
+        identifier: identifier.to_string(),
+        title: "test issue".to_string(),
+        description: None,
+        priority: None,
+        state: "Ready".to_string(),
+        branch_name: None,
+        url: None,
+        labels: Vec::new(),
+        blocked_by: Vec::new(),
+        created_at: None,
+        updated_at: None,
     }
 }
 
@@ -197,7 +216,9 @@ async fn creates_new_workspace_then_reuses_existing_directory() {
 async fn source_workspaces_are_namespaced_and_hooks_receive_source_id() {
     let temp = TempDir::new().expect("tempdir");
     let mut hooks = hooks_with_timeout(1_000);
-    hooks.after_create = Some("printf \"$SYMPHONY_SOURCE_ID\" > source_id".to_string());
+    hooks.after_create = Some(
+        "printf '%s\\n' \"$SYMPHONY_HOOK_NAME\" \"$SYMPHONY_WORKSPACE_PATH\" \"$SYMPHONY_WORKSPACE_KEY\" \"$SYMPHONY_SOURCE_ID\" \"$SYMPHONY_SOURCE_KEY\" \"$SYMPHONY_ISSUE_IDENTIFIER\" \"$SYMPHONY_ISSUE_KEY\" > hook_context; printf \"$SYMPHONY_SOURCE_ID\" > source_id; printf hook > cwd_marker".to_string(),
+    );
     let manager = manager(temp.path(), hooks);
 
     let workspace = manager
@@ -220,6 +241,94 @@ async fn source_workspaces_are_namespaced_and_hooks_receive_source_id() {
     assert_eq!(
         fs::read_to_string(workspace.path.join("source_id")).expect("source id marker"),
         "api/service"
+    );
+    assert!(
+        workspace.path.join("cwd_marker").is_file(),
+        "hook relative output must be created in its workspace cwd"
+    );
+    let context_output =
+        fs::read_to_string(workspace.path.join("hook_context")).expect("hook context");
+    let context: Vec<_> = context_output.lines().collect();
+    let expected_workspace_path = workspace.path.to_string_lossy().into_owned();
+    assert_eq!(
+        context,
+        vec![
+            "after_create",
+            expected_workspace_path.as_str(),
+            "api_service/issue_123",
+            "api/service",
+            "api_service",
+            "issue/123",
+            "issue_123",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn failing_hook_reports_redacted_stderr_diagnostics() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.before_run = Some(
+        "printf 'ordinary stdout' ; printf 'token=super-secret-value github_pat_very-secret-token' >&2; exit 7"
+            .to_string(),
+    );
+    let manager = manager(temp.path(), hooks);
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("create should succeed");
+    let issue = issue("issue-1");
+
+    let error = manager
+        .before_run_for_source_issue("default", &issue, &workspace.path)
+        .await
+        .expect_err("hook should fail");
+    let message = match error {
+        SymphonyError::Hook { hook, message } => {
+            assert_eq!(hook, "before_run");
+            message
+        }
+        other => panic!("expected hook error, got {other:?}"),
+    };
+    assert!(message.contains("exit_status="));
+    assert!(message.contains("elapsed_ms="));
+    assert!(message.contains("stdout_excerpt=\"ordinary stdout\""));
+    assert!(message.contains("stderr_excerpt="));
+    assert!(message.contains("[REDACTED]"));
+    assert!(!message.contains("super-secret-value"));
+    assert!(!message.contains("github_pat_very-secret-token"));
+}
+
+#[tokio::test]
+async fn hook_diagnostics_bound_large_stdout_and_stderr() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(1_000);
+    hooks.before_run = Some(
+        "i=0; while [ \"$i\" -lt 20000 ]; do printf o; printf e >&2; i=$((i + 1)); done; exit 3"
+            .to_string(),
+    );
+    let manager = manager(temp.path(), hooks);
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("create should succeed");
+    let issue = issue("issue-1");
+
+    let error = manager
+        .before_run_for_source_issue("default", &issue, &workspace.path)
+        .await
+        .expect_err("large-output hook should fail");
+    let message = match error {
+        SymphonyError::Hook { message, .. } => message,
+        other => panic!("expected hook error, got {other:?}"),
+    };
+    assert!(message.contains("stdout_excerpt="));
+    assert!(message.contains("stderr_excerpt="));
+    assert_eq!(message.matches("[truncated]").count(), 2);
+    assert!(
+        message.len() < 18_000,
+        "diagnostics must retain bounded excerpts, got {} bytes",
+        message.len()
     );
 }
 
@@ -299,8 +408,9 @@ async fn before_run_rejects_symlink_workspace_before_hook_runs() {
     fs::create_dir_all(temp.path()).expect("root create");
     symlink(outside.path(), &path).expect("workspace symlink create");
 
+    let issue = issue("issue-1");
     let error = manager
-        .before_run(&path)
+        .before_run_for_source_issue("default", &issue, &path)
         .await
         .expect_err("symlink workspace should fail before hook");
 
@@ -319,8 +429,9 @@ async fn before_run_failure_is_fatal() {
         .await
         .expect("create should succeed");
 
+    let issue = issue("issue-1");
     let error = manager
-        .before_run(&workspace.path)
+        .before_run_for_source_issue("default", &issue, &workspace.path)
         .await
         .expect_err("before_run failure should be fatal");
     assert_hook_error(error, "before_run", "exit_status=");
@@ -337,7 +448,10 @@ async fn after_run_failure_is_ignored_after_hook_runs() {
         .await
         .expect("create should succeed");
 
-    manager.after_run_best_effort(&workspace.path).await;
+    let issue = issue("issue-1");
+    manager
+        .after_run_best_effort_for_source_issue("default", &issue, &workspace.path)
+        .await;
 
     assert_eq!(
         fs::read_to_string(workspace.path.join("after_run_marker"))
@@ -379,10 +493,11 @@ async fn remove_rejects_symlink_workspace_before_hook_or_delete() {
 }
 
 #[tokio::test]
-async fn before_remove_runs_before_directory_is_removed() {
+async fn before_remove_failure_is_ignored_after_hook_runs() {
     let temp = TempDir::new().expect("tempdir");
     let mut hooks = hooks_with_timeout(1_000);
-    hooks.before_remove = Some("test -d . && printf ran > ../before_remove_marker".to_string());
+    hooks.before_remove =
+        Some("test -d . && printf ran > ../before_remove_marker; exit 7".to_string());
     let manager = manager(temp.path(), hooks);
     let workspace = manager
         .create_for_identifier("issue-1")
@@ -412,11 +527,43 @@ async fn fatal_hook_timeout_returns_error() {
         .await
         .expect("create should succeed");
 
+    let issue = issue("issue-1");
     let error = manager
-        .before_run(&workspace.path)
+        .before_run_for_source_issue("default", &issue, &workspace.path)
         .await
         .expect_err("timeout should be fatal");
     assert_hook_error(error, "before_run", "timeout after 10 ms");
+}
+
+#[tokio::test]
+async fn timeout_reports_captured_output_and_reaps_hook() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut hooks = hooks_with_timeout(500);
+    hooks.before_run = Some("printf started; printf timed-out >&2; exec sleep 5".to_string());
+    let manager = manager(temp.path(), hooks);
+    let workspace = manager
+        .create_for_identifier("issue-1")
+        .await
+        .expect("create should succeed");
+    let issue = issue("issue-1");
+
+    let started_at = Instant::now();
+    let error = manager
+        .before_run_for_source_issue("default", &issue, &workspace.path)
+        .await
+        .expect_err("timeout should be fatal");
+    let elapsed = started_at.elapsed();
+    let message = match error {
+        SymphonyError::Hook { message, .. } => message,
+        other => panic!("expected hook error, got {other:?}"),
+    };
+    assert!(message.contains("timeout after 500 ms"));
+    assert!(message.contains("stdout_excerpt=\"started\""));
+    assert!(message.contains("stderr_excerpt=\"timed-out\""));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "timed out hook must be killed and reaped, elapsed={elapsed:?}"
+    );
 }
 
 #[tokio::test]

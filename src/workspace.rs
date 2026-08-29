@@ -10,9 +10,7 @@ use crate::config::{
 };
 use crate::domain::{Issue, Workspace};
 use crate::error::{Result, SymphonyError};
-use crate::hooks::{
-    HookKind, populate_workspace, run_hook_best_effort_with_source, run_hook_with_source,
-};
+use crate::hooks::{HookContext, HookKind, populate_workspace, run_hook, run_hook_best_effort};
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceManager {
@@ -123,11 +121,15 @@ impl WorkspaceManager {
             return Err(error);
         }
         if created_now
-            && let Err(error) = run_hook_with_source(
+            && let Err(error) = run_hook(
                 HookKind::AfterCreate,
                 &self.hooks,
-                &verified_path,
-                Some(source_id),
+                HookContext::new(
+                    &verified_path,
+                    workspace.workspace_key.clone(),
+                    source_id,
+                    identifier,
+                ),
             )
             .await
         {
@@ -137,29 +139,33 @@ impl WorkspaceManager {
         Ok(workspace)
     }
 
-    pub async fn before_run(&self, workspace: &Path) -> Result<()> {
-        self.before_run_for_source(DEFAULT_SOURCE_ID, workspace)
-            .await
-    }
-
-    pub async fn before_run_for_source(&self, source_id: &str, workspace: &Path) -> Result<()> {
+    pub async fn before_run_for_source_issue(
+        &self,
+        source_id: &str,
+        issue: &Issue,
+        workspace: &Path,
+    ) -> Result<()> {
         let canonical_root = canonicalize_dir(&self.root)?;
         let workspace = verify_workspace_dir(&canonical_root, workspace)?;
-        run_hook_with_source(
+        run_hook(
             HookKind::BeforeRun,
             &self.hooks,
-            &workspace,
-            Some(source_id),
+            HookContext::new(
+                &workspace,
+                source_workspace_key(source_id, &issue.identifier),
+                source_id,
+                &issue.identifier,
+            ),
         )
         .await
     }
 
-    pub async fn after_run_best_effort(&self, workspace: &Path) {
-        self.after_run_best_effort_for_source(DEFAULT_SOURCE_ID, workspace)
-            .await;
-    }
-
-    pub async fn after_run_best_effort_for_source(&self, source_id: &str, workspace: &Path) {
+    pub async fn after_run_best_effort_for_source_issue(
+        &self,
+        source_id: &str,
+        issue: &Issue,
+        workspace: &Path,
+    ) {
         let canonical_root = match canonicalize_dir(&self.root) {
             Ok(root) => root,
             Err(error) => {
@@ -174,11 +180,15 @@ impl WorkspaceManager {
                 return;
             }
         };
-        run_hook_best_effort_with_source(
+        run_hook_best_effort(
             HookKind::AfterRun,
             &self.hooks,
-            &workspace,
-            Some(source_id),
+            HookContext::new(
+                &workspace,
+                source_workspace_key(source_id, &issue.identifier),
+                source_id,
+                &issue.identifier,
+            ),
         )
         .await;
     }
@@ -226,11 +236,10 @@ impl WorkspaceManager {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(SymphonyError::io(Some(path.clone()), err)),
         };
-        run_hook_best_effort_with_source(
+        run_hook_best_effort(
             HookKind::BeforeRemove,
             &self.hooks,
-            &workspace,
-            Some(source_id),
+            HookContext::new(&workspace, workspace_key, source_id, identifier),
         )
         .await;
         fs::remove_dir_all(&workspace)
