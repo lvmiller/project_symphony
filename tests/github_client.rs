@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,7 +11,9 @@ use symphony::config::{
 };
 use symphony::domain::Issue;
 use symphony::error::SymphonyError;
-use symphony::tracker::github::{GitHubGraphqlExecutor, GitHubTrackerClient};
+use symphony::tracker::github::{
+    GitHubGraphqlExecutor, GitHubTrackerClient, MAX_GITHUB_GRAPHQL_RESPONSE_BYTES,
+};
 use symphony::tracker::{TrackerClient, TrackerWriter};
 
 #[tokio::test]
@@ -102,6 +105,123 @@ async fn raw_graphql_executor_distinguishes_transport_status_and_malformed_respo
         .await
         .unwrap_err();
     assert_tracker_kind(err, "github_malformed");
+}
+
+#[tokio::test]
+async fn raw_graphql_executor_accepts_a_response_at_the_decoded_byte_limit() {
+    let server = WireServer::new(vec![WireResponse::fixed(200, exact_limit_graphql_body())]);
+
+    let body = raw_executor(server.url())
+        .execute("query { viewer { login } }", json!({}))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body["data"]["padding"].as_str().unwrap().len(),
+        MAX_GITHUB_GRAPHQL_RESPONSE_BYTES - graphql_padding_overhead()
+    );
+}
+
+#[tokio::test]
+async fn raw_graphql_executor_rejects_excessive_content_length_before_reading() {
+    let server = WireServer::new(vec![
+        WireResponse::fixed(200, br#"{}"#.to_vec())
+            .with_declared_content_length(MAX_GITHUB_GRAPHQL_RESPONSE_BYTES + 1),
+    ]);
+
+    let error = raw_executor(server.url())
+        .execute("query { viewer { login } }", json!({}))
+        .await
+        .unwrap_err();
+
+    assert_tracker_kind(error, "github_response_too_large");
+}
+
+#[tokio::test]
+async fn raw_graphql_executor_rejects_oversized_chunked_success_and_error_bodies() {
+    for status in [200, 502] {
+        let server = WireServer::new(vec![WireResponse::chunked(
+            status,
+            vec![
+                br#"{"data":{"padding":""#.to_vec(),
+                vec![b'x'; MAX_GITHUB_GRAPHQL_RESPONSE_BYTES],
+            ],
+        )]);
+
+        let error = raw_executor(server.url())
+            .execute("query { viewer { login } }", json!({}))
+            .await
+            .unwrap_err();
+
+        assert_tracker_kind(error, "github_response_too_large");
+    }
+}
+
+#[tokio::test]
+async fn raw_graphql_executor_rejects_compressed_responses_that_expand_past_the_limit() {
+    let server = WireServer::new(vec![
+        WireResponse::fixed(
+            200,
+            gzip_repeated_byte(b'x', MAX_GITHUB_GRAPHQL_RESPONSE_BYTES + 1),
+        )
+        .with_header("content-encoding", "gzip"),
+    ]);
+
+    let error = raw_executor(server.url())
+        .execute("query { viewer { login } }", json!({}))
+        .await
+        .unwrap_err();
+
+    assert_tracker_kind(error, "github_response_too_large");
+}
+
+#[tokio::test]
+async fn tracker_discards_preceding_pages_when_a_later_response_exceeds_the_limit() {
+    let server = WireServer::new(vec![
+        WireResponse::fixed(
+            200,
+            project_page(
+                true,
+                Some("next"),
+                vec![project_item("I_1", 1, "Todo", &[], None, None)],
+            )
+            .to_string()
+            .into_bytes(),
+        ),
+        WireResponse::chunked(
+            200,
+            vec![
+                br#"{"data":{"padding":""#.to_vec(),
+                vec![b'x'; MAX_GITHUB_GRAPHQL_RESPONSE_BYTES],
+            ],
+        ),
+    ]);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    let error = client.fetch_candidate_issues().await.unwrap_err();
+
+    assert_tracker_kind(error, "github_response_too_large");
+    assert_eq!(server.request_count(), 2);
+}
+
+#[tokio::test]
+async fn tracker_writer_does_not_issue_a_mutation_after_a_size_limit_failure() {
+    let server = WireServer::new(vec![WireResponse::chunked(
+        200,
+        vec![
+            br#"{"data":{"padding":""#.to_vec(),
+            vec![b'x'; MAX_GITHUB_GRAPHQL_RESPONSE_BYTES],
+        ],
+    )]);
+    let client = client(server.url(), vec!["Todo"], BTreeMap::new());
+
+    let error = client
+        .move_issue_to_state(&writer_issue(), "Started")
+        .await
+        .unwrap_err();
+
+    assert_tracker_kind(error, "github_response_too_large");
+    assert_eq!(server.request_count(), 1);
 }
 
 #[tokio::test]
@@ -1472,4 +1592,232 @@ fn write_http_response(stream: &mut std::net::TcpStream, response: HttpResponse)
         response.body
     );
     stream.write_all(reply.as_bytes()).unwrap();
+}
+
+struct WireResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: WireBody,
+    declared_content_length: Option<usize>,
+}
+
+enum WireBody {
+    Fixed(Vec<u8>),
+    Chunked(Vec<Vec<u8>>),
+}
+
+impl WireResponse {
+    fn fixed(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: WireBody::Fixed(body),
+            declared_content_length: None,
+        }
+    }
+
+    fn chunked(status: u16, chunks: Vec<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: WireBody::Chunked(chunks),
+            declared_content_length: None,
+        }
+    }
+
+    fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    fn with_declared_content_length(mut self, length: usize) -> Self {
+        self.declared_content_length = Some(length);
+        self
+    }
+}
+
+struct WireServer {
+    url: String,
+    requests: Arc<AtomicUsize>,
+}
+
+impl WireServer {
+    fn new(responses: Vec<WireResponse>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_http_request(&mut stream);
+                request_count.fetch_add(1, Ordering::Relaxed);
+                write_wire_response(&mut stream, response);
+            }
+        });
+        Self { url, requests }
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::Relaxed)
+    }
+}
+
+fn write_wire_response(stream: &mut std::net::TcpStream, response: WireResponse) {
+    let reason = if response.status == 200 {
+        "OK"
+    } else {
+        "Error"
+    };
+    let mut header = format!(
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\nconnection: close\r\n",
+        response.status, reason
+    );
+    for (name, value) in response.headers {
+        header.push_str(&format!("{name}: {value}\r\n"));
+    }
+    match response.body {
+        WireBody::Fixed(body) => {
+            let length = response.declared_content_length.unwrap_or(body.len());
+            header.push_str(&format!("content-length: {length}\r\n\r\n"));
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+        }
+        WireBody::Chunked(chunks) => {
+            header.push_str("transfer-encoding: chunked\r\n\r\n");
+            let _ = stream.write_all(header.as_bytes());
+            for chunk in chunks {
+                let _ = stream.write_all(format!("{:X}\r\n", chunk.len()).as_bytes());
+                let _ = stream.write_all(&chunk);
+                let _ = stream.write_all(b"\r\n");
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+        }
+    }
+}
+
+fn graphql_padding_overhead() -> usize {
+    br#"{"data":{"padding":""#.len() + br#""}}"#.len()
+}
+
+fn exact_limit_graphql_body() -> Vec<u8> {
+    let mut body = br#"{"data":{"padding":""#.to_vec();
+    body.extend(std::iter::repeat_n(
+        b'x',
+        MAX_GITHUB_GRAPHQL_RESPONSE_BYTES - graphql_padding_overhead(),
+    ));
+    body.extend_from_slice(br#""}}"#);
+    body
+}
+
+fn gzip_repeated_byte(byte: u8, length: usize) -> Vec<u8> {
+    assert!(length > 0);
+    let mut bits = DeflateBits::default();
+    bits.write(0b011, 3);
+    bits.fixed_symbol(u16::from(byte));
+    let mut remaining = length - 1;
+    while remaining >= 3 {
+        let matched = remaining.min(258);
+        bits.fixed_length(matched);
+        bits.write(0, 5);
+        remaining -= matched;
+    }
+    for _ in 0..remaining {
+        bits.fixed_symbol(u16::from(byte));
+    }
+    bits.fixed_symbol(256);
+
+    let mut gzip = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    gzip.extend(bits.finish());
+    gzip.extend(crc32_repeated_byte(byte, length).to_le_bytes());
+    gzip.extend((length as u32).to_le_bytes());
+    gzip
+}
+
+#[derive(Default)]
+struct DeflateBits {
+    bytes: Vec<u8>,
+    pending: u8,
+    pending_bits: u8,
+}
+
+impl DeflateBits {
+    fn write(&mut self, value: u32, width: u8) {
+        for bit in 0..width {
+            self.pending |= (((value >> bit) & 1) as u8) << self.pending_bits;
+            self.pending_bits += 1;
+            if self.pending_bits == 8 {
+                self.bytes.push(self.pending);
+                self.pending = 0;
+                self.pending_bits = 0;
+            }
+        }
+    }
+
+    fn fixed_symbol(&mut self, symbol: u16) {
+        let (code, width) = match symbol {
+            0..=143 => (0x30 + u32::from(symbol), 8),
+            144..=255 => (0x190 + u32::from(symbol - 144), 9),
+            256..=279 => (u32::from(symbol - 256), 7),
+            280..=287 => (0xc0 + u32::from(symbol - 280), 8),
+            _ => panic!("invalid fixed-Huffman symbol"),
+        };
+        self.write(reverse_bits(code, width), width);
+    }
+
+    fn fixed_length(&mut self, length: usize) {
+        let (minimum, symbol, extra_bits) = match length {
+            3..=10 => (3, 257 + (length - 3) as u16, 0),
+            11..=12 => (11, 265, 1),
+            13..=14 => (13, 266, 1),
+            15..=16 => (15, 267, 1),
+            17..=18 => (17, 268, 1),
+            19..=22 => (19, 269, 2),
+            23..=26 => (23, 270, 2),
+            27..=30 => (27, 271, 2),
+            31..=34 => (31, 272, 2),
+            35..=42 => (35, 273, 3),
+            43..=50 => (43, 274, 3),
+            51..=58 => (51, 275, 3),
+            59..=66 => (59, 276, 3),
+            67..=82 => (67, 277, 4),
+            83..=98 => (83, 278, 4),
+            99..=114 => (99, 279, 4),
+            115..=130 => (115, 280, 5),
+            131..=162 => (131, 281, 5),
+            163..=194 => (163, 282, 5),
+            195..=226 => (195, 283, 5),
+            227..=257 => (227, 284, 5),
+            258 => (258, 285, 0),
+            _ => panic!("invalid DEFLATE match length"),
+        };
+        self.fixed_symbol(symbol);
+        self.write((length - minimum) as u32, extra_bits);
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.pending_bits > 0 {
+            self.bytes.push(self.pending);
+        }
+        self.bytes
+    }
+}
+
+fn reverse_bits(value: u32, width: u8) -> u32 {
+    value.reverse_bits() >> (u32::BITS - u32::from(width))
+}
+
+fn crc32_repeated_byte(byte: u8, length: usize) -> u32 {
+    let mut crc = !0_u32;
+    for _ in 0..length {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
 }

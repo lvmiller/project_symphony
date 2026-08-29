@@ -12,7 +12,8 @@ use symphony::completion::{
 use symphony::config::{
     AgentConfig, CodexConfig, CompletionConfig, DirectCommitCompletionConfig, EffectiveConfig,
     GithubConfig, GithubProjectOwnerType, GithubRepositoryConfig, HooksConfig, PollingConfig,
-    ServerConfig, SourceConfig, TrackerConfig, WorkspaceCleanupConfig, WorkspaceConfig,
+    ServerConfig, SourceConfig, TrackerConfig, WorkerConfig, WorkspaceCleanupConfig,
+    WorkspaceConfig,
 };
 use symphony::domain::Issue;
 use symphony::error::{Result, SymphonyError};
@@ -456,10 +457,12 @@ fn config() -> EffectiveConfig {
         polling: PollingConfig { interval_ms: 1_000 },
         workspace: WorkspaceConfig {
             root: "workspaces".into(),
+            remote_root: "workspaces".to_string(),
             cleanup: WorkspaceCleanupConfig::default(),
             population: Default::default(),
             retention: Default::default(),
         },
+        worker: WorkerConfig::default(),
         hooks: HooksConfig::default(),
         agent: AgentConfig {
             max_concurrent_agents: 1,

@@ -13,6 +13,11 @@ use crate::domain::{BlockerRef, Issue};
 use crate::error::{Result, SymphonyError};
 use crate::tracker::{TrackerClient, TrackerWriter};
 
+/// Maximum decoded GraphQL response size accepted from a configured GitHub endpoint.
+///
+/// The cap applies before parsing to both successful and unsuccessful HTTP responses.
+pub const MAX_GITHUB_GRAPHQL_RESPONSE_BYTES: usize = 1_048_576;
+
 const PROJECT_ITEMS_QUERY: &str = r#"
 query SymphonyProjectItems(
   $repositoryOwner: String!
@@ -301,17 +306,14 @@ impl GitHubGraphqlExecutor {
             .await
             .map_err(|err| tracker_error("github_transport", err.to_string()))?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|err| tracker_error("github_transport", err.to_string()))?;
+        let body = read_bounded_decoded_body(response).await?;
         if status != StatusCode::OK {
             return Err(tracker_error(
                 "github_status",
                 format!("GitHub GraphQL HTTP status {}", status.as_u16()),
             ));
         }
-        let body: Value = serde_json::from_str(&body)
+        let body: Value = serde_json::from_slice(&body)
             .map_err(|err| tracker_error("github_malformed", err.to_string()))?;
         if !body.is_object() {
             return Err(tracker_error(
@@ -321,6 +323,35 @@ impl GitHubGraphqlExecutor {
         }
         Ok(body)
     }
+}
+
+async fn read_bounded_decoded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|length| length > MAX_GITHUB_GRAPHQL_RESPONSE_BYTES as u64) {
+        return Err(github_response_too_large());
+    }
+
+    let mut body = Vec::with_capacity(content_length.unwrap_or_default() as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| tracker_error("github_transport", err.to_string()))?
+    {
+        if chunk.len() > MAX_GITHUB_GRAPHQL_RESPONSE_BYTES.saturating_sub(body.len()) {
+            return Err(github_response_too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn github_response_too_large() -> SymphonyError {
+    tracker_error(
+        "github_response_too_large",
+        format!(
+            "GitHub GraphQL response exceeds {MAX_GITHUB_GRAPHQL_RESPONSE_BYTES} decoded bytes"
+        ),
+    )
 }
 
 #[derive(Clone, Debug)]
