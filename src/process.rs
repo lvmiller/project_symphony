@@ -73,12 +73,16 @@ impl ManagedChild {
     /// then forcibly terminate and reap it if the bounded grace wait expires.
     pub(crate) async fn terminate_tree(&mut self, grace: Duration) -> io::Result<ExitStatus> {
         #[cfg(unix)]
-        self.child.signal(libc::SIGTERM)?;
+        {
+            self.child.signal(libc::SIGTERM)?;
 
-        if let Some(status) = self.wait_bounded(grace).await? {
-            return Ok(status);
+            if let Some(status) = self.wait_bounded(grace).await? {
+                return Ok(status);
+            }
         }
 
+        // Windows Job Objects have no graceful signal equivalent. Waiting here
+        // would merely delay terminating an already timed-out hook tree.
         self.force_terminate_tree(grace).await
     }
 
